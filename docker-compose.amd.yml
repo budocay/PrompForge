@@ -1,0 +1,85 @@
+# ============================================
+# PromptForge - Docker Compose AMD ROCm
+# Pour cartes graphiques AMD (RX 6000/7000)
+# ============================================
+# Usage: docker compose -f docker-compose.amd.yml up -d
+
+services:
+  # Service Ollama avec support AMD ROCm
+  ollama:
+    image: ollama/ollama:rocm
+    container_name: promptforge-ollama-amd
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      # Pour RX 7900 XT/XTX (gfx1100)
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      # Utiliser toute la VRAM disponible
+      - GPU_MAX_HEAP_SIZE=100
+      - GPU_MAX_ALLOC_PERCENT=100
+    devices:
+      # Accès aux devices AMD GPU
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Interface Web PromptForge
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: promptforge-web
+    ports:
+      - "7860:7860"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      # Modèle optimisé pour AMD (VRAM élevé)
+      # qwen3:14b = meilleur instruction-following que qwen2.5
+      - OLLAMA_MODEL=qwen3:14b
+      - PROMPTFORGE_DATA_PATH=/data
+    volumes:
+      # IMPORTANT: Persistance de la BDD SQLite et des projets
+      - ./data:/data
+      # Projets pré-existants (exemples) - lecture seule
+      - ./projects:/app/example-projects:ro
+      # === SCANNER : Monte le dossier parent automatiquement ===
+      # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
+      - ${HOSTFS_PATH:-../}:/hostfs:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+
+# ============================================
+# GUIDE DES MODÈLES POUR AMD (VRAM élevé)
+# ============================================
+# 
+# RECOMMANDÉS 2025:
+# -----------------
+# qwen3:14b          (~9GB)  - Meilleur instruction-following ⭐ DÉFAUT
+# qwen3:32b          (~18GB) - Max qualité
+# deepseek-r1:14b    (~9GB)  - Raisonnement avancé
+# qwen2.5-coder:14b  (~9GB)  - Spécialisé code
+#
+# LEGACY (stables):
+# -----------------
+# qwen2.5:14b        (~9GB)  - Ancien défaut
+# qwen2.5:32b        (~18GB) - Ancien max
+#
+# Pour changer de modèle:
+# docker compose -f docker-compose.amd.yml exec ollama ollama pull qwen3:32b
+# Puis modifie OLLAMA_MODEL ci-dessus et redémarre
+# ============================================

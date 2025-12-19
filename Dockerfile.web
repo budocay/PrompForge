@@ -1,0 +1,39 @@
+# PromptForge Web Dockerfile
+# Interface web Gradio
+
+FROM python:3.12-slim
+
+LABEL maintainer="PromptForge Contributors"
+LABEL description="Interface web PromptForge avec Gradio"
+
+# Variables d'environnement
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    GRADIO_SERVER_NAME=0.0.0.0 \
+    GRADIO_SERVER_PORT=7860 \
+    PROMPTFORGE_DATA_PATH=/data
+
+# Répertoire de travail
+WORKDIR /app
+
+# Copier les fichiers du projet
+COPY pyproject.toml README.md LICENSE ./
+COPY promptforge/ ./promptforge/
+COPY templates/ ./templates/
+
+# Installer le package avec l'option web
+RUN pip install -e ".[web]"
+
+# Créer les dossiers nécessaires
+RUN mkdir -p /data/projects /data/history
+
+# Exposer le port Gradio
+EXPOSE 7860
+
+# Volume pour la persistance des données
+VOLUME ["/data"]
+
+# Point d'entrée - utilise --path pour spécifier le répertoire de données
+ENTRYPOINT ["promptforge", "--path", "/data", "web", "--host", "0.0.0.0"]

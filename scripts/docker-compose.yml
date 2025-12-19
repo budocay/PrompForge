@@ -1,0 +1,88 @@
+# Docker Compose pour PromptForge + Ollama
+# Usage: docker-compose up -d
+
+services:
+  # Service Ollama (LLM local)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    # Support GPU NVIDIA (RTX 4070 détectée)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  # Service pour télécharger le modèle au démarrage
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama-data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling llama3.1 model..."
+        ollama pull llama3.1
+        echo "Model ready!"
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    restart: "no"
+
+  # Interface Web PromptForge
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: promptforge-web
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./data:/data
+      - ./projects:/data/projects:ro
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    restart: unless-stopped
+
+  # PromptForge CLI (interactif)
+  promptforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: promptforge-app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+      - ./projects:/data/projects:ro
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    stdin_open: true
+    tty: true
+    restart: "no"
+    # Surcharge pour mode interactif
+    entrypoint: ["/bin/bash"]
+
+volumes:
+  ollama-data:
+    name: promptforge-ollama-data

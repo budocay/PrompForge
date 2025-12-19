@@ -1,0 +1,61 @@
+# ============================================
+# PromptForge - Windows avec NVIDIA GPU
+# ============================================
+# 
+# Sur Windows avec NVIDIA, cette config utilise Ollama natif
+# pour éviter les conflits de port si Ollama est déjà installé.
+#
+# ÉTAPES:
+# 1. Installe Ollama pour Windows: https://ollama.com/download/windows
+# 2. Lance Ollama: ollama serve (ou il tourne déjà en tâche de fond)
+# 3. Télécharge un modèle: ollama pull qwen3:8b
+# 4. Lance ce docker-compose pour l'interface web uniquement
+#
+# Usage: docker compose -f docker-compose.win-nvidia.yml up -d
+
+services:
+  # Interface Web uniquement (Ollama tourne en natif sur Windows)
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: promptforge-web
+    ports:
+      - "7860:7860"
+    environment:
+      # Connecte à Ollama natif Windows (host.docker.internal)
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODEL=qwen3:8b
+      - PROMPTFORGE_DATA_PATH=/data
+    volumes:
+      # IMPORTANT: Persistance de la BDD SQLite et des projets
+      - ./data:/data
+      # Projets pré-existants (exemples) - lecture seule
+      - ./projects:/app/example-projects:ro
+      # === SCANNER : Monte le dossier parent automatiquement ===
+      # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
+      - ${HOSTFS_PATH:-../}:/hostfs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+# ============================================
+# GUIDE RAPIDE WINDOWS + NVIDIA (Ollama natif)
+# ============================================
+#
+# Cette config est pour le cas où Ollama natif tourne déjà.
+# Si vous voulez Ollama dans Docker, utilisez docker-compose.yml
+#
+# Ollama tourne automatiquement en tâche de fond sur Windows.
+# Vérifier: ollama list
+#
+# Si pas de modèle:
+#   ollama pull qwen3:8b
+#
+# Puis:
+#   docker compose -f docker-compose.win-nvidia.yml up -d
+#
+# Ouvre: http://localhost:7860
+#
+# Les données sont persistées dans ./data/
+# ============================================

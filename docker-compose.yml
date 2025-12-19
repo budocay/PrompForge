@@ -1,0 +1,97 @@
+# Docker Compose pour PromptForge + Ollama
+# Usage: docker-compose up -d
+# Pour NVIDIA GPU (8GB+ VRAM)
+
+services:
+  # Service Ollama (LLM local)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    # Support GPU NVIDIA
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  # Service pour télécharger le modèle au démarrage
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama-data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling qwen3:8b model (GPU 8GB+ - meilleur raisonnement)..."
+        ollama pull qwen3:8b
+        echo "Model ready!"
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    restart: "no"
+
+  # Interface Web PromptForge
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: promptforge-web
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "7860:7860"
+    volumes:
+      # IMPORTANT: ./data contient la BDD ET les projets créés via l'interface
+      - ./data:/data
+      # Projets pré-existants (exemples) - lecture seule
+      - ./projects:/app/example-projects:ro
+      # === SCANNER : Monte le dossier parent (là où tu as cloné le projet) ===
+      # Par défaut: ../ = dossier parent de promptforge
+      # Pour personnaliser: crée un .env avec HOSTFS_PATH=/ton/chemin
+      - ${HOSTFS_PATH:-../}:/hostfs:ro
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=qwen3:8b
+    restart: unless-stopped
+
+  # PromptForge CLI (interactif)
+  promptforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: promptforge-app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+      - ./projects:/app/example-projects:ro
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=qwen3:8b
+    stdin_open: true
+    tty: true
+    restart: "no"
+    # Surcharge pour mode interactif
+    entrypoint: ["/bin/bash"]
+
+volumes:
+  ollama-data:
+    name: promptforge-ollama-data

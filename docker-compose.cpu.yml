@@ -1,0 +1,93 @@
+# Docker Compose pour PromptForge + Ollama (sans GPU)
+# Utiliser si vous n'avez pas de GPU ou si les drivers posent problème
+# Usage: docker-compose -f docker-compose.cpu.yml up -d
+#
+# MODÈLES CPU RECOMMANDÉS (par ordre de préférence):
+# - phi4-mini (2.5GB) - Microsoft, excellent sur CPU, bon suivi d'instructions
+# - gemma3n:e4b (3GB) - Google, optimisé edge/mobile
+# - qwen3:4b (3GB) - Qwen, rapide mais suivi XML limité
+# - llama3.2:3b (2GB) - Meta, ultra léger
+
+services:
+  # Service Ollama (LLM local - CPU only)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+
+  # Service pour télécharger le modèle au démarrage
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: promptforge-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama-data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling phi4-mini model (Microsoft - optimized for CPU)..."
+        ollama pull phi4-mini
+        echo "Model ready!"
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    restart: "no"
+
+  # Interface Web PromptForge
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: promptforge-web
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "7860:7860"
+    volumes:
+      # IMPORTANT: ./data contient la BDD ET les projets créés via l'interface
+      - ./data:/data
+      # Projets pré-existants (exemples) - lecture seule
+      - ./projects:/app/example-projects:ro
+      # === SCANNER : Monte le dossier parent automatiquement ===
+      # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
+      - ${HOSTFS_PATH:-../}:/hostfs:ro
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=phi4-mini
+    restart: unless-stopped
+
+  # PromptForge CLI (interactif)
+  promptforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: promptforge-app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+      - ./projects:/app/example-projects:ro
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=phi4-mini
+    stdin_open: true
+    tty: true
+    restart: "no"
+    entrypoint: ["/bin/bash"]
+
+volumes:
+  ollama-data:
+    name: promptforge-ollama-data
