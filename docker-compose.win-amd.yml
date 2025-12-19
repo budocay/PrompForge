@@ -1,0 +1,58 @@
+# ============================================
+# PromptForge - Windows avec AMD GPU
+# ============================================
+# 
+# ⚠️  Sur Windows, Docker ne peut pas accéder au GPU AMD directement.
+#     Tu dois lancer Ollama NATIVEMENT sur Windows (pas dans Docker).
+#
+# ÉTAPES:
+# 1. Installe Ollama pour Windows: https://ollama.com/download/windows
+# 2. Configure la variable d'environnement (PowerShell Admin):
+#    [Environment]::SetEnvironmentVariable("HSA_OVERRIDE_GFX_VERSION", "11.0.0", "User")
+# 3. Redémarre ton PC
+# 4. Lance Ollama: ollama serve
+# 5. Télécharge un modèle: ollama pull qwen3:14b
+# 6. Lance ce docker-compose pour l'interface web uniquement
+#
+# Usage: docker compose -f docker-compose.win-amd.yml up -d
+
+services:
+  # Interface Web uniquement (Ollama tourne en natif sur Windows)
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: promptforge-web
+    ports:
+      - "7860:7860"
+    environment:
+      # Connecte à Ollama natif Windows (host.docker.internal)
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODEL=qwen3:14b
+      - PROMPTFORGE_DATA_PATH=/data
+    volumes:
+      # IMPORTANT: Persistance de la BDD SQLite et des projets
+      - ./data:/data
+      # Projets pré-existants (exemples) - lecture seule
+      - ./projects:/app/example-projects:ro
+      # === SCANNER : Monte le dossier parent automatiquement ===
+      # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
+      - ${HOSTFS_PATH:-../}:/hostfs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+# ============================================
+# GUIDE RAPIDE WINDOWS + AMD
+# ============================================
+#
+# Terminal 1 (PowerShell):
+#   ollama serve
+#
+# Terminal 2 (PowerShell):
+#   docker compose -f docker-compose.win-amd.yml up -d
+#
+# Ouvre: http://localhost:7860
+#
+# Les données sont persistées dans ./data/
+# ============================================

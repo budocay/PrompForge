@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="fireGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" style="stop-color:#ff4d00"/>
+      <stop offset="50%" style="stop-color:#ff6b35"/>
+      <stop offset="100%" style="stop-color:#ffb347"/>
+    </linearGradient>
+    <linearGradient id="anvilGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#5a5a5a"/>
+      <stop offset="100%" style="stop-color:#2d2d2d"/>
+    </linearGradient>
+    <linearGradient id="hammerGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#6b6b6b"/>
+      <stop offset="50%" style="stop-color:#3d3d3d"/>
+      <stop offset="100%" style="stop-color:#1f1f1f"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow">
+      <feDropShadow dx="2" dy="4" stdDeviation="4" flood-color="#000" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  
+  <!-- Fond avec coins arrondis -->
+  <rect width="512" height="512" rx="80" fill="url(#bgGradient)"/>
+  
+  <!-- Bordure subtile -->
+  <rect x="4" y="4" width="504" height="504" rx="78" fill="none" stroke="#ff6b35" stroke-width="2" opacity="0.3"/>
+  
+  <!-- Lueur de forge -->
+  <ellipse cx="256" cy="365" rx="100" ry="35" fill="url(#fireGrad)" opacity="0.25"/>
+  <ellipse cx="256" cy="358" rx="65" ry="20" fill="#ff6b35" opacity="0.35"/>
+  
+  <!-- Enclume -->
+  <g filter="url(#shadow)">
+    <path d="M166 365 L182 330 L330 330 L346 365 Z" fill="url(#anvilGrad)"/>
+    <path d="M174 330 L190 290 L322 290 L338 330 Z" fill="url(#anvilGrad)"/>
+    <rect x="184" y="272" width="144" height="22" rx="3" fill="#4a4a4a"/>
+    <path d="M184 283 L120 294 L120 302 L184 293 Z" fill="#3d3d3d"/>
+    <path d="M328 276 L365 276 L365 292 L328 292 Z" fill="#3d3d3d"/>
+    <rect x="188" y="274" width="135" height="4" rx="2" fill="#6b6b6b" opacity="0.5"/>
+  </g>
+  
+  <!-- Symbole Prompt <> sur l'enclume -->
+  <g transform="translate(256, 260)">
+    <path d="M-28 0 L-42 14 L-28 28" stroke="#ff6b35" stroke-width="6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M28 0 L42 14 L28 28" stroke="#ff6b35" stroke-width="6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <line x1="-12" y1="14" x2="12" y2="14" stroke="#ffb347" stroke-width="4" stroke-linecap="round"/>
+  </g>
+  
+  <!-- Marteau -->
+  <g filter="url(#shadow)" transform="rotate(-35, 310, 185)">
+    <rect x="290" y="150" width="16" height="120" rx="4" fill="#3d3d3d"/>
+    <g fill="#2a2a2a">
+      <rect x="288" y="235" width="20" height="5" rx="2"/>
+      <rect x="288" y="244" width="20" height="5" rx="2"/>
+      <rect x="288" y="253" width="20" height="5" rx="2"/>
+    </g>
+    <rect x="260" y="115" width="80" height="42" rx="5" fill="url(#hammerGrad)"/>
+    <rect x="264" y="119" width="72" height="6" rx="2" fill="#5a5a5a" opacity="0.4"/>
+    <rect x="328" y="120" width="10" height="34" rx="2" fill="#7a7a7a"/>
+  </g>
+  
+  <!-- Étincelles -->
+  <g filter="url(#glow)">
+    <circle cx="225" cy="242" r="4" fill="#ffdd00"/>
+    <circle cx="200" cy="225" r="3" fill="#ffaa00"/>
+    <circle cx="275" cy="238" r="4.5" fill="#ffdd00"/>
+    <circle cx="300" cy="220" r="3" fill="#ff8800"/>
+    <circle cx="248" cy="215" r="3.5" fill="#ffffff"/>
+    <circle cx="188" cy="248" r="2.5" fill="#ffcc00"/>
+    <circle cx="312" cy="242" r="3.5" fill="#ffdd00"/>
+    
+    <path d="M235 248 Q218 225 198 208" stroke="#ffaa00" stroke-width="2" fill="none" opacity="0.7" stroke-linecap="round"/>
+    <path d="M268 244 Q285 218 308 195" stroke="#ffcc00" stroke-width="2" fill="none" opacity="0.7" stroke-linecap="round"/>
+    <path d="M252 238 Q252 208 240 180" stroke="#ffdd00" stroke-width="2" fill="none" opacity="0.5" stroke-linecap="round"/>
+    
+    <circle cx="180" cy="200" r="2" fill="#ff6600" opacity="0.6"/>
+    <circle cx="325" cy="198" r="2" fill="#ffaa00" opacity="0.6"/>
+    <circle cx="218" cy="188" r="2" fill="#ffcc00" opacity="0.7"/>
+  </g>
+  
+  <!-- Texte PromptForge -->
+  <text x="256" y="435" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="42" font-weight="bold" fill="#ffffff">
+    Prompt<tspan fill="#ff6b35">Forge</tspan>
+  </text>
+</svg>

@@ -1,0 +1,65 @@
+# ============================================
+# PromptForge - Docker Compose AMD ROCm MAX
+# Pour RX 7900 XT/XTX avec modèle 32B
+# ============================================
+# Usage: docker compose -f docker-compose.amd-max.yml up -d
+#
+# ⚠️  Ce fichier utilise qwen3:32b (~18GB VRAM)
+#     Plus lent mais BEAUCOUP plus intelligent
+#     Parfait pour des tâches complexes de reformatage
+
+services:
+  ollama:
+    image: ollama/ollama:rocm
+    container_name: promptforge-ollama-amd-max
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      - GPU_MAX_HEAP_SIZE=100
+      - GPU_MAX_ALLOC_PERCENT=100
+      # Optimisations pour gros modèles
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: promptforge-web
+    ports:
+      - "7860:7860"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      # Modèle 32B - Maximum qualité pour 18GB+ VRAM
+      - OLLAMA_MODEL=qwen3:32b
+      - PROMPTFORGE_DATA_PATH=/data
+    volumes:
+      # IMPORTANT: Persistance de la BDD SQLite et des projets
+      - ./data:/data
+      # Projets pré-existants (exemples) - lecture seule
+      - ./projects:/app/example-projects:ro
+      # === SCANNER : Monte le dossier parent automatiquement ===
+      # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
+      - ${HOSTFS_PATH:-../}:/hostfs:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

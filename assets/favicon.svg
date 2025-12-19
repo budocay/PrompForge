@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="fire" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" style="stop-color:#ff4d00"/>
+      <stop offset="100%" style="stop-color:#ffb347"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#5a5a5a"/>
+      <stop offset="100%" style="stop-color:#2d2d2d"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Fond -->
+  <rect width="64" height="64" rx="12" fill="#1a1a2e"/>
+  
+  <!-- Lueur -->
+  <ellipse cx="32" cy="50" rx="18" ry="6" fill="#ff6b35" opacity="0.4"/>
+  
+  <!-- Enclume simplifiée -->
+  <path d="M18 48 L22 40 L42 40 L46 48 Z" fill="url(#metal)"/>
+  <rect x="20" y="36" width="24" height="6" rx="1" fill="#4a4a4a"/>
+  
+  <!-- Chevrons (prompt) -->
+  <path d="M26 38 L22 42 L26 46" stroke="#ff6b35" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+  <path d="M38 38 L42 42 L38 46" stroke="#ff6b35" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+  
+  <!-- Marteau simplifié -->
+  <g transform="rotate(-40, 40, 24)">
+    <rect x="36" y="18" width="4" height="24" rx="1" fill="#3d3d3d"/>
+    <rect x="30" y="12" width="16" height="8" rx="2" fill="#4a4a4a"/>
+  </g>
+  
+  <!-- Étincelles -->
+  <circle cx="28" cy="30" r="2" fill="#ffdd00"/>
+  <circle cx="36" cy="28" r="2" fill="#ffaa00"/>
+  <circle cx="24" cy="34" r="1.5" fill="#ff8800"/>
+  <circle cx="40" cy="32" r="1.5" fill="#ffcc00"/>
+</svg>
