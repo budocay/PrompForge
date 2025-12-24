@@ -100,6 +100,303 @@ class SecurityContext:
     security_level: str = "standard"  # standard, elevated, critical
 
 
+@dataclass
+class SecretFinding:
+    """A detected secret or sensitive data."""
+    secret_type: str  # api_key, password, token, private_key, etc.
+    file_path: str
+    line_number: int
+    key_name: str  # The variable/key name (e.g., "AWS_SECRET_KEY")
+    masked_value: str  # Masked value for display (e.g., "AKIA****WXYZ")
+    severity: str  # HIGH, CRITICAL
+    recommendation: str
+
+
+# =============================================================================
+# SECRET DETECTION PATTERNS
+# =============================================================================
+
+# Patterns for detecting secrets - (name, regex, severity, recommendation)
+SECRET_PATTERNS = [
+    # AWS
+    ("AWS Access Key ID", r'(?:AWS|aws)?_?(?:ACCESS|access)?_?(?:KEY|key)?_?(?:ID|id)?\s*[=:]\s*["\']?(AKIA[0-9A-Z]{16})["\']?', "CRITICAL",
+     "Utilisez AWS IAM roles ou AWS Secrets Manager au lieu de credentials en dur"),
+    ("AWS Secret Access Key", r'(?:AWS|aws)?_?(?:SECRET|secret)?_?(?:ACCESS|access)?_?(?:KEY|key)\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?', "CRITICAL",
+     "Ne jamais commiter les AWS secret keys. Utilisez des variables d'environnement securisees"),
+
+    # Google Cloud
+    ("Google API Key", r'(?:GOOGLE|google)?_?(?:API|api)?_?(?:KEY|key)\s*[=:]\s*["\']?(AIza[0-9A-Za-z\-_]{35})["\']?', "HIGH",
+     "Restreignez cette cle API dans Google Cloud Console et utilisez des secrets managers"),
+    ("Google OAuth Client Secret", r'(?:client_secret|CLIENT_SECRET)\s*[=:]\s*["\']?([a-zA-Z0-9_-]{24})["\']?', "HIGH",
+     "Ne jamais exposer les OAuth client secrets. Utilisez des variables d'environnement"),
+
+    # OpenAI / Anthropic / LLM APIs
+    ("OpenAI API Key", r'(?:OPENAI|openai)?_?(?:API|api)?_?(?:KEY|key)\s*[=:]\s*["\']?(sk-(?:proj-)?[a-zA-Z0-9]{20,})["\']?', "CRITICAL",
+     "Cle OpenAI detectee! Risque de facturation non autorisee. Regenerez cette cle immediatement"),
+    ("Anthropic API Key", r'(?:ANTHROPIC|anthropic)?_?(?:API|api)?_?(?:KEY|key)\s*[=:]\s*["\']?(sk-ant-[a-zA-Z0-9\-]{20,})["\']?', "CRITICAL",
+     "Cle Anthropic detectee! Regenerez cette cle et utilisez des variables d'environnement"),
+
+    # Stripe
+    ("Stripe Secret Key", r'(?:STRIPE|stripe)?_?(?:SECRET|secret)?_?(?:KEY|key)\s*[=:]\s*["\']?(sk_live_[a-zA-Z0-9]{24,})["\']?', "CRITICAL",
+     "Cle Stripe LIVE detectee! Risque de fraude financiere. Regenerez immediatement"),
+    ("Stripe Publishable Key", r'(?:STRIPE|stripe)?_?(?:PUBLISHABLE|publishable)?_?(?:KEY|key)\s*[=:]\s*["\']?(pk_live_[a-zA-Z0-9]{24,})["\']?', "HIGH",
+     "Cle Stripe publishable en production. Verifiez que c'est intentionnel"),
+
+    # Database
+    ("Database URL with Password", r'(?:DATABASE_URL|DB_URL|MONGO_URI|POSTGRES_URL|MYSQL_URL)\s*[=:]\s*["\']?([a-z]+://[^:]+:[^@]+@[^\s"\']+)["\']?', "CRITICAL",
+     "URL de base de donnees avec credentials en clair. Utilisez des secrets managers"),
+    ("Database Password", r'(?:DB_PASS(?:WORD)?|DATABASE_PASS(?:WORD)?|POSTGRES_PASSWORD|MYSQL_PASSWORD|MONGO_PASSWORD)\s*[=:]\s*["\']?([^\s"\']{8,})["\']?', "CRITICAL",
+     "Mot de passe de base de donnees en clair. Ne jamais commiter!"),
+
+    # Generic Secrets
+    ("Generic API Key", r'(?:API_KEY|APIKEY|api_key|apikey)\s*[=:]\s*["\']?([a-zA-Z0-9_\-]{20,})["\']?', "HIGH",
+     "Cle API detectee. Utilisez des variables d'environnement ou un secrets manager"),
+    ("Generic Secret", r'(?:SECRET|secret)(?:_KEY|_TOKEN)?\s*[=:]\s*["\']?([a-zA-Z0-9_\-]{16,})["\']?', "HIGH",
+     "Secret en clair detecte. Utilisez des variables d'environnement securisees"),
+    ("Generic Password", r'(?:PASSWORD|PASSWD|PWD|pass(?:word)?)\s*[=:]\s*["\']?([^\s"\']{8,})["\']?', "HIGH",
+     "Mot de passe en clair detecte. Ne jamais stocker de mots de passe dans le code"),
+
+    # Tokens
+    ("JWT Token", r'(?:JWT|jwt|token|TOKEN)\s*[=:]\s*["\']?(eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*)["\']?', "HIGH",
+     "JWT token en dur detecte. Les tokens doivent etre generes dynamiquement"),
+    ("Bearer Token", r'(?:BEARER|bearer|AUTH|auth)(?:_TOKEN|_token)?\s*[=:]\s*["\']?([a-zA-Z0-9_\-]{32,})["\']?', "HIGH",
+     "Token d'authentification en clair. Utilisez un gestionnaire de secrets"),
+
+    # Private Keys
+    ("RSA Private Key", r'-----BEGIN (?:RSA )?PRIVATE KEY-----', "CRITICAL",
+     "Cle privee RSA detectee! Ne JAMAIS commiter de cles privees. Utilisez un vault"),
+    ("SSH Private Key", r'-----BEGIN OPENSSH PRIVATE KEY-----', "CRITICAL",
+     "Cle privee SSH detectee! Regenerez cette cle et ne la commitez jamais"),
+    ("PGP Private Key", r'-----BEGIN PGP PRIVATE KEY BLOCK-----', "CRITICAL",
+     "Cle privee PGP detectee! Ne jamais exposer de cles privees"),
+
+    # GitHub / GitLab
+    ("GitHub Token", r'(?:GITHUB|github)(?:_TOKEN|_token|_PAT)?\s*[=:]\s*["\']?(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})["\']?', "CRITICAL",
+     "Token GitHub detecte! Revoquez ce token dans les settings GitHub"),
+    ("GitLab Token", r'(?:GITLAB|gitlab)(?:_TOKEN|_token)?\s*[=:]\s*["\']?(glpat-[a-zA-Z0-9\-]{20})["\']?', "CRITICAL",
+     "Token GitLab detecte! Revoquez ce token dans les settings GitLab"),
+
+    # Slack / Discord
+    ("Slack Token", r'(?:SLACK|slack)(?:_TOKEN|_token|_WEBHOOK)?\s*[=:]\s*["\']?(xox[baprs]-[a-zA-Z0-9\-]+)["\']?', "HIGH",
+     "Token Slack detecte. Regenerez ce token dans les settings Slack"),
+    ("Discord Webhook", r'(?:DISCORD|discord)(?:_WEBHOOK|_webhook)?\s*[=:]\s*["\']?(https://discord(?:app)?\.com/api/webhooks/[0-9]+/[a-zA-Z0-9_\-]+)["\']?', "HIGH",
+     "Webhook Discord detecte. Les webhooks peuvent etre abuses pour du spam"),
+
+    # SendGrid / Mailgun / Email
+    ("SendGrid API Key", r'(?:SENDGRID|sendgrid)(?:_API)?(?:_KEY|_key)?\s*[=:]\s*["\']?(SG\.[a-zA-Z0-9_\-]{22}\.[a-zA-Z0-9_\-]{43})["\']?', "HIGH",
+     "Cle SendGrid detectee. Risque d'envoi de spam. Utilisez des IP whitelists"),
+
+    # Twilio
+    ("Twilio Auth Token", r'(?:TWILIO|twilio)(?:_AUTH)?(?:_TOKEN|_token)?\s*[=:]\s*["\']?([a-f0-9]{32})["\']?', "HIGH",
+     "Token Twilio detecte. Risque de facturation SMS non autorisee"),
+
+    # Heroku
+    ("Heroku API Key", r'(?:HEROKU|heroku)(?:_API)?(?:_KEY|_key)?\s*[=:]\s*["\']?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']?', "HIGH",
+     "Cle API Heroku detectee. Risque de modification d'infrastructure"),
+]
+
+# Files to scan for secrets
+SECRET_SCAN_FILES = [
+    ".env", ".env.local", ".env.production", ".env.development", ".env.staging",
+    ".env.example", ".env.sample", ".env.template",
+    "config.py", "config.js", "config.ts", "config.json", "config.yaml", "config.yml",
+    "settings.py", "settings.json", "settings.yaml", "settings.yml",
+    "credentials.json", "credentials.yaml", "credentials.yml",
+    "secrets.json", "secrets.yaml", "secrets.yml",
+    "application.properties", "application.yml", "application.yaml",
+    "docker-compose.yml", "docker-compose.yaml",
+    ".npmrc", ".pypirc", ".netrc",
+    "Dockerfile", "dockerfile",
+]
+
+# File extensions to scan
+SECRET_SCAN_EXTENSIONS = [
+    ".env", ".ini", ".cfg", ".conf", ".config",
+    ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".json", ".yaml", ".yml", ".toml",
+    ".properties", ".xml",
+    ".sh", ".bash", ".zsh",
+    ".dockerfile",
+    ".pem", ".key", ".p12", ".pfx",  # Private key files
+]
+
+
+def mask_secret(value: str, show_chars: int = 4) -> str:
+    """Mask a secret value for safe display."""
+    if not value or len(value) <= show_chars * 2:
+        return "*" * len(value) if value else "****"
+    return value[:show_chars] + "*" * (len(value) - show_chars * 2) + value[-show_chars:]
+
+
+def scan_file_for_secrets(file_path: Path) -> list[SecretFinding]:
+    """Scan a single file for secrets."""
+    findings = []
+
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        lines = content.split("\n")
+
+        for line_num, line in enumerate(lines, 1):
+            # Skip comments (but not PEM headers which start with dashes)
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith("//"):
+                continue
+            # Skip SQL comments but not PEM headers (-----BEGIN)
+            if stripped.startswith("--") and not stripped.startswith("-----BEGIN"):
+                continue
+
+            for secret_name, pattern, severity, recommendation in SECRET_PATTERNS:
+                matches = re.finditer(pattern, line, re.IGNORECASE)
+                for match in matches:
+                    # Extract the secret value (last group or full match)
+                    secret_value = match.group(1) if match.lastindex else match.group(0)
+
+                    # Skip placeholder values
+                    placeholders = ["your_", "xxx", "changeme", "replace", "example", "placeholder", "todo", "<", ">", "${", "{{"]
+                    if any(p in secret_value.lower() for p in placeholders):
+                        continue
+
+                    # Skip very short values (likely not real secrets)
+                    if len(secret_value) < 8 and "KEY" not in secret_name:
+                        continue
+
+                    # Extract key name from the line
+                    key_match = re.search(r'^([A-Z_][A-Z0-9_]*)\s*[=:]', line, re.IGNORECASE)
+                    key_name = key_match.group(1) if key_match else secret_name
+
+                    findings.append(SecretFinding(
+                        secret_type=secret_name,
+                        file_path=str(file_path),
+                        line_number=line_num,
+                        key_name=key_name,
+                        masked_value=mask_secret(secret_value),
+                        severity=severity,
+                        recommendation=recommendation
+                    ))
+                    break  # One finding per line per pattern type
+
+    except Exception as e:
+        logger.debug(f"Error scanning {file_path}: {e}")
+
+    return findings
+
+
+def scan_directory_for_secrets(directory: Path, max_files: int = 1000) -> list[SecretFinding]:
+    """
+    Scan a directory for secrets in configuration files.
+
+    Args:
+        directory: Path to scan
+        max_files: Maximum files to scan (for performance)
+
+    Returns:
+        List of SecretFinding objects
+    """
+    findings = []
+    files_scanned = 0
+
+    # First, scan known sensitive files
+    for filename in SECRET_SCAN_FILES:
+        file_path = directory / filename
+        if file_path.exists() and file_path.is_file():
+            findings.extend(scan_file_for_secrets(file_path))
+            files_scanned += 1
+
+    # Then scan by extension (limited depth for performance)
+    for ext in SECRET_SCAN_EXTENSIONS:
+        if files_scanned >= max_files:
+            break
+
+        for file_path in directory.rglob(f"*{ext}"):
+            if files_scanned >= max_files:
+                break
+
+            # Skip node_modules, venv, .git, etc.
+            path_str = str(file_path).lower()
+            skip_patterns = ["node_modules", "venv", ".venv", "__pycache__", ".git", "dist", "build"]
+            if any(p in path_str for p in skip_patterns):
+                continue
+
+            # Skip already scanned files
+            if file_path.name in SECRET_SCAN_FILES:
+                continue
+
+            findings.extend(scan_file_for_secrets(file_path))
+            files_scanned += 1
+
+    # Deduplicate findings (same secret in same file)
+    seen = set()
+    unique_findings = []
+    for f in findings:
+        key = (f.file_path, f.line_number, f.secret_type)
+        if key not in seen:
+            seen.add(key)
+            unique_findings.append(f)
+
+    logger.info(f"Secret scan: scanned {files_scanned} files, found {len(unique_findings)} potential secrets")
+    return unique_findings
+
+
+def format_secret_alerts(findings: list[SecretFinding]) -> str:
+    """Format secret findings as a security alert section."""
+    if not findings:
+        return ""
+
+    lines = []
+    lines.append("## ⚠️ ALERTE: Secrets Detectes")
+    lines.append("")
+    lines.append("> **ATTENTION**: Des secrets et donnees sensibles ont ete detectes dans votre projet.")
+    lines.append("> Meme si votre environnement est local, ces donnees peuvent fuiter via:")
+    lines.append("> - Les logs et historiques de conversation avec l'IA")
+    lines.append("> - Les commits Git accidentels")
+    lines.append("> - Les sauvegardes et synchronisations cloud")
+    lines.append("> - Les rapports d'erreur automatiques")
+    lines.append("")
+
+    # Group by severity
+    critical = [f for f in findings if f.severity == "CRITICAL"]
+    high = [f for f in findings if f.severity == "HIGH"]
+
+    if critical:
+        lines.append("### 🔴 CRITIQUE - Action Immediate Requise")
+        lines.append("")
+        for finding in critical:
+            rel_path = Path(finding.file_path).name
+            lines.append(f"**{finding.secret_type}** dans `{rel_path}:{finding.line_number}`")
+            lines.append(f"- Variable: `{finding.key_name}`")
+            lines.append(f"- Valeur: `{finding.masked_value}`")
+            lines.append(f"- ⚡ {finding.recommendation}")
+            lines.append("")
+
+    if high:
+        lines.append("### 🟠 ELEVE - Correction Recommandee")
+        lines.append("")
+        for finding in high[:10]:  # Limit display
+            rel_path = Path(finding.file_path).name
+            lines.append(f"- **{finding.key_name}** (`{finding.secret_type}`) dans `{rel_path}:{finding.line_number}`")
+        if len(high) > 10:
+            lines.append(f"- ... et {len(high) - 10} autres")
+        lines.append("")
+
+    # Recommendations
+    lines.append("### Recommandations Generales")
+    lines.append("")
+    lines.append("1. **Ne jamais commiter de secrets** - Ajoutez `.env` a `.gitignore`")
+    lines.append("2. **Utilisez des variables d'environnement** - Chargez les secrets au runtime")
+    lines.append("3. **Secrets Manager** - AWS Secrets Manager, HashiCorp Vault, Doppler")
+    lines.append("4. **Rotation reguliere** - Changez vos cles API periodiquement")
+    lines.append("5. **Principe du moindre privilege** - Limitez les permissions des cles")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("# Exemple: Charger les secrets depuis l'environnement")
+    lines.append("export API_KEY=$(cat /run/secrets/api_key)")
+    lines.append("# Ou utilisez un fichier .env NON commite")
+    lines.append("```")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 # =============================================================================
 # DEV CONTEXT DETECTION
 # =============================================================================
