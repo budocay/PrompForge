@@ -21,7 +21,10 @@ from typing import Optional
 from .security import (
     SecurityContext,
     CVEInfo,
+    SecretFinding,
     get_security_guidelines,
+    scan_directory_for_secrets,
+    format_secret_alerts,
     OWASP_TOP_10,
     SECURITY_KEYWORDS,
 )
@@ -662,6 +665,7 @@ class ScanResult:
     # Security
     packages: list[DetectedPackage] = field(default_factory=list)
     security_alerts: list[SecurityAlert] = field(default_factory=list)
+    secret_findings: list[SecretFinding] = field(default_factory=list)
 
 
 # =============================================================================
@@ -741,6 +745,9 @@ class ProjectScanner:
         result.dev_commands = self._detect_dev_commands(path)
         result.env_variables = self._detect_env_variables(path)
         result.packages = self._detect_packages(path)
+
+        # Secret detection (API keys, passwords, tokens)
+        result.secret_findings = scan_directory_for_secrets(path)
 
         # Final stats
         result.files_scanned = self._files_scanned
@@ -2813,6 +2820,13 @@ class ProjectScanner:
                 lines.append("Aucune commande de remediation automatique disponible.")
                 lines.append("Vérifier manuellement les versions des packages affectés.")
                 lines.append("")
+
+        # Secret Findings (API keys, passwords, tokens)
+        if result.secret_findings:
+            lines.append("---")
+            lines.append("")
+            secret_alert_text = format_secret_alerts(result.secret_findings)
+            lines.append(secret_alert_text)
 
         # Footer
         lines.append("---")

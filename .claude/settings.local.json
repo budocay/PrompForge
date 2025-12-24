@@ -10,7 +10,9 @@
       "Bash(python -X utf8 -m tests.test_real_value:*)",
       "Bash(python:*)",
       "Bash(pip show:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(git -C \"D:/Dev/promptforge\" status --porcelain)",
+      "Bash(git -C \"D:/Dev/promptforge\" show HEAD:docs/STRUCTURE.md)"
     ]
   }
 }

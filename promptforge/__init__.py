@@ -20,8 +20,11 @@ from .security import (
     check_package_cve,
     get_security_guidelines,
     enrich_prompt_with_security,
+    scan_directory_for_secrets,
+    format_secret_alerts,
     CVEInfo,
     SecurityContext,
+    SecretFinding,
 )
 
 __all__ = [
@@ -45,6 +48,9 @@ __all__ = [
     "check_package_cve",
     "get_security_guidelines",
     "enrich_prompt_with_security",
+    "scan_directory_for_secrets",
+    "format_secret_alerts",
     "CVEInfo",
     "SecurityContext",
+    "SecretFinding",
 ]

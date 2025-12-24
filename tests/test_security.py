@@ -429,6 +429,309 @@ class TestRealWorldScenarios:
         print(enriched[:500])
 
 
+# =============================================================================
+# SECRET DETECTION TESTS
+# =============================================================================
+
+from promptforge.security import (
+    scan_file_for_secrets,
+    scan_directory_for_secrets,
+    format_secret_alerts,
+    mask_secret,
+    SecretFinding,
+)
+from pathlib import Path
+import tempfile
+
+
+class TestSecretMasking:
+    """Tests for secret masking function."""
+
+    def test_mask_short_secret(self):
+        """Should fully mask short secrets."""
+        masked = mask_secret("abc123")
+        assert "abc" not in masked
+        assert masked == "******"
+
+    def test_mask_long_secret(self):
+        """Should show first and last chars of long secrets."""
+        masked = mask_secret("sk-1234567890abcdefghij")
+        assert masked.startswith("sk-1")
+        assert masked.endswith("ghij")
+        assert "****" in masked
+
+    def test_mask_empty(self):
+        """Should handle empty string."""
+        masked = mask_secret("")
+        assert masked == "****"
+
+
+class TestSecretFileScanning:
+    """Tests for file-level secret scanning."""
+
+    def test_scan_env_file_with_secrets(self):
+        """Should detect secrets in .env file."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("DATABASE_URL=postgresql://user:password123@localhost/db\n")
+            f.write("API_KEY=sk-1234567890abcdefghijklmnopqrstuvwxyz\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert len(findings) >= 2
+            secret_types = [f.secret_type for f in findings]
+            assert any("Database" in t for t in secret_types)
+        finally:
+            path.unlink()
+
+    def test_scan_file_with_aws_keys(self):
+        """Should detect AWS credentials."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
+            f.write("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert len(findings) >= 1
+            assert any("AWS" in f.secret_type for f in findings)
+            assert all(f.severity in ["HIGH", "CRITICAL"] for f in findings)
+        finally:
+            path.unlink()
+
+    def test_scan_file_with_github_token(self):
+        """Should detect GitHub tokens."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert len(findings) >= 1
+            assert any("GitHub" in f.secret_type for f in findings)
+        finally:
+            path.unlink()
+
+    def test_skip_placeholder_values(self):
+        """Should skip placeholder values."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("API_KEY=your_api_key_here\n")
+            f.write("SECRET=<replace_with_secret>\n")
+            f.write("PASSWORD=changeme\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            # Should not flag placeholder values
+            assert len(findings) == 0
+        finally:
+            path.unlink()
+
+    def test_skip_comments(self):
+        """Should skip commented lines."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("# API_KEY=sk-1234567890abcdefghijklmnopqrstuvwxyz\n")
+            f.write("// ANOTHER_KEY=secret123456789012345\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert len(findings) == 0
+        finally:
+            path.unlink()
+
+
+class TestSecretDirectoryScanning:
+    """Tests for directory-level secret scanning."""
+
+    def test_scan_directory_with_secrets(self):
+        """Should scan multiple files in directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+
+            # Create .env file
+            (project / '.env').write_text("API_KEY=sk-1234567890abcdef\n")
+
+            # Create config.py
+            (project / 'config.py').write_text('SECRET = "my_secret_value_123456789"\n')
+
+            findings = scan_directory_for_secrets(project)
+            assert len(findings) >= 1
+
+    def test_scan_skips_node_modules(self):
+        """Should skip node_modules directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+
+            # Create node_modules with secrets (should be skipped)
+            nm = project / 'node_modules' / 'some_pkg'
+            nm.mkdir(parents=True)
+            (nm / 'config.js').write_text('const KEY = "sk-1234567890abcdef";\n')
+
+            # Create real file with secret
+            (project / '.env').write_text("API_KEY=sk-realkey1234567890\n")
+
+            findings = scan_directory_for_secrets(project)
+
+            # Should only find the .env secret, not node_modules
+            file_paths = [f.file_path for f in findings]
+            assert not any("node_modules" in p for p in file_paths)
+
+    def test_scan_empty_directory(self):
+        """Should handle empty directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir)
+            findings = scan_directory_for_secrets(project)
+            assert findings == []
+
+
+class TestSecretAlertFormatting:
+    """Tests for secret alert formatting."""
+
+    def test_format_critical_findings(self):
+        """Should format critical findings with emphasis."""
+        findings = [
+            SecretFinding(
+                secret_type="AWS Secret Key",
+                file_path="/project/.env",
+                line_number=5,
+                key_name="AWS_SECRET_KEY",
+                masked_value="wJal****EKEY",
+                severity="CRITICAL",
+                recommendation="Use AWS IAM roles"
+            )
+        ]
+        alert = format_secret_alerts(findings)
+
+        assert "CRITIQUE" in alert
+        assert "AWS_SECRET_KEY" in alert
+        assert "wJal****EKEY" in alert
+
+    def test_format_high_findings(self):
+        """Should format high severity findings."""
+        findings = [
+            SecretFinding(
+                secret_type="Generic API Key",
+                file_path="/project/config.py",
+                line_number=10,
+                key_name="API_KEY",
+                masked_value="sk-1****wxyz",
+                severity="HIGH",
+                recommendation="Use environment variables"
+            )
+        ]
+        alert = format_secret_alerts(findings)
+
+        assert "ELEVE" in alert
+        assert "API_KEY" in alert
+
+    def test_format_empty_findings(self):
+        """Should return empty string for no findings."""
+        alert = format_secret_alerts([])
+        assert alert == ""
+
+    def test_format_includes_recommendations(self):
+        """Should include general recommendations."""
+        findings = [
+            SecretFinding(
+                secret_type="Test",
+                file_path="/test",
+                line_number=1,
+                key_name="TEST",
+                masked_value="****",
+                severity="HIGH",
+                recommendation="Test rec"
+            )
+        ]
+        alert = format_secret_alerts(findings)
+
+        assert "gitignore" in alert.lower() or ".env" in alert
+        assert "Secrets Manager" in alert or "secrets" in alert.lower()
+
+
+class TestSecretPatterns:
+    """Tests for specific secret pattern detection."""
+
+    def test_detect_openai_key(self):
+        """Should detect OpenAI API keys."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("OPENAI_API_KEY=sk-proj-1234567890abcdefghijklmnopqrstuvwxyz\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert any("OpenAI" in f.secret_type for f in findings)
+        finally:
+            path.unlink()
+
+    def test_detect_anthropic_key(self):
+        """Should detect Anthropic API keys."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert any("Anthropic" in f.secret_type for f in findings)
+        finally:
+            path.unlink()
+
+    def test_detect_stripe_live_key(self):
+        """Should detect Stripe live keys as critical."""
+        # Use fake key that looks real but won't trigger GitHub scanner
+        # Pattern: sk_live_ + 24 alphanumeric (avoid xxx which is filtered as placeholder)
+        fake_stripe_key = "sk_live_" + "0a1b2c3d4e5f6g7h8i9j0k1l"
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(f'STRIPE_SECRET_KEY = "{fake_stripe_key}"\n')
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            stripe_findings = [f for f in findings if "Stripe" in f.secret_type]
+            assert len(stripe_findings) >= 1
+            assert any(f.severity == "CRITICAL" for f in stripe_findings)
+        finally:
+            path.unlink()
+
+    def test_detect_jwt_token(self):
+        """Should detect JWT tokens."""
+        jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(f'TOKEN = "{jwt}"\n')
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert any("JWT" in f.secret_type for f in findings)
+        finally:
+            path.unlink()
+
+    def test_detect_private_key(self):
+        """Should detect private keys."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False) as f:
+            f.write("-----BEGIN RSA PRIVATE KEY-----\n")
+            f.write("MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF6M...\n")
+            f.write("-----END RSA PRIVATE KEY-----\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert any("Private Key" in f.secret_type for f in findings)
+            assert any(f.severity == "CRITICAL" for f in findings)
+        finally:
+            path.unlink()
+
+
 if __name__ == "__main__":
     # Run with: python -m pytest tests/test_security.py -v
     # Run integration tests: python -m pytest tests/test_security.py -v -m integration
