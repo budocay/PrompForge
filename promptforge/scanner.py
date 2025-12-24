@@ -4,6 +4,11 @@ Project Scanner - Automatic project analysis and configuration generation.
 This module provides functionality to scan a project directory and automatically
 detect languages, frameworks, databases, code conventions, tests, and infrastructure.
 It generates a comprehensive Markdown configuration file for PromptForge.
+
+Security Features:
+- CVE checking via OSV.dev API
+- Language-specific security guidelines
+- OWASP Top 10 reminders
 """
 
 import re
@@ -12,6 +17,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from .security import (
+    SecurityContext,
+    CVEInfo,
+    get_security_guidelines,
+    OWASP_TOP_10,
+    SECURITY_KEYWORDS,
+)
 
 
 # =============================================================================
@@ -119,6 +132,32 @@ FRAMEWORK_SIGNATURES = {
         "pattern": r"starlette",
         "category": "backend",
     },
+    # Python UI/Web Frameworks
+    "Gradio": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"gradio",
+        "category": "ui",
+    },
+    "Streamlit": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"streamlit",
+        "category": "ui",
+    },
+    "Panel": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"panel(?!-)",
+        "category": "ui",
+    },
+    "Dash": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"dash(?!-)",
+        "category": "ui",
+    },
+    "Nicegui": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"nicegui",
+        "category": "ui",
+    },
     # Python ORM
     "SQLAlchemy": {
         "files": ["requirements.txt", "pyproject.toml"],
@@ -134,6 +173,47 @@ FRAMEWORK_SIGNATURES = {
         "files": ["requirements.txt", "pyproject.toml"],
         "pattern": r"peewee",
         "category": "orm",
+    },
+    "Prisma": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"prisma",
+        "category": "orm",
+    },
+    # Python Libraries (common)
+    "Pydantic": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"pydantic",
+        "category": "validation",
+    },
+    "httpx": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"httpx",
+        "category": "http",
+    },
+    "requests": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"requests(?!-)",
+        "category": "http",
+    },
+    "aiohttp": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"aiohttp",
+        "category": "http",
+    },
+    "Celery": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"celery",
+        "category": "task-queue",
+    },
+    "RQ": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"rq(?!-)",
+        "category": "task-queue",
+    },
+    "Dramatiq": {
+        "files": ["requirements.txt", "pyproject.toml"],
+        "pattern": r"dramatiq",
+        "category": "task-queue",
     },
     # JavaScript/TypeScript Frontend
     "React": {
@@ -511,6 +591,54 @@ class ProjectStructure:
 
 
 @dataclass
+class KeyFile:
+    """Important project file."""
+    path: str
+    category: str  # entry_point, config, main, api, etc.
+    description: str = ""
+
+
+@dataclass
+class DevCommand:
+    """Development command."""
+    name: str
+    command: str
+    source: str  # Makefile, package.json, pyproject.toml
+
+
+@dataclass
+class EnvVariable:
+    """Environment variable."""
+    name: str
+    example: str = ""
+    required: bool = True
+    description: str = ""
+
+
+@dataclass
+class DetectedPackage:
+    """Detected package dependency."""
+    ecosystem: str  # PyPI, npm, crates.io
+    name: str
+    version: str  # Version effective (installed si dispo, sinon declared)
+    source_file: str = ""
+    declared_version: str = ""  # Version dans le fichier de config
+    installed_version: str = ""  # Version réellement installée
+    version_source: str = "declared"  # "installed" ou "declared"
+
+
+@dataclass
+class SecurityAlert:
+    """Security vulnerability alert."""
+    cve_id: str
+    package: str
+    severity: str  # LOW, MEDIUM, HIGH, CRITICAL
+    summary: str = ""
+    fixed_version: Optional[str] = None
+    references: list[str] = field(default_factory=list)  # Links to advisories
+
+
+@dataclass
 class ScanResult:
     """Complete scan result."""
 
@@ -527,6 +655,13 @@ class ScanResult:
     scan_duration_ms: int = 0
     files_scanned: int = 0
     errors: list[str] = field(default_factory=list)
+    # Nouvelles détections
+    key_files: list[KeyFile] = field(default_factory=list)
+    dev_commands: list[DevCommand] = field(default_factory=list)
+    env_variables: list[EnvVariable] = field(default_factory=list)
+    # Security
+    packages: list[DetectedPackage] = field(default_factory=list)
+    security_alerts: list[SecurityAlert] = field(default_factory=list)
 
 
 # =============================================================================
@@ -600,6 +735,12 @@ class ProjectScanner:
         result.docker = self._scan_docker(path)
         result.cicd = self._scan_cicd(path)
         result.readme_description = self._extract_description(path)
+
+        # New detections for richer config
+        result.key_files = self._detect_key_files(path)
+        result.dev_commands = self._detect_dev_commands(path)
+        result.env_variables = self._detect_env_variables(path)
+        result.packages = self._detect_packages(path)
 
         # Final stats
         result.files_scanned = self._files_scanned
@@ -1088,6 +1229,1115 @@ class ProjectScanner:
 
         return None
 
+    def _detect_key_files(self, path: Path) -> list[KeyFile]:
+        """Detect important project files."""
+        key_files = []
+
+        # Entry points and main files
+        entry_points = [
+            ("main.py", "entry_point", "Point d'entrée Python"),
+            ("app.py", "entry_point", "Application principale"),
+            ("index.py", "entry_point", "Point d'entrée"),
+            ("__main__.py", "entry_point", "Module executable"),
+            ("cli.py", "entry_point", "Interface CLI"),
+            ("server.py", "entry_point", "Serveur"),
+            ("manage.py", "entry_point", "Django manage"),
+            ("index.ts", "entry_point", "Point d'entrée TypeScript"),
+            ("index.js", "entry_point", "Point d'entrée JavaScript"),
+            ("main.ts", "entry_point", "Point d'entrée TypeScript"),
+            ("main.go", "entry_point", "Point d'entrée Go"),
+            ("main.rs", "entry_point", "Point d'entrée Rust"),
+        ]
+
+        # Config files
+        config_files = [
+            ("pyproject.toml", "config", "Config Python/projet"),
+            ("package.json", "config", "Config Node.js"),
+            ("tsconfig.json", "config", "Config TypeScript"),
+            ("Cargo.toml", "config", "Config Rust"),
+            ("go.mod", "config", "Config Go"),
+            ("docker-compose.yml", "config", "Config Docker Compose"),
+            ("docker-compose.yaml", "config", "Config Docker Compose"),
+            ("Dockerfile", "config", "Image Docker"),
+            (".env.example", "config", "Variables d'environnement"),
+            ("Makefile", "config", "Commandes Make"),
+        ]
+
+        # Check entry points in root and common subdirs
+        for filename, category, desc in entry_points + config_files:
+            if (path / filename).exists():
+                key_files.append(KeyFile(filename, category, desc))
+
+            # Check in common subdirs
+            for subdir in ["src", "app", "lib", "pkg"]:
+                subpath = path / subdir / filename
+                if subpath.exists():
+                    key_files.append(KeyFile(f"{subdir}/{filename}", category, desc))
+
+        return key_files[:15]  # Limit to 15 most important
+
+    def _detect_dev_commands(self, path: Path) -> list[DevCommand]:
+        """Detect development commands from Makefile, package.json, pyproject.toml."""
+        commands = []
+
+        # Makefile
+        makefile = path / "Makefile"
+        if makefile.exists():
+            content = self._safe_read_file(makefile)
+            if content:
+                # Find targets (lines starting with name:)
+                for match in re.finditer(r'^([a-zA-Z_-]+):\s*(?:.*)?$', content, re.MULTILINE):
+                    target = match.group(1)
+                    if not target.startswith('.') and target not in ['all', 'clean', 'help']:
+                        commands.append(DevCommand(target, f"make {target}", "Makefile"))
+
+        # package.json
+        pkg_json = path / "package.json"
+        if pkg_json.exists():
+            content = self._safe_read_file(pkg_json)
+            if content:
+                try:
+                    import json
+                    data = json.loads(content)
+                    scripts = data.get("scripts", {})
+                    for name, cmd in list(scripts.items())[:10]:
+                        commands.append(DevCommand(name, f"npm run {name}", "package.json"))
+                except:
+                    pass
+
+        # pyproject.toml scripts
+        pyproject = path / "pyproject.toml"
+        if pyproject.exists():
+            content = self._safe_read_file(pyproject)
+            if content:
+                # Look for [tool.poetry.scripts] or [project.scripts]
+                in_scripts = False
+                for line in content.split("\n"):
+                    if "[tool.poetry.scripts]" in line or "[project.scripts]" in line:
+                        in_scripts = True
+                        continue
+                    if in_scripts:
+                        if line.startswith("["):
+                            break
+                        match = re.match(r'(\w+)\s*=', line)
+                        if match:
+                            name = match.group(1)
+                            commands.append(DevCommand(name, name, "pyproject.toml"))
+
+        return commands[:15]
+
+    def _detect_env_variables(self, path: Path) -> list[EnvVariable]:
+        """Detect environment variables from .env.example, docker-compose, etc."""
+        env_vars = []
+        seen = set()
+
+        # .env.example or .env.sample
+        for env_file in [".env.example", ".env.sample", ".env.template"]:
+            env_path = path / env_file
+            if env_path.exists():
+                content = self._safe_read_file(env_path)
+                if content:
+                    for line in content.split("\n"):
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            parts = line.split("=", 1)
+                            name = parts[0].strip()
+                            value = parts[1].strip() if len(parts) > 1 else ""
+                            if name and name not in seen:
+                                seen.add(name)
+                                env_vars.append(EnvVariable(name, value))
+
+        # docker-compose.yml environment section
+        for compose_file in ["docker-compose.yml", "docker-compose.yaml"]:
+            compose_path = path / compose_file
+            if compose_path.exists():
+                content = self._safe_read_file(compose_path)
+                if content:
+                    # Simple regex to find environment variables
+                    for match in re.finditer(r'^\s*-?\s*([A-Z][A-Z0-9_]+)(?:=|\s*:)', content, re.MULTILINE):
+                        name = match.group(1)
+                        if name not in seen and not name.startswith("COMPOSE"):
+                            seen.add(name)
+                            env_vars.append(EnvVariable(name, "", True, "docker-compose"))
+
+        return env_vars[:20]
+
+    def _get_installed_packages(self) -> dict[str, str]:
+        """
+        Get actually installed Python package versions using importlib.metadata.
+        Returns dict mapping package_name (lowercase) -> version.
+        """
+        installed = {}
+        try:
+            from importlib.metadata import distributions
+            for dist in distributions():
+                name = dist.metadata.get("Name", "").lower()
+                version = dist.metadata.get("Version", "")
+                if name and version:
+                    installed[name] = version
+                    # Also add with underscores replaced by hyphens and vice versa
+                    installed[name.replace("-", "_")] = version
+                    installed[name.replace("_", "-")] = version
+        except Exception:
+            pass
+        return installed
+
+    def _parse_npm_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse package-lock.json for installed npm package versions.
+        Returns dict mapping package_name -> version.
+        """
+        installed = {}
+        lockfile = path / "package-lock.json"
+        if not lockfile.exists():
+            return installed
+
+        content = self._safe_read_file(lockfile)
+        if not content:
+            return installed
+
+        try:
+            import json
+            data = json.loads(content)
+
+            # package-lock.json v2/v3 format (packages field)
+            if "packages" in data:
+                for pkg_path, pkg_info in data["packages"].items():
+                    if pkg_path.startswith("node_modules/"):
+                        name = pkg_path.replace("node_modules/", "").split("/")[0]
+                        # Handle scoped packages (@org/pkg)
+                        if name.startswith("@") and "/" in pkg_path.replace("node_modules/", ""):
+                            parts = pkg_path.replace("node_modules/", "").split("/")
+                            name = f"{parts[0]}/{parts[1]}"
+                        version = pkg_info.get("version", "")
+                        if name and version:
+                            installed[name.lower()] = version
+
+            # package-lock.json v1 format (dependencies field)
+            elif "dependencies" in data:
+                for name, info in data["dependencies"].items():
+                    version = info.get("version", "")
+                    if version:
+                        installed[name.lower()] = version
+        except Exception:
+            pass
+
+        return installed
+
+    def _parse_cargo_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse Cargo.lock for installed Rust crate versions.
+        Returns dict mapping crate_name -> version.
+        """
+        installed = {}
+        lockfile = path / "Cargo.lock"
+        if not lockfile.exists():
+            return installed
+
+        content = self._safe_read_file(lockfile)
+        if not content:
+            return installed
+
+        # Parse TOML-like format: [[package]] name = "x" version = "y"
+        current_name = None
+        for line in content.split("\n"):
+            line = line.strip()
+            if line.startswith("name = "):
+                current_name = line.split('"')[1] if '"' in line else None
+            elif line.startswith("version = ") and current_name:
+                version = line.split('"')[1] if '"' in line else None
+                if version:
+                    installed[current_name.lower()] = version
+                current_name = None
+
+        return installed
+
+    def _parse_go_sum(self, path: Path) -> dict[str, str]:
+        """
+        Parse go.sum for Go module versions.
+        Returns dict mapping module_path -> version.
+        """
+        installed = {}
+        sumfile = path / "go.sum"
+        if not sumfile.exists():
+            return installed
+
+        content = self._safe_read_file(sumfile)
+        if not content:
+            return installed
+
+        for line in content.split("\n"):
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                module = parts[0]
+                version = parts[1].lstrip("v").split("/")[0]  # Remove v prefix and /go.mod suffix
+                if module and version and not version.endswith("/go.mod"):
+                    # Use last part of module path as name
+                    name = module.split("/")[-1] if "/" in module else module
+                    installed[name.lower()] = version
+                    installed[module.lower()] = version  # Also store full path
+
+        return installed
+
+    def _parse_composer_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse composer.lock for PHP package versions.
+        Returns dict mapping package_name -> version.
+        """
+        installed = {}
+        lockfile = path / "composer.lock"
+        if not lockfile.exists():
+            return installed
+
+        content = self._safe_read_file(lockfile)
+        if not content:
+            return installed
+
+        try:
+            import json
+            data = json.loads(content)
+
+            for pkg in data.get("packages", []):
+                name = pkg.get("name", "")
+                version = pkg.get("version", "").lstrip("v")
+                if name and version:
+                    installed[name.lower()] = version
+                    # Also store just the package name without vendor
+                    if "/" in name:
+                        installed[name.split("/")[1].lower()] = version
+
+            for pkg in data.get("packages-dev", []):
+                name = pkg.get("name", "")
+                version = pkg.get("version", "").lstrip("v")
+                if name and version:
+                    installed[name.lower()] = version
+        except Exception:
+            pass
+
+        return installed
+
+    def _parse_gemfile_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse Gemfile.lock for Ruby gem versions.
+        Returns dict mapping gem_name -> version.
+        """
+        installed = {}
+        lockfile = path / "Gemfile.lock"
+        if not lockfile.exists():
+            return installed
+
+        content = self._safe_read_file(lockfile)
+        if not content:
+            return installed
+
+        # Parse GEM section
+        in_specs = False
+        for line in content.split("\n"):
+            if "specs:" in line:
+                in_specs = True
+                continue
+            if in_specs:
+                if line and not line.startswith(" "):
+                    in_specs = False
+                    continue
+                # Match "    gem_name (version)"
+                match = re.match(r'^\s{4}([a-zA-Z0-9_-]+)\s+\(([0-9.]+)', line)
+                if match:
+                    name = match.group(1)
+                    version = match.group(2)
+                    installed[name.lower()] = version
+
+        return installed
+
+    def _parse_nuget_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse packages.lock.json or *.csproj for .NET package versions.
+        Returns dict mapping package_name -> version.
+        """
+        installed = {}
+
+        # Try packages.lock.json first (NuGet lock file)
+        lockfile = path / "packages.lock.json"
+        if lockfile.exists():
+            content = self._safe_read_file(lockfile)
+            if content:
+                try:
+                    import json
+                    data = json.loads(content)
+                    for framework, deps in data.get("dependencies", {}).items():
+                        for name, info in deps.items():
+                            version = info.get("resolved", "")
+                            if version:
+                                installed[name.lower()] = version
+                except Exception:
+                    pass
+
+        # Also try parsing .csproj files for PackageReference
+        for csproj in path.glob("*.csproj"):
+            content = self._safe_read_file(csproj)
+            if content:
+                for match in re.finditer(
+                    r'<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)"',
+                    content
+                ):
+                    name = match.group(1)
+                    version = match.group(2)
+                    if name and version:
+                        installed[name.lower()] = version
+
+        return installed
+
+    def _parse_gradle_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse gradle.lockfile or build.gradle for Java/Kotlin dependency versions.
+        Returns dict mapping artifact_name -> version.
+        """
+        installed = {}
+
+        # Try gradle.lockfile
+        lockfile = path / "gradle.lockfile"
+        if lockfile.exists():
+            content = self._safe_read_file(lockfile)
+            if content:
+                for line in content.split("\n"):
+                    # Format: group:artifact:version=hash
+                    if ":" in line and "=" in line:
+                        parts = line.split("=")[0].split(":")
+                        if len(parts) >= 3:
+                            artifact = parts[1]
+                            version = parts[2]
+                            installed[artifact.lower()] = version
+
+        # Also try build.gradle
+        for gradle_file in ["build.gradle", "build.gradle.kts"]:
+            gradle_path = path / gradle_file
+            if gradle_path.exists():
+                content = self._safe_read_file(gradle_path)
+                if content:
+                    # Match implementation 'group:artifact:version'
+                    for match in re.finditer(
+                        r"(?:implementation|api|compile)\s*['\"]([^:]+):([^:]+):([^'\"]+)['\"]",
+                        content
+                    ):
+                        artifact = match.group(2)
+                        version = match.group(3)
+                        installed[artifact.lower()] = version
+
+        return installed
+
+    def _parse_maven_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse pom.xml for Maven dependency versions.
+        Returns dict mapping artifact_name -> version.
+        """
+        installed = {}
+        pom_file = path / "pom.xml"
+        if not pom_file.exists():
+            return installed
+
+        content = self._safe_read_file(pom_file)
+        if not content:
+            return installed
+
+        # Simple regex parsing for <dependency> blocks
+        # Match <artifactId>xxx</artifactId> followed by <version>yyy</version>
+        for match in re.finditer(
+            r'<artifactId>([^<]+)</artifactId>\s*<version>([^<]+)</version>',
+            content,
+            re.DOTALL
+        ):
+            artifact = match.group(1).strip()
+            version = match.group(2).strip()
+            # Skip version variables like ${project.version}
+            if version and not version.startswith("$"):
+                installed[artifact.lower()] = version
+
+        return installed
+
+    def _parse_conan_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse conan.lock for C/C++ Conan package versions.
+        Returns dict mapping package_name -> version.
+        """
+        installed = {}
+
+        # Try conan.lock (Conan 2.x format - JSON)
+        lockfile = path / "conan.lock"
+        if lockfile.exists():
+            content = self._safe_read_file(lockfile)
+            if content:
+                try:
+                    import json
+                    data = json.loads(content)
+                    # Conan 2.x format: {"requires": ["pkg/version@...", ...]}
+                    for req in data.get("requires", []):
+                        # Format: "package/version@user/channel" or "package/version"
+                        if "/" in req:
+                            parts = req.split("/")
+                            name = parts[0]
+                            version = parts[1].split("@")[0] if "@" in parts[1] else parts[1]
+                            installed[name.lower()] = version
+                except Exception:
+                    pass
+
+        # Try conanfile.lock (Conan 1.x format)
+        lockfile_v1 = path / "conanfile.lock"
+        if lockfile_v1.exists():
+            content = self._safe_read_file(lockfile_v1)
+            if content:
+                try:
+                    import json
+                    data = json.loads(content)
+                    # Conan 1.x: graph_lock.nodes
+                    nodes = data.get("graph_lock", {}).get("nodes", {})
+                    for node_id, node_info in nodes.items():
+                        ref = node_info.get("ref", "")
+                        if "/" in ref:
+                            parts = ref.split("/")
+                            name = parts[0]
+                            version = parts[1].split("@")[0] if "@" in parts[1] else parts[1]
+                            installed[name.lower()] = version
+                except Exception:
+                    pass
+
+        return installed
+
+    def _parse_vcpkg_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse vcpkg.json and vcpkg-configuration.json for C/C++ vcpkg package versions.
+        Returns dict mapping package_name -> version.
+        """
+        installed = {}
+
+        # vcpkg.json manifest
+        manifest = path / "vcpkg.json"
+        if manifest.exists():
+            content = self._safe_read_file(manifest)
+            if content:
+                try:
+                    import json
+                    data = json.loads(content)
+
+                    # Dependencies can be strings or objects
+                    for dep in data.get("dependencies", []):
+                        if isinstance(dep, str):
+                            # Simple dependency: "boost"
+                            installed[dep.lower()] = "latest"
+                        elif isinstance(dep, dict):
+                            # Object: {"name": "boost", "version>=": "1.80.0"}
+                            name = dep.get("name", "")
+                            version = dep.get("version>=", dep.get("version", "latest"))
+                            if name:
+                                installed[name.lower()] = str(version)
+
+                    # Check overrides for pinned versions
+                    for override in data.get("overrides", []):
+                        name = override.get("name", "")
+                        version = override.get("version", "")
+                        if name and version:
+                            installed[name.lower()] = version
+                except Exception:
+                    pass
+
+        # Also check vcpkg_installed directory for actual versions
+        vcpkg_installed = path / "vcpkg_installed"
+        if vcpkg_installed.exists():
+            # Look for status file
+            for status_file in vcpkg_installed.glob("*/status"):
+                content = self._safe_read_file(status_file)
+                if content:
+                    current_pkg = None
+                    for line in content.split("\n"):
+                        if line.startswith("Package: "):
+                            current_pkg = line.split(": ", 1)[1].strip()
+                        elif line.startswith("Version: ") and current_pkg:
+                            version = line.split(": ", 1)[1].strip()
+                            installed[current_pkg.lower()] = version
+                            current_pkg = None
+
+        return installed
+
+    def _parse_swift_lockfile(self, path: Path) -> dict[str, str]:
+        """
+        Parse Package.resolved for Swift package versions.
+        Returns dict mapping package_name -> version.
+        """
+        installed = {}
+
+        # Package.resolved (Swift Package Manager)
+        resolved = path / "Package.resolved"
+        if not resolved.exists():
+            # Also check in .build directory
+            resolved = path / ".build" / "Package.resolved"
+
+        if not resolved.exists():
+            return installed
+
+        content = self._safe_read_file(resolved)
+        if not content:
+            return installed
+
+        try:
+            import json
+            data = json.loads(content)
+
+            # Version 2 format (Swift 5.6+)
+            if "pins" in data:
+                for pin in data.get("pins", []):
+                    identity = pin.get("identity", "")
+                    state = pin.get("state", {})
+                    version = state.get("version", state.get("revision", "")[:8])
+                    if identity and version:
+                        installed[identity.lower()] = version
+
+            # Version 1 format (older Swift)
+            elif "object" in data:
+                pins = data.get("object", {}).get("pins", [])
+                for pin in pins:
+                    name = pin.get("package", "")
+                    state = pin.get("state", {})
+                    version = state.get("version", state.get("revision", "")[:8])
+                    if name and version:
+                        installed[name.lower()] = version
+        except Exception:
+            pass
+
+        return installed
+
+    def _parse_cmake_packages(self, path: Path) -> dict[str, str]:
+        """
+        Parse CMakeLists.txt for find_package and FetchContent dependencies.
+        Returns dict mapping package_name -> version (or 'detected').
+        """
+        installed = {}
+
+        cmake_file = path / "CMakeLists.txt"
+        if not cmake_file.exists():
+            return installed
+
+        content = self._safe_read_file(cmake_file)
+        if not content:
+            return installed
+
+        # find_package(PackageName VERSION x.y.z)
+        for match in re.finditer(
+            r'find_package\s*\(\s*(\w+)(?:\s+(\d+(?:\.\d+)*))?',
+            content,
+            re.IGNORECASE
+        ):
+            name = match.group(1)
+            version = match.group(2) or "detected"
+            installed[name.lower()] = version
+
+        # FetchContent_Declare with GIT_TAG
+        for match in re.finditer(
+            r'FetchContent_Declare\s*\(\s*(\w+).*?GIT_TAG\s+["\']?v?(\d+\.\d+(?:\.\d+)?)["\']?',
+            content,
+            re.IGNORECASE | re.DOTALL
+        ):
+            name = match.group(1)
+            version = match.group(2)
+            installed[name.lower()] = version
+
+        return installed
+
+    def _detect_packages(self, path: Path) -> list[DetectedPackage]:
+        """
+        Detect package dependencies from manifest files.
+        Uses installed versions when available for accurate CVE checking.
+        """
+        packages = []
+
+        # Get installed packages for version verification
+        installed_packages = self._get_installed_packages()
+
+        def make_package(ecosystem: str, name: str, declared_version: str, source_file: str) -> DetectedPackage:
+            """Helper to create package with installed version if available."""
+            name_lower = name.lower()
+            installed_version = installed_packages.get(name_lower, "")
+
+            # Use installed version if available, otherwise declared
+            if installed_version:
+                effective_version = installed_version
+                version_source = "installed"
+            else:
+                effective_version = declared_version
+                version_source = "declared"
+
+            return DetectedPackage(
+                ecosystem=ecosystem,
+                name=name_lower,
+                version=effective_version,
+                source_file=source_file,
+                declared_version=declared_version,
+                installed_version=installed_version,
+                version_source=version_source
+            )
+
+        # Python: requirements.txt
+        req_files = ["requirements.txt", "requirements-dev.txt", "requirements-prod.txt"]
+        for req_file in req_files:
+            req_path = path / req_file
+            if req_path.exists():
+                content = self._safe_read_file(req_path)
+                if content:
+                    for line in content.split("\n"):
+                        line = line.strip()
+                        if not line or line.startswith("#") or line.startswith("-"):
+                            continue
+                        # Match package==version or package>=version
+                        match = re.match(r"^([a-zA-Z0-9_-]+)\s*[=><]+\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)", line)
+                        if match:
+                            packages.append(make_package(
+                                "PyPI",
+                                match.group(1),
+                                match.group(2),
+                                req_file
+                            ))
+
+        # Python: pyproject.toml
+        # Only scan runtime dependencies, NOT build-system.requires
+        pyproject = path / "pyproject.toml"
+        if pyproject.exists():
+            content = self._safe_read_file(pyproject)
+            if content:
+                # Extract only dependencies sections, skip [build-system]
+                # Look for [project.dependencies] and [project.optional-dependencies.*]
+                deps_sections = []
+
+                # Find dependencies = [...] after [project]
+                project_match = re.search(r'\[project\].*?(?=\n\[|$)', content, re.DOTALL)
+                if project_match:
+                    deps_sections.append(project_match.group(0))
+
+                # Find [project.optional-dependencies.*] sections
+                for match in re.finditer(r'\[project\.optional-dependencies[^\]]*\].*?(?=\n\[|$)', content, re.DOTALL):
+                    deps_sections.append(match.group(0))
+
+                # Parse dependencies from these sections only
+                deps_content = '\n'.join(deps_sections)
+                for match in re.finditer(r'"([a-zA-Z0-9_-]+)(?:\[[\w,]+\])?\s*[=><]+\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)"', deps_content):
+                    pkg_name = match.group(1).lower()
+                    # Skip build tools that might appear
+                    if pkg_name not in ['setuptools', 'wheel', 'pip', 'build']:
+                        packages.append(make_package(
+                            "PyPI",
+                            match.group(1),
+                            match.group(2),
+                            "pyproject.toml"
+                        ))
+
+        # Node.js: package.json with package-lock.json for installed versions
+        npm_installed = self._parse_npm_lockfile(path)
+        package_json = path / "package.json"
+        if package_json.exists():
+            content = self._safe_read_file(package_json)
+            if content:
+                for match in re.finditer(r'"([a-zA-Z0-9@/_-]+)"\s*:\s*"[\^~]?([0-9]+\.[0-9]+(?:\.[0-9]+)?)"', content):
+                    pkg_name = match.group(1)
+                    declared_version = match.group(2)
+                    if not pkg_name.startswith("@types/"):
+                        installed_version = npm_installed.get(pkg_name.lower(), "")
+                        packages.append(DetectedPackage(
+                            ecosystem="npm",
+                            name=pkg_name,
+                            version=installed_version or declared_version,
+                            source_file="package.json",
+                            declared_version=declared_version,
+                            installed_version=installed_version,
+                            version_source="installed" if installed_version else "declared"
+                        ))
+
+        # Rust: Cargo.toml with Cargo.lock for installed versions
+        cargo_installed = self._parse_cargo_lockfile(path)
+        cargo_toml = path / "Cargo.toml"
+        if cargo_toml.exists():
+            content = self._safe_read_file(cargo_toml)
+            if content and "[dependencies]" in content:
+                deps_section = content.split("[dependencies]")[1].split("[")[0]
+                for match in re.finditer(r'^([a-zA-Z0-9_-]+)\s*=\s*"([0-9]+\.[0-9]+(?:\.[0-9]+)?)"', deps_section, re.MULTILINE):
+                    pkg = match.group(1)
+                    declared_version = match.group(2)
+                    if pkg not in ["version", "edition", "name"]:
+                        installed_version = cargo_installed.get(pkg.lower(), "")
+                        packages.append(DetectedPackage(
+                            ecosystem="crates.io",
+                            name=pkg,
+                            version=installed_version or declared_version,
+                            source_file="Cargo.toml",
+                            declared_version=declared_version,
+                            installed_version=installed_version,
+                            version_source="installed" if installed_version else "declared"
+                        ))
+
+        # Go: go.mod with go.sum for installed versions
+        go_installed = self._parse_go_sum(path)
+        go_mod = path / "go.mod"
+        if go_mod.exists():
+            content = self._safe_read_file(go_mod)
+            if content:
+                for match in re.finditer(r'^\s*([a-zA-Z0-9._/-]+)\s+v([0-9]+\.[0-9]+(?:\.[0-9]+)?)', content, re.MULTILINE):
+                    module = match.group(1)
+                    declared_version = match.group(2)
+                    name = module.split("/")[-1] if "/" in module else module
+                    installed_version = go_installed.get(name.lower(), "") or go_installed.get(module.lower(), "")
+                    packages.append(DetectedPackage(
+                        ecosystem="Go",
+                        name=name,
+                        version=installed_version or declared_version,
+                        source_file="go.mod",
+                        declared_version=declared_version,
+                        installed_version=installed_version,
+                        version_source="installed" if installed_version else "declared"
+                    ))
+
+        # PHP: composer.json with composer.lock for installed versions
+        composer_installed = self._parse_composer_lockfile(path)
+        composer_json = path / "composer.json"
+        if composer_json.exists():
+            content = self._safe_read_file(composer_json)
+            if content:
+                try:
+                    import json
+                    data = json.loads(content)
+                    for section in ["require", "require-dev"]:
+                        for pkg_name, version_constraint in data.get(section, {}).items():
+                            if pkg_name != "php" and not pkg_name.startswith("ext-"):
+                                # Extract version from constraint (e.g., "^8.0" -> "8.0")
+                                declared = re.search(r'([0-9]+\.[0-9]+(?:\.[0-9]+)?)', version_constraint)
+                                declared_version = declared.group(1) if declared else ""
+                                installed_version = composer_installed.get(pkg_name.lower(), "")
+                                short_name = pkg_name.split("/")[-1] if "/" in pkg_name else pkg_name
+                                packages.append(DetectedPackage(
+                                    ecosystem="Packagist",
+                                    name=short_name,
+                                    version=installed_version or declared_version,
+                                    source_file="composer.json",
+                                    declared_version=declared_version,
+                                    installed_version=installed_version,
+                                    version_source="installed" if installed_version else "declared"
+                                ))
+                except Exception:
+                    pass
+
+        # Ruby: Gemfile with Gemfile.lock for installed versions
+        gem_installed = self._parse_gemfile_lockfile(path)
+        gemfile = path / "Gemfile"
+        if gemfile.exists():
+            content = self._safe_read_file(gemfile)
+            if content:
+                for match in re.finditer(r"gem\s+['\"]([a-zA-Z0-9_-]+)['\"](?:\s*,\s*['\"]([~>=<\s0-9.]+)['\"])?", content):
+                    gem_name = match.group(1)
+                    version_constraint = match.group(2) or ""
+                    declared = re.search(r'([0-9]+\.[0-9]+(?:\.[0-9]+)?)', version_constraint)
+                    declared_version = declared.group(1) if declared else ""
+                    installed_version = gem_installed.get(gem_name.lower(), "")
+                    packages.append(DetectedPackage(
+                        ecosystem="RubyGems",
+                        name=gem_name,
+                        version=installed_version or declared_version,
+                        source_file="Gemfile",
+                        declared_version=declared_version,
+                        installed_version=installed_version,
+                        version_source="installed" if installed_version else "declared"
+                    ))
+
+        # C#/.NET: *.csproj with packages.lock.json for installed versions
+        nuget_installed = self._parse_nuget_lockfile(path)
+        for csproj in path.glob("*.csproj"):
+            content = self._safe_read_file(csproj)
+            if content:
+                for match in re.finditer(r'<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)"', content):
+                    pkg_name = match.group(1)
+                    declared_version = match.group(2)
+                    installed_version = nuget_installed.get(pkg_name.lower(), "")
+                    packages.append(DetectedPackage(
+                        ecosystem="NuGet",
+                        name=pkg_name,
+                        version=installed_version or declared_version,
+                        source_file=csproj.name,
+                        declared_version=declared_version,
+                        installed_version=installed_version,
+                        version_source="installed" if installed_version else "declared"
+                    ))
+
+        # Java Maven: pom.xml
+        maven_installed = self._parse_maven_lockfile(path)
+        pom_file = path / "pom.xml"
+        if pom_file.exists():
+            content = self._safe_read_file(pom_file)
+            if content:
+                for match in re.finditer(r'<dependency>.*?<artifactId>([^<]+)</artifactId>.*?<version>([^<]+)</version>.*?</dependency>', content, re.DOTALL):
+                    artifact = match.group(1).strip()
+                    declared_version = match.group(2).strip()
+                    if not declared_version.startswith("$"):
+                        installed_version = maven_installed.get(artifact.lower(), "")
+                        packages.append(DetectedPackage(
+                            ecosystem="Maven",
+                            name=artifact,
+                            version=installed_version or declared_version,
+                            source_file="pom.xml",
+                            declared_version=declared_version,
+                            installed_version=installed_version,
+                            version_source="installed" if installed_version else "declared"
+                        ))
+
+        # Java Gradle: build.gradle
+        gradle_installed = self._parse_gradle_lockfile(path)
+        for gradle_file in ["build.gradle", "build.gradle.kts"]:
+            gradle_path = path / gradle_file
+            if gradle_path.exists():
+                content = self._safe_read_file(gradle_path)
+                if content:
+                    for match in re.finditer(r"(?:implementation|api|compile)\s*['\"]([^:]+):([^:]+):([^'\"]+)['\"]", content):
+                        artifact = match.group(2)
+                        declared_version = match.group(3)
+                        installed_version = gradle_installed.get(artifact.lower(), "")
+                        packages.append(DetectedPackage(
+                            ecosystem="Maven",
+                            name=artifact,
+                            version=installed_version or declared_version,
+                            source_file=gradle_file,
+                            declared_version=declared_version,
+                            installed_version=installed_version,
+                            version_source="installed" if installed_version else "declared"
+                        ))
+
+        # C/C++ Conan: conanfile.txt or conanfile.py
+        conan_installed = self._parse_conan_lockfile(path)
+        for conan_file in ["conanfile.txt", "conanfile.py"]:
+            conan_path = path / conan_file
+            if conan_path.exists():
+                content = self._safe_read_file(conan_path)
+                if content:
+                    # conanfile.txt: package/version
+                    for match in re.finditer(r'^([a-zA-Z0-9_-]+)/(\d+\.\d+(?:\.\d+)?)', content, re.MULTILINE):
+                        pkg_name = match.group(1)
+                        declared_version = match.group(2)
+                        installed_version = conan_installed.get(pkg_name.lower(), "")
+                        packages.append(DetectedPackage(
+                            ecosystem="Conan",
+                            name=pkg_name,
+                            version=installed_version or declared_version,
+                            source_file=conan_file,
+                            declared_version=declared_version,
+                            installed_version=installed_version,
+                            version_source="installed" if installed_version else "declared"
+                        ))
+                    # conanfile.py: requires = ["package/version"]
+                    for match in re.finditer(r'["\']([a-zA-Z0-9_-]+)/(\d+\.\d+(?:\.\d+)?)', content):
+                        pkg_name = match.group(1)
+                        declared_version = match.group(2)
+                        if pkg_name.lower() not in [p.name.lower() for p in packages]:
+                            installed_version = conan_installed.get(pkg_name.lower(), "")
+                            packages.append(DetectedPackage(
+                                ecosystem="Conan",
+                                name=pkg_name,
+                                version=installed_version or declared_version,
+                                source_file=conan_file,
+                                declared_version=declared_version,
+                                installed_version=installed_version,
+                                version_source="installed" if installed_version else "declared"
+                            ))
+
+        # C/C++ vcpkg: vcpkg.json
+        vcpkg_installed = self._parse_vcpkg_lockfile(path)
+        vcpkg_json = path / "vcpkg.json"
+        if vcpkg_json.exists():
+            content = self._safe_read_file(vcpkg_json)
+            if content:
+                try:
+                    import json
+                    data = json.loads(content)
+                    for dep in data.get("dependencies", []):
+                        if isinstance(dep, str):
+                            pkg_name = dep
+                            declared_version = ""
+                        else:
+                            pkg_name = dep.get("name", "")
+                            declared_version = dep.get("version>=", dep.get("version", ""))
+                        if pkg_name:
+                            installed_version = vcpkg_installed.get(pkg_name.lower(), "")
+                            packages.append(DetectedPackage(
+                                ecosystem="vcpkg",
+                                name=pkg_name,
+                                version=installed_version or declared_version or "latest",
+                                source_file="vcpkg.json",
+                                declared_version=declared_version,
+                                installed_version=installed_version,
+                                version_source="installed" if installed_version else "declared"
+                            ))
+                except Exception:
+                    pass
+
+        # Swift: Package.swift
+        swift_installed = self._parse_swift_lockfile(path)
+        package_swift = path / "Package.swift"
+        if package_swift.exists():
+            content = self._safe_read_file(package_swift)
+            if content:
+                # Match .package(url: "...", from: "version") or .exact("version")
+                for match in re.finditer(
+                    r'\.package\s*\([^)]*url:\s*["\']https?://[^"\']*?/([^/"\']+)(?:\.git)?["\'][^)]*(?:from:|exact:)\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
+                    content
+                ):
+                    pkg_name = match.group(1)
+                    declared_version = match.group(2)
+                    installed_version = swift_installed.get(pkg_name.lower(), "")
+                    packages.append(DetectedPackage(
+                        ecosystem="SwiftPM",
+                        name=pkg_name,
+                        version=installed_version or declared_version,
+                        source_file="Package.swift",
+                        declared_version=declared_version,
+                        installed_version=installed_version,
+                        version_source="installed" if installed_version else "declared"
+                    ))
+
+        # CMake: CMakeLists.txt (for C/C++ projects using CMake)
+        cmake_packages = self._parse_cmake_packages(path)
+        cmake_file = path / "CMakeLists.txt"
+        if cmake_file.exists() and cmake_packages:
+            for pkg_name, version in cmake_packages.items():
+                # Only add if not already detected via Conan/vcpkg
+                if pkg_name.lower() not in [p.name.lower() for p in packages]:
+                    packages.append(DetectedPackage(
+                        ecosystem="CMake",
+                        name=pkg_name,
+                        version=version,
+                        source_file="CMakeLists.txt",
+                        declared_version=version if version != "detected" else "",
+                        installed_version="",
+                        version_source="declared"
+                    ))
+
+        return packages[:100]  # Increased limit for multi-language projects
+
+    def check_security(self, result: ScanResult) -> list[SecurityAlert]:
+        """Check detected packages for known vulnerabilities via OSV.dev."""
+        if not result.packages:
+            return []
+
+        from .security import check_cve_osv
+
+        dependencies = [
+            (pkg.ecosystem, pkg.name, pkg.version)
+            for pkg in result.packages
+        ]
+
+        cves = check_cve_osv(dependencies)
+        alerts = []
+        for cve in cves:
+            alerts.append(SecurityAlert(
+                cve_id=cve.id,
+                package=cve.package,
+                severity=cve.severity,
+                summary=cve.summary[:150] if cve.summary else "",
+                fixed_version=cve.fixed_version,
+                references=cve.references[:3] if cve.references else []
+            ))
+
+        return alerts
+
+    def _build_security_context(self, result: ScanResult) -> SecurityContext:
+        """
+        Build a SecurityContext from scan results for security guidelines generation.
+
+        This converts the scanner's detection results into the format expected by
+        the security module's get_security_guidelines() function.
+        """
+        context = SecurityContext()
+
+        # Map detected languages to security module format
+        language_mapping = {
+            "Python": "python",
+            "TypeScript": "typescript",
+            "JavaScript": "javascript",
+            "Go": "go",
+            "Rust": "rust",
+            "Java": "java",
+            "Kotlin": "java",  # Kotlin uses Java security patterns
+            "C#": "csharp",
+            "PHP": "php",
+            "Ruby": "ruby",
+            "Swift": "swift",
+            "C": "c",
+            "C++": "cpp",
+        }
+
+        for lang in result.languages:
+            mapped = language_mapping.get(lang.name)
+            if mapped and mapped not in context.languages:
+                context.languages.append(mapped)
+
+        # Detect security-relevant keywords from frameworks and databases
+        security_triggers = []
+
+        # Framework categories that imply security concerns
+        for fw in result.frameworks:
+            name_lower = fw.name.lower()
+            category = fw.category.lower()
+
+            if category in ["backend", "orm"]:
+                security_triggers.extend(["api", "database"])
+            if "auth" in name_lower or "jwt" in name_lower:
+                security_triggers.append("auth")
+            if "oauth" in name_lower:
+                security_triggers.extend(["auth", "oauth"])
+
+        # Databases imply DB security concerns
+        if result.databases:
+            security_triggers.extend(["database", "sql", "query"])
+
+        # File/upload detection from key files
+        for kf in result.key_files:
+            path_lower = kf.path.lower()
+            if "upload" in path_lower or "file" in path_lower:
+                security_triggers.append("file")
+            if "auth" in path_lower or "login" in path_lower:
+                security_triggers.append("auth")
+            if "api" in path_lower or "route" in path_lower:
+                security_triggers.append("api")
+
+        # Detect from env variables
+        for ev in result.env_variables:
+            name_lower = ev.name.lower()
+            if any(kw in name_lower for kw in ["secret", "key", "password", "token", "jwt"]):
+                security_triggers.extend(["auth", "credentials"])
+
+        # Deduplicate and add to context
+        context.security_keywords_found = list(set(security_triggers))
+
+        # Convert CVE alerts to CVEInfo if present
+        if result.security_alerts:
+            context.cves = [
+                CVEInfo(
+                    id=alert.cve_id,
+                    summary=alert.summary,
+                    severity=alert.severity,
+                    package=alert.package,
+                    affected_versions="detected",
+                    fixed_version=alert.fixed_version,
+                )
+                for alert in result.security_alerts
+            ]
+
+        # Determine if dev context
+        context.is_dev = len(context.languages) > 0
+
+        # Determine security level based on findings
+        cve_critical = sum(1 for a in result.security_alerts if a.severity == "CRITICAL")
+        cve_high = sum(1 for a in result.security_alerts if a.severity == "HIGH")
+
+        if cve_critical > 0 or len(context.security_keywords_found) >= 5:
+            context.security_level = "critical"
+        elif cve_high > 0 or len(context.security_keywords_found) >= 3:
+            context.security_level = "elevated"
+        else:
+            context.security_level = "standard"
+
+        return context
+
     def generate_config(
         self,
         result: ScanResult,
@@ -1228,6 +2478,341 @@ class ProjectScanner:
                 dirs_str = f" ({', '.join(test.test_dirs)})" if test.test_dirs else ""
                 lines.append(f"- **{test.framework}**{dirs_str}")
             lines.append("")
+
+        # Key Files (nouveau)
+        if result.key_files:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Fichiers Clés")
+            lines.append("")
+            lines.append("| Fichier | Type | Description |")
+            lines.append("|---------|------|-------------|")
+            for kf in result.key_files[:10]:
+                lines.append(f"| `{kf.path}` | {kf.category} | {kf.description} |")
+            lines.append("")
+
+        # Dev Commands (nouveau)
+        if result.dev_commands:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Commandes de Développement")
+            lines.append("")
+            lines.append("| Commande | Source |")
+            lines.append("|----------|--------|")
+            for cmd in result.dev_commands[:10]:
+                lines.append(f"| `{cmd.command}` | {cmd.source} |")
+            lines.append("")
+
+        # Environment Variables (nouveau)
+        if result.env_variables:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Variables d'Environnement")
+            lines.append("")
+            lines.append("| Variable | Exemple |")
+            lines.append("|----------|---------|")
+            for ev in result.env_variables[:15]:
+                example = ev.example if ev.example else "*à définir*"
+                lines.append(f"| `{ev.name}` | {example} |")
+            lines.append("")
+
+        # =================================================================
+        # SECURITY SECTION - Guidelines + CVE Alerts
+        # =================================================================
+        security_context = self._build_security_context(result)
+
+        if security_context.is_dev:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Directives de Sécurité")
+            lines.append("")
+
+            # Security level indicator
+            level_indicators = {
+                "critical": "🔴 **CRITIQUE** - Attention requise immédiatement",
+                "elevated": "🟠 **ÉLEVÉ** - Vigilance accrue recommandée",
+                "standard": "🟢 **STANDARD** - Bonnes pratiques à appliquer",
+            }
+            lines.append(f"> Niveau de sécurité: {level_indicators.get(security_context.security_level, 'STANDARD')}")
+            lines.append("")
+
+            # Language-specific guidelines
+            if security_context.languages:
+                lines.append("### Bonnes Pratiques par Langage")
+                lines.append("")
+
+                if "python" in security_context.languages:
+                    lines.append("#### Python")
+                    lines.append("- Utiliser `secrets` au lieu de `random` pour tokens/mots de passe")
+                    lines.append("- Requêtes SQL paramétrées (pas de f-string dans les queries)")
+                    lines.append("- Valider les inputs avec Pydantic ou dataclasses")
+                    lines.append("- `bcrypt` ou `argon2` pour le hashing de mots de passe")
+                    lines.append("- Éviter les fonctions d'évaluation dynamique avec données utilisateur")
+                    lines.append("")
+
+                if "javascript" in security_context.languages or "typescript" in security_context.languages:
+                    lines.append("#### JavaScript/TypeScript")
+                    lines.append("- Échapper les outputs HTML (prévention XSS)")
+                    lines.append("- Requêtes paramétrées pour les bases de données")
+                    lines.append("- Valider les inputs côté serveur (ne jamais faire confiance au client)")
+                    lines.append("- Configurer CORS correctement")
+                    lines.append("- Utiliser `helmet.js` pour les headers de sécurité")
+                    lines.append("")
+
+                if "rust" in security_context.languages:
+                    lines.append("#### Rust")
+                    lines.append("- Préférer les types sûrs (`Option`, `Result`) aux valeurs nulles")
+                    lines.append("- Utiliser `sqlx` avec requêtes paramétrées pour SQL")
+                    lines.append("- `argon2` pour le hashing de mots de passe")
+                    lines.append("- Éviter `unsafe` sauf si absolument nécessaire")
+                    lines.append("")
+
+                if "go" in security_context.languages:
+                    lines.append("#### Go")
+                    lines.append("- Utiliser `prepared statements` pour SQL")
+                    lines.append("- Échapper les templates HTML avec `html/template`")
+                    lines.append("- Valider les inputs avec `go-playground/validator`")
+                    lines.append("- Ne jamais logger les secrets/mots de passe")
+                    lines.append("")
+
+                if "java" in security_context.languages:
+                    lines.append("#### Java")
+                    lines.append("- Utiliser `PreparedStatement` pour toutes les requêtes SQL")
+                    lines.append("- Valider les inputs avec Bean Validation (JSR 380)")
+                    lines.append("- Spring Security pour l'authentification")
+                    lines.append("- Éviter la désérialisation de données non fiables")
+                    lines.append("")
+
+                if "csharp" in security_context.languages:
+                    lines.append("#### C# / .NET")
+                    lines.append("- Utiliser les requêtes paramétrées avec Entity Framework ou Dapper")
+                    lines.append("- ASP.NET Core Identity pour l'authentification")
+                    lines.append("- Anti-forgery tokens pour les formulaires")
+                    lines.append("- Encoder les outputs HTML avec `HtmlEncoder`")
+                    lines.append("")
+
+                if "php" in security_context.languages:
+                    lines.append("#### PHP")
+                    lines.append("- PDO avec requêtes préparées pour SQL")
+                    lines.append("- `password_hash()` / `password_verify()` pour les mots de passe")
+                    lines.append("- `htmlspecialchars()` pour l'échappement HTML")
+                    lines.append("- Valider les uploads avec vérification MIME réelle")
+                    lines.append("")
+
+                if "ruby" in security_context.languages:
+                    lines.append("#### Ruby")
+                    lines.append("- ActiveRecord avec requêtes paramétrées (where avec placeholders)")
+                    lines.append("- `has_secure_password` pour le hashing de mots de passe")
+                    lines.append("- Strong Parameters dans Rails pour filtrer les inputs")
+                    lines.append("- Protection CSRF activée par défaut dans Rails")
+                    lines.append("")
+
+                if "swift" in security_context.languages:
+                    lines.append("#### Swift / iOS")
+                    lines.append("- Keychain pour stocker les credentials (pas UserDefaults)")
+                    lines.append("- App Transport Security (ATS) activé")
+                    lines.append("- Certificate pinning pour les connexions sensibles")
+                    lines.append("- Valider les inputs avant traitement")
+                    lines.append("")
+
+                if "c" in security_context.languages or "cpp" in security_context.languages:
+                    lines.append("#### C/C++")
+                    lines.append("- Éviter les fonctions non-sécurisées: gets, strcpy, sprintf")
+                    lines.append("- Utiliser fgets, strncpy, snprintf avec vérification des bornes")
+                    lines.append("- Toujours initialiser les variables avant utilisation")
+                    lines.append("- RAII en C++ pour la gestion mémoire automatique")
+                    lines.append("- Compiler avec: -fstack-protector -D_FORTIFY_SOURCE=2 -fPIE")
+                    lines.append("- Utiliser AddressSanitizer/MemorySanitizer pour le debug")
+                    lines.append("")
+
+            # Context-specific recommendations
+            if security_context.security_keywords_found:
+                lines.append("### Recommandations Spécifiques")
+                lines.append("")
+
+                if any(k in security_context.security_keywords_found for k in ["auth", "login", "password", "jwt", "token", "credentials"]):
+                    lines.append("#### 🔐 Authentification")
+                    lines.append("- Implémenter rate limiting sur les endpoints d'auth")
+                    lines.append("- HTTPS uniquement pour toutes les communications")
+                    lines.append("- JWT: expiration courte, refresh tokens, signature forte (RS256)")
+                    lines.append("- Stocker les mots de passe avec bcrypt/argon2 (jamais MD5/SHA1)")
+                    lines.append("- Protection CSRF sur tous les formulaires")
+                    lines.append("")
+
+                if any(k in security_context.security_keywords_found for k in ["sql", "database", "query"]):
+                    lines.append("#### 🗄️ Base de Données")
+                    lines.append("- **TOUJOURS** utiliser des requêtes paramétrées (prepared statements)")
+                    lines.append("- Principe du moindre privilège pour les accès DB")
+                    lines.append("- Chiffrer les données sensibles au repos")
+                    lines.append("- Valider et sanitizer les inputs avant insertion")
+                    lines.append("")
+
+                if any(k in security_context.security_keywords_found for k in ["file", "upload"]):
+                    lines.append("#### 📁 Fichiers & Uploads")
+                    lines.append("- Valider le type MIME et l'extension des fichiers uploadés")
+                    lines.append("- Limiter la taille des uploads")
+                    lines.append("- Stocker hors du webroot avec noms générés")
+                    lines.append("- Éviter les path traversal (../../)")
+                    lines.append("")
+
+                if any(k in security_context.security_keywords_found for k in ["api", "endpoint", "route"]):
+                    lines.append("#### 🌐 API Security")
+                    lines.append("- Authentification sur tous les endpoints sensibles")
+                    lines.append("- Rate limiting et throttling")
+                    lines.append("- Validation des inputs (schema validation)")
+                    lines.append("- Headers de sécurité (CORS, CSP, X-Frame-Options)")
+                    lines.append("- Logging des accès et erreurs")
+                    lines.append("")
+
+            # OWASP Top 10 Reminder
+            lines.append("### Rappel OWASP Top 10 (2021)")
+            lines.append("")
+            lines.append("Vérifier que le code n'est pas vulnérable à:")
+            lines.append("")
+            lines.append("| # | Vulnérabilité | Points clés |")
+            lines.append("|---|---------------|-------------|")
+            lines.append("| A01 | Broken Access Control | Contrôle d'accès, permissions |")
+            lines.append("| A02 | Cryptographic Failures | Chiffrement, hashing, secrets |")
+            lines.append("| A03 | Injection | SQL, Command, XSS, LDAP |")
+            lines.append("| A04 | Insecure Design | Architecture sécurisée |")
+            lines.append("| A05 | Security Misconfiguration | Configs par défaut, debug |")
+            lines.append("| A06 | Vulnerable Components | Dépendances à jour |")
+            lines.append("| A07 | Auth Failures | Sessions, mots de passe |")
+            lines.append("| A08 | Integrity Failures | CI/CD, désérialisation |")
+            lines.append("| A09 | Logging Failures | Monitoring, alerting |")
+            lines.append("| A10 | SSRF | Requêtes serveur-side |")
+            lines.append("")
+
+        # Security Alerts (if any)
+        if result.security_alerts:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Alertes de Sécurité")
+            lines.append("")
+            lines.append("⚠️ **Des vulnérabilités ont été détectées dans les dépendances:**")
+            lines.append("")
+
+            # Group by severity
+            critical = [a for a in result.security_alerts if a.severity == "CRITICAL"]
+            high = [a for a in result.security_alerts if a.severity == "HIGH"]
+            medium = [a for a in result.security_alerts if a.severity == "MEDIUM"]
+
+            def format_cve_link(cve_id: str) -> str:
+                """Generate clickable link for CVE."""
+                if cve_id.startswith("CVE-"):
+                    return f"[{cve_id}](https://nvd.nist.gov/vuln/detail/{cve_id})"
+                elif cve_id.startswith("GHSA-"):
+                    return f"[{cve_id}](https://github.com/advisories/{cve_id})"
+                elif cve_id.startswith("PYSEC-"):
+                    return f"[{cve_id}](https://osv.dev/vulnerability/{cve_id})"
+                else:
+                    return f"[{cve_id}](https://osv.dev/vulnerability/{cve_id})"
+
+            if critical:
+                lines.append("### 🔴 CRITIQUES - Action immédiate requise")
+                lines.append("")
+                for alert in critical:
+                    cve_link = format_cve_link(alert.cve_id)
+                    lines.append(f"#### {cve_link} - `{alert.package}`")
+                    lines.append("")
+                    if alert.summary:
+                        lines.append(f"**Description:** {alert.summary}")
+                    if alert.fixed_version:
+                        lines.append(f"")
+                        lines.append(f"**Remediation:** Mettre à jour vers `{alert.fixed_version}` ou version supérieure")
+                    else:
+                        lines.append(f"")
+                        lines.append(f"**Remediation:** Vérifier si une version corrigée existe ou envisager une alternative")
+                    if alert.references:
+                        lines.append("")
+                        lines.append("**Références:**")
+                        for ref in alert.references[:2]:
+                            lines.append(f"- {ref}")
+                    lines.append("")
+
+            if high:
+                lines.append("### 🟠 ÉLEVÉES - Correction recommandée rapidement")
+                lines.append("")
+                for alert in high[:5]:
+                    cve_link = format_cve_link(alert.cve_id)
+                    fix_str = f" → Mettre à jour vers `{alert.fixed_version}`" if alert.fixed_version else ""
+                    lines.append(f"- {cve_link}: `{alert.package}`{fix_str}")
+                    if alert.references:
+                        lines.append(f"  - Ref: {alert.references[0]}")
+                if len(high) > 5:
+                    lines.append(f"- ... et {len(high) - 5} autres vulnérabilités élevées")
+                lines.append("")
+
+            if medium:
+                lines.append(f"### 🟡 MOYENNES ({len(medium)}) - À planifier")
+                lines.append("")
+                for alert in medium[:3]:
+                    cve_link = format_cve_link(alert.cve_id)
+                    fix_str = f" → `{alert.fixed_version}`" if alert.fixed_version else ""
+                    lines.append(f"- {cve_link}: `{alert.package}`{fix_str}")
+                if len(medium) > 3:
+                    lines.append(f"- ... et {len(medium) - 3} autres")
+                lines.append("")
+
+            # Add remediation commands section
+            lines.append("### Commandes de Remediation")
+            lines.append("")
+            # Group by ecosystem
+            ecosystems_fixes = {}
+            for alert in result.security_alerts:
+                if alert.fixed_version:
+                    # Find the package ecosystem
+                    for pkg in result.packages:
+                        if pkg.name.lower() == alert.package.lower():
+                            eco = pkg.ecosystem
+                            if eco not in ecosystems_fixes:
+                                ecosystems_fixes[eco] = []
+                            ecosystems_fixes[eco].append((alert.package, alert.fixed_version))
+                            break
+
+            if ecosystems_fixes:
+                lines.append("```bash")
+                if "PyPI" in ecosystems_fixes:
+                    fixes = ecosystems_fixes["PyPI"]
+                    lines.append("# Python - mettre à jour les packages vulnérables:")
+                    for pkg, ver in fixes[:5]:
+                        lines.append(f"pip install '{pkg}>={ver}'")
+                    lines.append("")
+                if "npm" in ecosystems_fixes:
+                    fixes = ecosystems_fixes["npm"]
+                    lines.append("# Node.js - mettre à jour les packages vulnérables:")
+                    for pkg, ver in fixes[:5]:
+                        lines.append(f"npm install {pkg}@^{ver}")
+                    lines.append("")
+                if "crates.io" in ecosystems_fixes:
+                    fixes = ecosystems_fixes["crates.io"]
+                    lines.append("# Rust - mettre à jour Cargo.toml puis:")
+                    lines.append("cargo update")
+                    lines.append("")
+                if "RubyGems" in ecosystems_fixes:
+                    fixes = ecosystems_fixes["RubyGems"]
+                    lines.append("# Ruby - mettre à jour les gems:")
+                    for pkg, ver in fixes[:5]:
+                        lines.append(f"gem install {pkg} -v '>= {ver}'")
+                    lines.append("")
+                if "NuGet" in ecosystems_fixes:
+                    lines.append("# .NET - mettre à jour les packages:")
+                    lines.append("dotnet restore")
+                    lines.append("")
+                if "Maven" in ecosystems_fixes:
+                    lines.append("# Java Maven - mettre à jour pom.xml puis:")
+                    lines.append("mvn dependency:resolve")
+                    lines.append("")
+                if "Packagist" in ecosystems_fixes:
+                    lines.append("# PHP - mettre à jour composer.json puis:")
+                    lines.append("composer update")
+                    lines.append("")
+                lines.append("```")
+                lines.append("")
+            else:
+                lines.append("Aucune commande de remediation automatique disponible.")
+                lines.append("Vérifier manuellement les versions des packages affectés.")
+                lines.append("")
 
         # Footer
         lines.append("---")

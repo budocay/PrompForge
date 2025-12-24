@@ -64,8 +64,14 @@ class OllamaProvider:
         except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
             return []
 
-    def generate(self, prompt: str, system_prompt: str = "") -> Optional[str]:
-        """Génère une réponse via Ollama."""
+    def generate(self, prompt: str, system_prompt: str = "", num_ctx: int = 16384) -> Optional[str]:
+        """Génère une réponse via Ollama.
+
+        Args:
+            prompt: Le prompt à envoyer
+            system_prompt: Le system prompt optionnel
+            num_ctx: Taille du contexte (défaut: 16384 pour supporter les gros projets)
+        """
         try:
             payload = {
                 "model": self.config.model,
@@ -73,7 +79,8 @@ class OllamaProvider:
                 "stream": False,
                 "options": {
                     "temperature": 0.3,  # Plus déterministe pour le reformatage
-                    "top_p": 0.9
+                    "top_p": 0.9,
+                    "num_ctx": num_ctx  # Utiliser plus de contexte pour les gros prompts
                 }
             }
             

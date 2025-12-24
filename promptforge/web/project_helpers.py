@@ -7,8 +7,10 @@ import gradio as gr
 from pathlib import Path
 
 from .ollama_helpers import get_forge
-from .assets import SANS_PROJET
 from ..tokens import estimate_tokens
+
+# Constante partagée
+SANS_PROJET = "🔧 Sans projet (prompt seul)"
 
 
 def get_projects_list() -> list[str]:
