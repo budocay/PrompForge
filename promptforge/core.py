@@ -9,6 +9,16 @@ import re
 
 from .database import Database, Project
 from .providers import OllamaProvider, OllamaConfig, format_prompt_with_ollama
+from .security import (
+    detect_dev_context,
+    detect_dependencies_from_text,
+    check_cve_osv,
+    get_security_guidelines,
+    SecurityContext,
+)
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class PromptForge:
@@ -105,56 +115,103 @@ class PromptForge:
             return True, f"Projet '{name}' supprimé"
         return False, f"Projet '{name}' introuvable"
 
-    def format_prompt(self, raw_prompt: str, 
-                      project_name: Optional[str] = None,
-                      profile_name: Optional[str] = None) -> tuple[bool, str, Optional[str]]:
+    def format_prompt(
+        self,
+        raw_prompt: str,
+        project_name: Optional[str] = None,
+        profile_name: Optional[str] = None,
+        check_security: bool = True,
+        check_cves: bool = False,
+    ) -> tuple[bool, str, Optional[str], Optional[SecurityContext]]:
         """
         Reformate un prompt en utilisant le contexte projet.
-        
+
         Args:
             raw_prompt: Le prompt brut à reformater
             project_name: Nom du projet (utilise le projet actif si None)
             profile_name: Profil de reformatage (claude_technique, chatgpt_standard, etc.)
-        
+            check_security: Si True, analyse et injecte les guidelines de sécurité
+            check_cves: Si True, vérifie les CVE via OSV.dev (plus lent)
+
         Returns:
-            Tuple (succès, message/erreur, prompt_reformaté)
+            Tuple (succès, message/erreur, prompt_reformaté, security_context)
         """
-        # Récupération du projet
-        if project_name:
-            project = self.db.get_project(project_name)
-        else:
+        # Récupération du projet (optionnel)
+        # project_name = None -> utiliser le projet actif (CLI)
+        # project_name = "" -> explicitement sans projet (Web "Sans projet")
+        # project_name = "xxx" -> utiliser ce projet spécifique
+        project = None
+        if project_name is None:
+            # Non spécifié = utiliser le projet actif (comportement CLI)
             project = self.db.get_active_project()
-        
-        if not project:
-            return False, "Aucun projet actif. Utilisez 'use <projet>' ou spécifiez --project", None
-        
+        elif project_name != "":
+            # Projet spécifique demandé
+            project = self.db.get_project(project_name)
+        # Si project_name == "", on garde project = None (explicitement sans projet)
+
         # Vérification Ollama
         if not self.ollama.is_available():
-            return False, "Ollama n'est pas disponible. Vérifiez qu'il est lancé.", None
-        
+            return False, "Ollama n'est pas disponible. Vérifiez qu'il est lancé.", None, None
+
+        # Contexte projet (vide si pas de projet)
+        project_context = project.config_content if project else ""
+
+        # === SECURITY ENRICHMENT ===
+        security_context = None
+        if check_security:
+            # Analyze prompt and project for dev context
+            full_text = f"{raw_prompt}\n{project_context}"
+            security_context = detect_dev_context(full_text)
+
+            if security_context.is_dev:
+                logger.info(
+                    f"Dev context detected: languages={security_context.languages}, "
+                    f"level={security_context.security_level}"
+                )
+
+                # Check for CVEs if requested and dependencies found
+                if check_cves:
+                    dependencies = detect_dependencies_from_text(project_context)
+                    if dependencies:
+                        logger.info(f"Checking {len(dependencies)} dependencies for CVEs...")
+                        security_context.cves = check_cve_osv(dependencies)
+                        if security_context.cves:
+                            logger.warning(
+                                f"Found {len(security_context.cves)} CVE(s) in dependencies!"
+                            )
+
+                # Enrich project context with security guidelines
+                security_guidelines = get_security_guidelines(security_context)
+                if security_guidelines:
+                    project_context = f"{project_context}\n{security_guidelines}"
+                    logger.debug("Security guidelines injected into context")
+
         # Reformatage via Ollama
         formatted = format_prompt_with_ollama(
             raw_prompt=raw_prompt,
-            project_context=project.config_content,
+            project_context=project_context,
             provider=self.ollama,
             profile_name=profile_name
         )
-        
+
         if not formatted:
-            return False, "Erreur lors du reformatage avec Ollama", None
-        
-        # Sauvegarde dans l'historique
-        file_path = self._save_history(project, raw_prompt, formatted)
-        
-        # Enregistrement en base
-        self.db.add_history(
-            project_id=project.id,
-            raw_prompt=raw_prompt,
-            formatted_prompt=formatted,
-            file_path=str(file_path)
-        )
-        
-        return True, str(file_path), formatted
+            return False, "Erreur lors du reformatage avec Ollama", None, security_context
+
+        # Sauvegarde dans l'historique (seulement si projet actif)
+        if project:
+            file_path = self._save_history(project, raw_prompt, formatted)
+
+            # Enregistrement en base
+            self.db.add_history(
+                project_id=project.id,
+                raw_prompt=raw_prompt,
+                formatted_prompt=formatted,
+                file_path=str(file_path)
+            )
+            return True, str(file_path), formatted, security_context
+        else:
+            # Sans projet, on retourne juste le résultat (pas d'historique)
+            return True, "Reformaté sans projet (historique non sauvegardé)", formatted, security_context
 
     def _save_history(self, project: Project, raw_prompt: str, 
                       formatted_prompt: str) -> Path:

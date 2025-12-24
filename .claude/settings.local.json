@@ -4,7 +4,13 @@
       "Bash(dir:*)",
       "Bash(mkdir:*)",
       "Bash(python -c:*)",
-      "Bash(python -m pytest:*)"
+      "Bash(python -m pytest:*)",
+      "Bash(curl:*)",
+      "Bash(python -m tests.test_real_value:*)",
+      "Bash(python -X utf8 -m tests.test_real_value:*)",
+      "Bash(python:*)",
+      "Bash(pip show:*)",
+      "Bash(cd:*)"
     ]
   }
 }

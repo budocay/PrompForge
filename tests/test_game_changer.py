@@ -285,14 +285,15 @@ class TestInterfaceImports:
         """Vérifie que l'interface importe les template helpers."""
         # Ce test vérifie que l'import ne plante pas
         try:
-            from promptforge.web.interface import create_interface, TEMPLATE_INFO
+            from promptforge.web import create_interface
+            from promptforge.web.template_helpers import TEMPLATE_INFO
             assert True
         except ImportError as e:
             pytest.fail(f"Import échoué: {e}")
 
     def test_create_interface_callable(self):
         """Vérifie que create_interface est appelable."""
-        from promptforge.web.interface import create_interface
+        from promptforge.web import create_interface
         assert callable(create_interface)
 
 

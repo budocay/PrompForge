@@ -32,16 +32,19 @@ promptforge/
 │   ├── utils.py          # Cross-platform utilities (clipboard, GPU detection)
 │   ├── scanner.py        # Project auto-scanner and config generator
 │   ├── web.py            # DEPRECATED - backward compatibility wrapper
+│   ├── starter_templates.py  # Pre-filled profession templates
 │   └── web/              # Modular web interface package
 │       ├── __init__.py   # Package exports
 │       ├── assets.py     # SVG logos, CSS, constants
+│       ├── interface.py  # Main Gradio interface
 │       ├── ollama_helpers.py    # Ollama status and model management
-│       ├── project_helpers.py   # Project CRUD for UI
+│       ├── project_helpers.py   # Project CRUD for UI + SANS_PROJET constant
 │       ├── analysis.py          # Prompt quality analysis
 │       ├── recommendations.py   # Model recommendations and benchmarks
 │       ├── profiles_ui.py       # Profile selection helpers
 │       ├── scanner_helpers.py   # Scanner UI helpers
-│       └── interface.py         # Main Gradio interface
+│       ├── template_helpers.py  # Template loading utilities
+│       └── onboarding.py        # Wizard flows for profession setup
 ├── tests/                # pytest test suite
 │   ├── conftest.py       # Shared fixtures
 │   ├── test_core.py
@@ -76,7 +79,9 @@ promptforge/
 | `tokens.py` | Token estimation with tiktoken/heuristics | ~180 |
 | `logging_config.py` | Structured JSON logging | ~200 |
 | `scanner.py` | Project auto-scanner, config generator | ~1250 |
-| `web/interface.py` | Main Gradio interface | ~550 |
+| `starter_templates.py` | 6 pre-filled profession templates | ~200 |
+| `web/interface.py` | Main Gradio interface | ~1400 |
+| `web/onboarding.py` | Wizard flows (8 professions, 123 questions) | ~900 |
 | `web/scanner_helpers.py` | Scanner UI helpers | ~240 |
 | `web/analysis.py` | Prompt quality analysis | ~350 |
 | `web/recommendations.py` | Model recommendations | ~300 |
@@ -376,14 +381,16 @@ make rebuild                # Rebuild without cache
 
 | Module | Responsibility |
 |--------|----------------|
-| `assets.py` | Static content: SVG, CSS, constants |
+| `assets.py` | Static content: SVG, CSS (CSS_V4, LOGO_SVG_LARGE) |
+| `interface.py` | Main Gradio interface assembly |
 | `ollama_helpers.py` | Ollama connection, model management |
-| `project_helpers.py` | Project CRUD operations |
+| `project_helpers.py` | Project CRUD operations, SANS_PROJET constant |
 | `analysis.py` | Prompt quality scoring, comparison |
 | `recommendations.py` | Model recommendations, benchmarks |
 | `profiles_ui.py` | Profile dropdown helpers |
 | `scanner_helpers.py` | Scanner UI integration |
-| `interface.py` | Main Gradio interface assembly |
+| `template_helpers.py` | Template loading for profession configs |
+| `onboarding.py` | Wizard flows (8 professions, 123 questions) |
 
 ## Project Scanner
 
@@ -427,3 +434,224 @@ config = scanner.generate_config(result, "my-project", "Optional description")
 | `CICDSetup` | CI provider, config files, workflows |
 | `ProjectStructure` | Directory tree, file counts |
 | `ScanResult` | Aggregation of all detected information |
+| `DetectedPackage` | Package with version info (installed vs declared) |
+| `SecurityAlert` | CVE vulnerability with severity and fix version |
+
+## Security Module
+
+The security module (`security.py`) provides CVE detection and security guidelines for scanned projects.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `security.py` | CVE checking via OSV.dev, security guidelines, OWASP Top 10 |
+| `scanner.py` | Package detection, installed version verification |
+| `web/scanner_helpers.py` | Security section generation for UI |
+
+### Features
+
+- **CVE Detection**: Real-time vulnerability checking via OSV.dev API (free, no API key)
+- **Installed Version Detection**: Uses `importlib.metadata` for Python to detect actual installed versions
+- **OWASP Top 10**: Automatic reminders based on project context
+- **Language-Specific Guidelines**: Security best practices per language
+- **Severity Parsing**: CVSS vector parsing for CRITICAL/HIGH/MEDIUM/LOW classification
+
+### Version Detection Strategy
+
+The scanner prioritizes **installed versions** over **declared versions** to avoid false positives:
+
+```python
+# Priority: installed > declared
+if installed_version:  # from importlib.metadata or lockfiles
+    effective_version = installed_version
+    version_source = "installed"  # High confidence
+else:
+    effective_version = declared_version  # from requirements.txt, pyproject.toml
+    version_source = "declared"  # Lower confidence
+```
+
+### Ecosystem Support for Installed Versions
+
+| Ecosystem | Lockfile/Method | Status |
+|-----------|-----------------|--------|
+| **Python/PyPI** | `importlib.metadata` | ✅ Implemented |
+| **Node.js/npm** | `package-lock.json` | ✅ Implemented |
+| **Rust/Cargo** | `Cargo.lock` | ✅ Implemented |
+| **Go** | `go.sum` | ✅ Implemented |
+| **PHP/Composer** | `composer.lock` | ✅ Implemented |
+| **Java/Maven** | `pom.xml` | ✅ Implemented |
+| **Java/Gradle** | `gradle.lockfile` + `build.gradle` | ✅ Implemented |
+| **Ruby/Bundler** | `Gemfile.lock` | ✅ Implemented |
+| **C#/.NET** | `packages.lock.json` + `*.csproj` | ✅ Implemented |
+| **C/C++ Conan** | `conan.lock` + `conanfile.txt/py` | ✅ Implemented |
+| **C/C++ vcpkg** | `vcpkg.json` + `vcpkg_installed/` | ✅ Implemented |
+| **C/C++ CMake** | `CMakeLists.txt` (find_package, FetchContent) | ✅ Implemented |
+| **Swift/SwiftPM** | `Package.resolved` + `Package.swift` | ✅ Implemented |
+
+### OSV.dev API Usage
+
+```python
+from promptforge.security import check_cve_osv
+
+# Check multiple packages at once (batch API)
+dependencies = [
+    ("PyPI", "gradio", "6.0.2"),
+    ("npm", "express", "4.18.0"),
+]
+cves = check_cve_osv(dependencies)
+```
+
+**Endpoint**: `POST https://api.osv.dev/v1/querybatch`
+
+### SecurityContext Dataclass
+
+```python
+@dataclass
+class SecurityContext:
+    languages: list[str]           # ["python", "javascript"]
+    security_keywords_found: list[str]  # ["auth", "database", "api"]
+    cves: list[CVEInfo]           # Detected vulnerabilities
+    is_dev: bool                   # True if dev project
+    security_level: str           # "critical", "elevated", "standard"
+```
+
+### Generated Security Section
+
+When scanning a project, the following security section is auto-generated:
+
+```markdown
+## Directives de Sécurité
+
+> Niveau de sécurité: 🔴 **CRITIQUE** / 🟠 **ÉLEVÉ** / 🟢 **STANDARD**
+
+### Bonnes Pratiques par Langage
+- Python: secrets, parameterized queries, bcrypt...
+- JavaScript: XSS prevention, CORS, helmet.js...
+- (other languages...)
+
+### Recommandations Spécifiques
+- 🔐 Authentification (if auth detected)
+- 🗄️ Base de Données (if SQL detected)
+- 📁 Fichiers & Uploads (if file ops detected)
+- 🌐 API Security (if API detected)
+
+### Rappel OWASP Top 10
+| # | Vulnérabilité |
+|---|---------------|
+| A01 | Broken Access Control |
+| A02 | Cryptographic Failures |
+...
+
+## Alertes de Sécurité (CVE)
+### 🔴 CRITIQUES
+- CVE-XXXX-XXXX: package → fix_version
+```
+
+### Build-System Filtering
+
+The scanner ignores build-system dependencies (not runtime):
+- `setuptools`, `wheel`, `pip`, `build` are filtered out
+- Only `[project.dependencies]` and `[project.optional-dependencies]` are scanned
+
+## Commercial Product Roadmap
+
+### ✅ Completed Features
+
+1. **Core Security Module** (`security.py`)
+   - OSV.dev integration for CVE checking
+   - CVSS severity parsing
+   - Language-specific security guidelines
+   - OWASP Top 10 reminders
+
+2. **Installed Version Detection** (Python only)
+   - `importlib.metadata` for accurate version detection
+   - Eliminates false positive CVEs
+   - Confidence indicators (✓ installed, ? declared)
+
+3. **Scanner Security Integration**
+   - Auto-detection of security context (auth, DB, API, files)
+   - Security level calculation (critical/elevated/standard)
+   - Build-system package filtering
+
+4. **UI Integration**
+   - CVE checkbox in Scanner tab
+   - Security alerts accordion
+   - Version source indicators
+
+### ✅ Recently Completed
+
+5. **Multi-Language Installed Version Detection** (December 2024)
+   - [x] Node.js: Parse `package-lock.json`
+   - [x] Rust: Parse `Cargo.lock`
+   - [x] Go: Parse `go.sum`
+   - [x] PHP: Parse `composer.lock`
+   - [x] Java Maven: Parse `pom.xml`
+   - [x] Java Gradle: Parse `gradle.lockfile` + `build.gradle`
+   - [x] Ruby: Parse `Gemfile.lock`
+   - [x] C#/.NET: Parse `packages.lock.json` + `*.csproj`
+   - [x] C/C++ Conan: Parse `conan.lock` + `conanfile.txt/py`
+   - [x] C/C++ vcpkg: Parse `vcpkg.json` + `vcpkg_installed/`
+   - [x] C/C++ CMake: Parse `CMakeLists.txt` (find_package, FetchContent)
+   - [x] Swift/SwiftPM: Parse `Package.resolved` + `Package.swift`
+
+6. **Enhanced Security Guidelines** (December 2024)
+   - [x] Language guidelines: Python, JavaScript/TypeScript, Rust, Go, Java, C#, PHP, Ruby, Swift, C/C++
+   - [x] Framework guidelines: React, Angular, Vue, Django, FastAPI, Flask, Express, NestJS, Spring Boot, ASP.NET
+   - [x] CVE links: Clickable links to NVD, GitHub Security Advisories, OSV.dev
+   - [x] Remediation commands: Auto-generated fix commands per ecosystem
+   - [x] Severity-based grouping: CRITICAL/HIGH/MEDIUM with actionable advice
+
+### 🔄 In Progress / TODO
+
+1. **Future Enhancements**
+   - [ ] SBOM generation (CycloneDX, SPDX format)
+   - [ ] License compliance checking (GPL, MIT, Apache detection)
+   - [ ] Secret detection in code (API keys, passwords)
+   - [ ] Dependency tree impact analysis
+   - [ ] CI/CD integration (GitHub Actions, GitLab CI)
+
+2. **Additional Language/Framework Support**
+   - [ ] Kotlin Multiplatform: Gradle with Kotlin DSL specific patterns
+   - [ ] Scala: sbt lockfile parsing
+   - [ ] Elixir: mix.lock parsing
+   - [ ] Haskell: cabal.project.freeze parsing
+
+## Important Notes for Development
+
+### Security Module Architecture
+
+```
+User triggers scan
+       ↓
+ProjectScanner._detect_packages()
+       ↓
+_get_installed_packages() [importlib.metadata for Python]
+       ↓
+DetectedPackage with version_source="installed" or "declared"
+       ↓
+check_security() → OSV.dev API
+       ↓
+_build_security_context()
+       ↓
+generate_config() with security section
+```
+
+### Truthfulness Requirement
+
+**CRITICAL**: PromptForge is a commercial product. All security information MUST be accurate:
+
+1. **Never report false positive CVEs** - Use installed versions when available
+2. **Always indicate confidence level** - ✓ for installed, ? for declared
+3. **Filter irrelevant packages** - Build tools, dev dependencies
+4. **Provide actionable information** - Fix versions, not just CVE IDs
+
+### Adding New Ecosystem Support
+
+To add installed version detection for a new ecosystem:
+
+1. Add lockfile detection in `_detect_packages()`
+2. Parse lockfile for actual versions
+3. Set `version_source="installed"` when found
+4. Test with real projects
+5. Update this documentation

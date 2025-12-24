@@ -132,21 +132,34 @@ def cmd_format(args):
         sys.exit(1)
     
     print("⏳ Reformatage en cours...\n")
-    
-    success, message, formatted = forge.format_prompt(raw_prompt, args.project)
-    
+
+    check_cves = getattr(args, 'check_cves', False)
+    success, message, formatted, security_ctx = forge.format_prompt(
+        raw_prompt, args.project, check_cves=check_cves
+    )
+
     if success:
         print("=" * 60)
         print("PROMPT REFORMATÉ")
         print("=" * 60)
         print(formatted)
         print("=" * 60)
+
+        # Display security info if dev context detected
+        if security_ctx and security_ctx.is_dev:
+            print(f"\n🔒 Contexte dev détecté: {', '.join(security_ctx.languages)}")
+            print(f"   Niveau de sécurité: {security_ctx.security_level}")
+            if security_ctx.cves:
+                print(f"\n⚠️  {len(security_ctx.cves)} CVE(s) détectée(s):")
+                for cve in security_ctx.cves[:5]:
+                    print(f"   [{cve.severity}] {cve.id}: {cve.package}")
+
         print(f"\n✓ Sauvegardé dans: {message}")
-        
+
         # Copie dans le presse-papier si demandé
         if args.copy:
             from .utils import copy_to_clipboard, get_clipboard_tool
-            
+
             if copy_to_clipboard(formatted):
                 print("✓ Copié dans le presse-papier")
             else:
@@ -433,6 +446,7 @@ def main():
     format_parser.add_argument("--project", help="Projet à utiliser (défaut: actif)")
     format_parser.add_argument("--model", "-m", help="Modèle Ollama à utiliser")
     format_parser.add_argument("--copy", "-c", action="store_true", help="Copier dans le presse-papier")
+    format_parser.add_argument("--check-cves", action="store_true", help="Vérifier les CVE via OSV.dev")
     format_parser.set_defaults(func=cmd_format)
     
     # history
