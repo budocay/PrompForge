@@ -56,7 +56,7 @@ class ModelPricing:
     input_price: float      # $ par million de tokens en entrée
     output_price: float     # $ par million de tokens en sortie
     context_window: int     # Fenêtre de contexte max, en tokens
-    cached_input: Optional[float] = None  # $ / MTok en cache hit ; None = non confirmé
+    cached_input: float | None = None  # $ / MTok en cache hit ; None = non confirmé
     source_url: str = ""    # Page officielle consultée
     verified_on: str = ""   # Date de vérification, ISO 8601
 

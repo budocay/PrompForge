@@ -6,6 +6,7 @@ Generates recommendations based on domain detection and model capabilities.
 from ..tokens import estimate_tokens
 from ..profiles import MODEL_PRICING, TargetModel, compare_models
 from .analysis import detect_domain, detect_task_type
+from .profiles_ui import format_context_window
 
 # =============================================================================
 # BENCHMARK SOURCES (December 2025)
@@ -85,16 +86,15 @@ OLLAMA_MODELS_INFO = {
     'qwen3:4b': {'size': '4B', 'reformat_score': 68, 'tier': 'cpu', 'note': 'Qwen - suivi XML limité'},
 }
 
+
 def _context_of(model: TargetModel) -> str:
     """Fenêtre de contexte lisible, composée depuis MODEL_PRICING.
 
-    Aucune fenêtre de contexte n'est écrite en dur dans le package web
-    (F-022 bloc 2) : elle est lue dans le domaine au moment du rendu.
+    Délègue à l'unique formateur de fenêtre du paquet web
+    (`profiles_ui.format_context_window`) : la convention d'affichage a une
+    seule raison de changer, donc un seul endroit où la changer (CRAFT V3).
     """
-    window = MODEL_PRICING[model].context_window
-    if window >= 1_000_000 and window % 1_000_000 == 0:
-        return f"{window // 1_000_000}M"
-    return f"{window // 1_000}K"
+    return format_context_window(MODEL_PRICING[model])
 
 
 # Domain expertise scores by model
@@ -404,7 +404,7 @@ def generate_recommendation(
             'score': score,
             'reason': reason,
             'value': value_score,
-            'context': f"{pricing.context_window // 1000}K"
+            'context': format_context_window(pricing)
         })
 
     all_models.sort(key=lambda x: x['score'], reverse=True)

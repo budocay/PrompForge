@@ -460,6 +460,41 @@ class TestProfilesUiDomainParity:
         info = get_profile_info("profil-inexistant")
         assert "$" not in info
 
+    def test_static_descriptions_hold_no_price_nor_context_literal(self):
+        """Aucun tarif ni fenêtre de contexte en dur dans le texte statique.
+
+        Les tests de parité vérifiaient la PRÉSENCE du suffixe composé, jamais
+        l'ABSENCE d'un littéral : réinjecter « ($999/$1) » dans une description
+        les laissait tous verts, et l'utilisateur voyait deux tarifs dont un
+        faux. Ce test est le verrou manquant (CRAFT V1).
+        """
+        import re
+
+        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS
+
+        literal = re.compile(r"\$|\b\d+(?:[.,]\d+)?\s*[KM]\b")
+        for name, description in PROFILE_DESCRIPTIONS.items():
+            found = literal.findall(description)
+            assert not found, (
+                f"{name}: littéral de tarif ou de contexte {found} dans le texte "
+                f"statique — ces valeurs se composent depuis MODEL_PRICING au rendu"
+            )
+
+    def test_static_details_hold_no_price_nor_context_literal(self):
+        """Même verrou sur le panneau de détail, titre et puces compris."""
+        import re
+
+        from promptforge.web.profiles_ui import PROFILE_DETAILS
+
+        literal = re.compile(r"\$|\b\d+(?:[.,]\d+)?\s*[KM]\b")
+        for name, details in PROFILE_DETAILS.items():
+            for text in [details["title"], *details["bullets"]]:
+                found = literal.findall(text)
+                assert not found, (
+                    f"{name}: littéral de tarif ou de contexte {found} dans "
+                    f"{text[:60]!r} — composer depuis MODEL_PRICING au rendu"
+                )
+
     def test_recommendation_iterates_over_model_pricing(self):
         """`generate_recommendation()` couvre toutes les entrées de MODEL_PRICING."""
         from promptforge.profiles import MODEL_PRICING
@@ -472,6 +507,13 @@ class TestProfilesUiDomainParity:
             domain_override="code",
         )
         assert isinstance(rendered, str) and rendered
-        # Le tableau n'affiche que le top 5 : on vérifie qu'aucun modèle du
-        # domaine ne fait échouer le rendu (KeyError sur une entrée manquante).
-        assert len(MODEL_PRICING) >= 5
+
+        # L'assertion porte sur l'ACTE, pas sur une constante de module : on
+        # compte les modèles du domaine réellement cités par le rendu. Une
+        # itération tronquée (`list(...)[:1]`) tombe ici, alors qu'un
+        # `len(MODEL_PRICING) >= 5` resterait vrai (CRAFT V2).
+        cites = [model.value for model in MODEL_PRICING if model.value in rendered]
+        assert len(cites) >= 5, (
+            f"seuls {len(cites)} modèles sur {len(MODEL_PRICING)} apparaissent "
+            f"dans le rendu : {cites}"
+        )
