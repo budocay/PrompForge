@@ -258,3 +258,100 @@ class TestConfigureOllama:
         forge.configure_ollama(base_url="http://custom:8080")
         
         assert forge.ollama.config.base_url == "http://custom:8080"
+
+
+class TestModelPricingContract:
+    """Tests du contrat de ModelPricing et de la table MODEL_PRICING (F-022).
+
+    Placés ici faute de fichier de tests dédié à profiles.py dans le périmètre
+    d'agent-backend ; à déplacer vers tests/test_profiles.py si ce fichier est
+    créé un jour.
+    """
+
+    def test_pricing_table_covers_exactly_target_model(self):
+        """Parité stricte : une entrée de tarif par modèle cible, ni plus ni moins."""
+        from promptforge.profiles import MODEL_PRICING, TargetModel
+
+        assert set(MODEL_PRICING) == set(TargetModel)
+
+    def test_every_pricing_entry_is_a_model_pricing(self):
+        """Chaque valeur est bien une ModelPricing exploitable."""
+        from promptforge.profiles import MODEL_PRICING, ModelPricing
+
+        for model, pricing in MODEL_PRICING.items():
+            assert isinstance(pricing, ModelPricing), model
+            assert pricing.input_price > 0, model
+            assert pricing.output_price > 0, model
+            assert pricing.context_window > 0, model
+
+    def test_cached_input_is_never_zero(self):
+        """Un cache absent vaut None, jamais 0.0 : zéro facturerait un cache gratuit."""
+        from promptforge.profiles import MODEL_PRICING
+
+        for model, pricing in MODEL_PRICING.items():
+            assert pricing.cached_input is None or pricing.cached_input > 0, model
+
+    def test_sourced_entries_carry_url_and_date(self):
+        """Une entrée qui porte une source porte aussi sa date de vérification."""
+        from promptforge.profiles import MODEL_PRICING
+
+        for model, pricing in MODEL_PRICING.items():
+            if pricing.source_url:
+                assert pricing.source_url.startswith("https://"), model
+                assert pricing.verified_on, model
+                # ISO 8601, forme AAAA-MM-JJ
+                assert len(pricing.verified_on) == 10, model
+                assert pricing.verified_on[4] == "-" and pricing.verified_on[7] == "-", model
+
+    def test_estimate_cost_without_cache_price_ignores_cached_pct(self):
+        """Sans tarif de cache confirmé, la remise n'est pas appliquée."""
+        from promptforge.profiles import ModelPricing
+
+        pricing = ModelPricing(input_price=15.0, output_price=120.0, context_window=400_000)
+
+        assert pricing.cached_input is None
+        full = pricing.estimate_cost(1_000_000, 0, cached_pct=0)
+        discounted = pricing.estimate_cost(1_000_000, 0, cached_pct=1.0)
+        assert full == pytest.approx(15.0)
+        assert discounted == pytest.approx(full)
+
+    def test_estimate_cost_applies_confirmed_cache_price(self):
+        """Avec un tarif de cache confirmé, la remise s'applique."""
+        from promptforge.profiles import ModelPricing
+
+        pricing = ModelPricing(
+            input_price=1.0,
+            output_price=5.0,
+            context_window=200_000,
+            cached_input=0.1,
+        )
+
+        assert pricing.estimate_cost(1_000_000, 0, cached_pct=1.0) == pytest.approx(0.1)
+        assert pricing.estimate_cost(1_000_000, 0, cached_pct=0.5) == pytest.approx(0.55)
+        assert pricing.estimate_cost(0, 1_000_000) == pytest.approx(5.0)
+
+    def test_gpt_5_pro_has_no_input_cache(self):
+        """GPT-5 Pro ne propose pas de cache d'entrée (source officielle 2026-09-03)."""
+        from promptforge.profiles import MODEL_PRICING, TargetModel
+
+        assert MODEL_PRICING[TargetModel.GPT_5_PRO].cached_input is None
+
+    def test_corrected_values_match_the_official_sources(self):
+        """Les quatre corrections de F-022, vérifiées le 2026-09-03."""
+        from promptforge.profiles import MODEL_PRICING, TargetModel
+
+        haiku = MODEL_PRICING[TargetModel.CLAUDE_HAIKU_4_5]
+        assert (haiku.input_price, haiku.output_price) == (1.0, 5.0)
+
+        gpt5pro = MODEL_PRICING[TargetModel.GPT_5_PRO]
+        assert (gpt5pro.input_price, gpt5pro.output_price) == (15.0, 120.0)
+        assert gpt5pro.context_window == 400_000
+
+        assert MODEL_PRICING[TargetModel.GPT_5_1].context_window == 400_000
+        assert MODEL_PRICING[TargetModel.CLAUDE_SONNET_4_5].context_window == 200_000
+
+    def test_model_pricing_has_no_dead_member(self):
+        """avg_price_per_1k est supprimée : aucun appelant, contrat nettoyé."""
+        from promptforge.profiles import ModelPricing
+
+        assert not hasattr(ModelPricing, "avg_price_per_1k")

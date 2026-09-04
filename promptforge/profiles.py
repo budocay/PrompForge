@@ -1,7 +1,10 @@
 """
 Profils de reformatage optimisés pour différents modèles LLM.
-Mis à jour Décembre 2025 avec GPT-5.1, Gemini 3, Claude 4.5.
-Inclut comparaison prix/performance.
+
+Tarifs et fenêtres de contexte vérifiés le 2026-09-03 sur les pages officielles
+de tarification Anthropic et OpenAI (cf. MEMORY/VEILLE.md). Chaque entrée de
+MODEL_PRICING porte sa source et sa date ; une source vide signale une valeur
+qu'aucune source officielle ne confirme.
 """
 
 from dataclasses import dataclass
@@ -39,22 +42,36 @@ class PromptStyle(Enum):
 
 @dataclass
 class ModelPricing:
-    """Prix d'un modèle par million de tokens."""
-    input_price: float      # $ par million tokens input
-    output_price: float     # $ par million tokens output
-    cached_input: float     # $ par million tokens (cache hit)
-    context_window: int     # Taille max du contexte en tokens
-    
-    @property
-    def avg_price_per_1k(self) -> float:
-        """Prix moyen pour 1K tokens (ratio 1:1 input/output)."""
-        return (self.input_price + self.output_price) / 2 / 1000
-    
+    """Prix d'un modèle par million de tokens, avec sa provenance.
+
+    `cached_input` vaut ``None`` quand aucun tarif de cache n'est confirmé par
+    une source officielle. Surtout pas ``0.0`` : zéro facturerait silencieusement
+    un cache gratuit qui n'existe pas. `estimate_cost()` force alors
+    ``cached_pct = 0`` et facture tout en entrée fraîche.
+
+    `source_url` vide signale une valeur qu'aucune source officielle ne confirme
+    aujourd'hui (modèle arrêté, identifiant sans existence connue, ou moyenne
+    synthétique). Voir F-028 pour le sort de ces entrées.
+    """
+    input_price: float      # $ par million de tokens en entrée
+    output_price: float     # $ par million de tokens en sortie
+    context_window: int     # Fenêtre de contexte max, en tokens
+    cached_input: Optional[float] = None  # $ / MTok en cache hit ; None = non confirmé
+    source_url: str = ""    # Page officielle consultée
+    verified_on: str = ""   # Date de vérification, ISO 8601
+
     def estimate_cost(self, input_tokens: int, output_tokens: int, cached_pct: float = 0) -> float:
-        """Estime le coût d'une requête."""
+        """Estime le coût d'une requête.
+
+        Sans tarif de cache confirmé, `cached_pct` est ignoré et forcé à 0 :
+        on préfère surestimer le coût que d'appliquer une remise inventée.
+        """
+        if self.cached_input is None:
+            cached_pct = 0
         cached_tokens = input_tokens * cached_pct
         fresh_tokens = input_tokens - cached_tokens
-        input_cost = (fresh_tokens * self.input_price + cached_tokens * self.cached_input) / 1_000_000
+        cached_price = 0.0 if self.cached_input is None else self.cached_input
+        input_cost = (fresh_tokens * self.input_price + cached_tokens * cached_price) / 1_000_000
         output_cost = output_tokens * self.output_price / 1_000_000
         return input_cost + output_cost
 
@@ -71,70 +88,108 @@ class ReformatProfile:
 
 
 # ============================================
-# Prix des modèles (Décembre 2025)
+# Prix des modèles
+# Vérifiés le 2026-09-03 sur les pages officielles de tarification
+# (voir MEMORY/VEILLE.md, section « Modèles cibles du reformatage et tarifs »).
+# Chaque entrée porte son URL de source et sa date de vérification.
+# Une source vide = aucune source officielle ne confirme la valeur (F-028).
 # ============================================
 
+ANTHROPIC_PRICING_URL = "https://platform.claude.com/docs/en/about-claude/pricing"
+OPENAI_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
+PRICING_VERIFIED_ON = "2026-09-03"
+
 MODEL_PRICING = {
-    # Claude (Anthropic)
+    # Claude (Anthropic) - tarifs et fenêtres relevés sur la page officielle
     TargetModel.CLAUDE_OPUS_4_5: ModelPricing(
         input_price=5.0,
         output_price=25.0,
+        context_window=200_000,  # antérieur à Claude 4.6 : pas de contexte 1M
         cached_input=0.5,
-        context_window=200_000
+        source_url=ANTHROPIC_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
     ),
     TargetModel.CLAUDE_SONNET_4_5: ModelPricing(
         input_price=3.0,
         output_price=15.0,
+        # Corrigé : le contexte 1M à prix standard est réservé à Claude 4.6+.
+        context_window=200_000,
         cached_input=0.3,
-        context_window=1_000_000  # 1M tokens depuis août 2025
+        source_url=ANTHROPIC_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
     ),
     TargetModel.CLAUDE_HAIKU_4_5: ModelPricing(
-        input_price=0.25,
-        output_price=1.25,
-        cached_input=0.025,
-        context_window=200_000
+        # Corrigé : le dépôt affichait 0.25 / 1.25, soit un facteur 4 sous le
+        # tarif officiel.
+        input_price=1.0,
+        output_price=5.0,
+        context_window=200_000,
+        cached_input=0.1,  # multiplicateur standard 0.1x
+        source_url=ANTHROPIC_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
     ),
-    
+
     # GPT (OpenAI)
     TargetModel.GPT_5_1: ModelPricing(
         input_price=1.25,
         output_price=10.0,
+        context_window=400_000,  # corrigé : le dépôt annonçait 272 000
         cached_input=0.125,
-        context_window=272_000
+        source_url=OPENAI_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
     ),
     TargetModel.GPT_5_1_MINI: ModelPricing(
+        # Aucune source : `gpt-5.1-mini` n'a aucune existence officielle connue
+        # (404 sur la fiche modèle). Les valeurs ci-dessous sont celles déjà
+        # présentes dans le dépôt, recopiées du tarif de `gpt-5-mini`.
+        # Elles ne sont ni corrigées ni sourcées ici : le sort de ce membre de
+        # TargetModel relève de F-028.
         input_price=0.25,
         output_price=2.0,
+        context_window=200_000,
         cached_input=0.025,
-        context_window=200_000
     ),
     TargetModel.GPT_5_PRO: ModelPricing(
-        input_price=5.0,
-        output_price=20.0,
-        cached_input=0.5,
-        context_window=272_000
+        # Corrigé : le dépôt sous-estimait l'entrée d'un facteur 3 et la sortie
+        # d'un facteur 6.
+        input_price=15.0,
+        output_price=120.0,
+        # Corrigé : 272 000 est le plafond de sortie, pas la fenêtre de contexte.
+        context_window=400_000,
+        # GPT-5 Pro ne propose pas de cache d'entrée : aucun tarif à facturer.
+        cached_input=None,
+        source_url=OPENAI_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
     ),
-    
+
     # Gemini (Google)
     TargetModel.GEMINI_3_PRO: ModelPricing(
+        # Aucune source : `gemini-3-pro-preview` est arrêté depuis le
+        # 2026-03-09. Valeurs du dépôt conservées telles quelles ; le
+        # remplacement de l'identifiant relève de F-028.
         input_price=2.0,
         output_price=12.0,
+        context_window=1_000_000,
         cached_input=0.2,
-        context_window=1_000_000
     ),
     TargetModel.GEMINI_3_FLASH: ModelPricing(
+        # Aucune source : `gemini-3-flash-preview` est déprécié et ces tarifs ne
+        # correspondent à aucune version active. Valeurs du dépôt conservées
+        # telles quelles ; leur sort relève de F-028.
         input_price=0.5,
         output_price=2.0,
+        context_window=1_000_000,
         cached_input=0.05,
-        context_window=1_000_000
     ),
-    
-    # Universel (moyenne)
+
+    # Universel
     TargetModel.UNIVERSAL: ModelPricing(
+        # Aucune source par construction : moyenne synthétique, ne désigne aucun
+        # modèle réel. Traité par F-028.
         input_price=1.0,
         output_price=5.0,
+        context_window=128_000,
         cached_input=0.1,
-        context_window=128_000
     ),
 }
 
