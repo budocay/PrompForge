@@ -23,7 +23,17 @@ import argparse
 from pathlib import Path
 
 # Configurations Docker Compose disponibles
+#
+# `default` est le chemin par defaut de DEC-010 : seule l'interface tourne en
+# conteneur, Ollama reste natif sur l'hote. Identique sur Windows, macOS et
+# Linux. C'est la valeur retenue quand `-c` n'est pas passe : le defaut du
+# produit est desormais celui que le produit selectionne reellement.
+#
+# Les autres entrees embarquent Ollama en conteneur et ne se justifient que
+# sur une machine dont le GPU est expose a Docker. Elles restent accessibles
+# explicitement, ou par `-c auto` qui rejoue la detection GPU.
 COMPOSE_FILES = {
+    "default": "compose.yaml",
     "nvidia": "docker/compose/docker-compose.yml",
     "linux-amd": "docker/compose/docker-compose.amd.yml",
     "linux-amd-max": "docker/compose/docker-compose.amd-max.yml",
@@ -31,6 +41,15 @@ COMPOSE_FILES = {
     "win-amd": "docker/compose/docker-compose.win-amd.yml",
     "win-nvidia-native": "docker/compose/docker-compose.win-nvidia.yml"
 }
+
+# Configuration retenue en l'absence de `-c`.
+DEFAULT_CONFIG = "default"
+
+# Valeur speciale de `-c` : rejoue la detection materielle.
+AUTO_CONFIG = "auto"
+
+# Choix acceptes par `-c`.
+CONFIG_CHOICES = [AUTO_CONFIG] + list(COMPOSE_FILES.keys())
 
 # Couleurs pour le terminal
 class Colors:
@@ -113,15 +132,45 @@ def detect_gpu():
     return "cpu"
 
 def get_compose_file(config=None):
-    """Retourne le fichier docker-compose approprié."""
+    """Retourne le fichier docker-compose approprié.
+
+    Sans `-c`, on ne devine plus : on prend le chemin par defaut de DEC-010,
+    identique sur les trois systemes. `detect_gpu()` n'a aucune branche Darwin
+    (D-018) et retombait silencieusement sur `cpu` sur macOS, c'est-a-dire sur
+    un Ollama conteneurise sans acces Metal — exactement ce que DEC-010
+    remplace. La detection reste disponible, mais seulement si on la demande.
+    """
     if config is None:
+        config = DEFAULT_CONFIG
+    elif config == AUTO_CONFIG:
         config = detect_gpu()
-    
+        print_status(f"Detection materielle : configuration '{config}'", "info")
+
     if config not in COMPOSE_FILES:
-        print_status(f"Configuration '{config}' inconnue, utilisation de 'cpu'", "warning")
-        config = "cpu"
-    
+        print_status(
+            f"Configuration '{config}' inconnue, utilisation de '{DEFAULT_CONFIG}'", "warning"
+        )
+        config = DEFAULT_CONFIG
+
     return COMPOSE_FILES[config]
+
+
+def compose_services(compose_file):
+    """Services declares par le fichier compose vise.
+
+    Interroge Docker plutot que de parser le YAML : meme resolution que celle
+    qui s'appliquera aux commandes suivantes.
+    """
+    result = subprocess.run(
+        ["docker", "compose", "-f", compose_file, "config", "--services"],
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace'
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 def cmd_status(args):
     """Affiche l'état des images Docker."""
@@ -240,7 +289,10 @@ def cmd_up(args):
     if result.returncode == 0:
         print_status("\n✅ Services démarrés!", "success")
         print_status("   → PromptForge: http://localhost:7860", "info")
-        print_status("   → Ollama: http://localhost:11434", "info")
+        if "ollama" in compose_services(compose_file):
+            print_status("   → Ollama (conteneur): http://localhost:11434", "info")
+        else:
+            print_status("   → Ollama: natif sur l'hote (DEC-010)", "info")
     
     return result.returncode
 
@@ -265,7 +317,8 @@ def main():
         epilog="""
 Examples:
   python scripts/build.py status              # Voir l'état des images
-  python scripts/build.py build               # Construire (auto-détection GPU)
+  python scripts/build.py build               # Construire (compose.yaml, defaut DEC-010)
+  python scripts/build.py build -c auto       # Construire avec detection GPU
   python scripts/build.py build -c nvidia     # Construire pour NVIDIA
   python scripts/build.py build --no-cache    # Reconstruire sans cache
   python scripts/build.py up                  # Démarrer les services
@@ -282,8 +335,9 @@ Examples:
     
     # build
     p_build = subparsers.add_parser("build", help="Construire les images")
-    p_build.add_argument("-c", "--config", choices=list(COMPOSE_FILES.keys()),
-                         help="Configuration GPU (auto-détecté si non spécifié)")
+    p_build.add_argument("-c", "--config", choices=CONFIG_CHOICES,
+                         help=f"Configuration (defaut: {DEFAULT_CONFIG}, "
+                              f"'{AUTO_CONFIG}' pour la detection GPU)")
     p_build.add_argument("--no-cache", action="store_true",
                          help="Reconstruire sans utiliser le cache")
     p_build.add_argument("--parallel", type=int, default=None,
@@ -306,16 +360,18 @@ Examples:
     
     # up
     p_up = subparsers.add_parser("up", help="Démarrer les services")
-    p_up.add_argument("-c", "--config", choices=list(COMPOSE_FILES.keys()),
-                      help="Configuration GPU")
+    p_up.add_argument("-c", "--config", choices=CONFIG_CHOICES,
+                      help=f"Configuration (defaut: {DEFAULT_CONFIG}, "
+                           f"'{AUTO_CONFIG}' pour la detection GPU)")
     p_up.add_argument("--build", action="store_true",
                       help="Reconstruire avant de démarrer")
     p_up.set_defaults(func=cmd_up)
     
     # down
     p_down = subparsers.add_parser("down", help="Arrêter les services")
-    p_down.add_argument("-c", "--config", choices=list(COMPOSE_FILES.keys()),
-                        help="Configuration GPU")
+    p_down.add_argument("-c", "--config", choices=CONFIG_CHOICES,
+                        help=f"Configuration (defaut: {DEFAULT_CONFIG}, "
+                             f"'{AUTO_CONFIG}' pour la detection GPU)")
     p_down.set_defaults(func=cmd_down)
     
     args = parser.parse_args()

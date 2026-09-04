@@ -1,7 +1,7 @@
 # PromptForge Makefile
 # Usage: make <target>
 
-.PHONY: help install install-dev test test-cov lint format clean docker-start docker-stop docker-status docker-run docker-clean web
+.PHONY: help install install-dev test test-cov lint format clean docker-build docker-start docker-stop docker-status docker-logs docker-run docker-shell docker-clean docker-web build build-auto up down web
 
 # Variables
 PYTHON := python3
@@ -9,6 +9,14 @@ PIP := pip
 PYTEST := pytest
 BLACK := black
 RUFF := ruff
+
+# Fichier compose par defaut (DEC-010) : seule l'interface tourne en conteneur,
+# Ollama reste natif sur l'hote. Il n'expose donc QU'UN service,
+# `promptforge-web` : aucune cible ne doit nommer `ollama` ni `promptforge`
+# sans passer un `-f` vers une variante qui les declare.
+# Surchargeable : make docker-start COMPOSE_FILE=docker/compose/docker-compose.cpu.yml
+COMPOSE_FILE ?= compose.yaml
+COMPOSE := docker compose -f $(COMPOSE_FILE)
 
 # Couleurs
 BLUE := \033[34m
@@ -69,25 +77,25 @@ format-check: ## Vérifier le formatage sans modifier
 # ============================================
 
 docker-build: ## Construire l'image Docker
-	docker compose build promptforge
+	$(COMPOSE) build
 
-docker-start: ## Démarrer Ollama + télécharger le modèle
-	$(PYTHON) scripts/docker_helper.py start
+docker-start: ## Démarrer les services + vérifier le modèle Ollama
+	$(PYTHON) scripts/docker_helper.py -f $(COMPOSE_FILE) start
 
 docker-stop: ## Arrêter les services Docker
-	$(PYTHON) scripts/docker_helper.py stop
+	$(PYTHON) scripts/docker_helper.py -f $(COMPOSE_FILE) stop
 
 docker-status: ## Statut des services Docker
 	$(PYTHON) scripts/build.py status
 
-docker-logs: ## Logs Ollama
-	$(PYTHON) scripts/docker_helper.py logs
+docker-logs: ## Logs de l'interface (usage: make docker-logs SERVICE=promptforge-web)
+	$(PYTHON) scripts/docker_helper.py -f $(COMPOSE_FILE) logs $(SERVICE)
 
 docker-run: ## Exécuter une commande (usage: make docker-run CMD="list")
-	$(PYTHON) scripts/docker_helper.py run $(CMD)
+	$(PYTHON) scripts/docker_helper.py -f $(COMPOSE_FILE) run $(CMD)
 
 docker-shell: ## Shell interactif dans le conteneur
-	$(PYTHON) scripts/docker_helper.py shell
+	$(PYTHON) scripts/docker_helper.py -f $(COMPOSE_FILE) shell
 
 docker-clean: ## Supprimer conteneurs et volumes Docker
 	$(PYTHON) scripts/build.py clean --force --images
@@ -96,8 +104,11 @@ docker-clean: ## Supprimer conteneurs et volumes Docker
 # Build System (nouveau)
 # ============================================
 
-build: ## Construire les images Docker (auto-détection GPU)
+build: ## Construire les images Docker (compose.yaml, defaut DEC-010)
 	$(PYTHON) scripts/build.py build
+
+build-auto: ## Construire avec détection GPU (Ollama conteneurisé)
+	$(PYTHON) scripts/build.py build -c auto
 
 build-nvidia: ## Construire pour NVIDIA
 	$(PYTHON) scripts/build.py build -c nvidia
@@ -111,7 +122,7 @@ build-cpu: ## Construire pour CPU
 rebuild: ## Reconstruire sans cache
 	$(PYTHON) scripts/build.py build --no-cache
 
-up: ## Démarrer les services (auto-détection GPU)
+up: ## Démarrer les services (compose.yaml, defaut DEC-010)
 	$(PYTHON) scripts/build.py up
 
 down: ## Arrêter les services
@@ -126,29 +137,29 @@ launcher: ## Lancer le launcher GUI
 
 update: ## Mettre à jour les images Docker (pull + rebuild + restart)
 	@echo "$(BLUE)🔄 Mise à jour PromptForge...$(NC)"
-	docker compose pull
-	docker compose build
-	docker compose up -d
+	$(COMPOSE) pull
+	$(COMPOSE) build
+	$(COMPOSE) up -d
 	@echo "$(GREEN)✅ Mise à jour terminée!$(NC)"
-	docker compose ps
+	$(COMPOSE) ps
 
 update-force: ## Forcer reconstruction complète (sans cache)
 	@echo "$(YELLOW)🔄 Reconstruction forcée (sans cache)...$(NC)"
-	docker compose down
-	docker compose build --no-cache --pull
-	docker compose up -d
+	$(COMPOSE) down
+	$(COMPOSE) build --no-cache --pull
+	$(COMPOSE) up -d
 	@echo "$(GREEN)✅ Reconstruction terminée!$(NC)"
-	docker compose ps
+	$(COMPOSE) ps
 
 update-all: ## Mettre à jour + nettoyer les anciennes images
 	@echo "$(BLUE)🔄 Mise à jour complète...$(NC)"
-	docker compose down
-	docker compose pull
-	docker compose build --no-cache
+	$(COMPOSE) down
+	$(COMPOSE) pull
+	$(COMPOSE) build --no-cache
 	docker image prune -f
-	docker compose up -d
+	$(COMPOSE) up -d
 	@echo "$(GREEN)✅ Mise à jour complète terminée!$(NC)"
-	docker compose ps
+	$(COMPOSE) ps
 
 # ============================================
 # Docker AMD GPU (ROCm)
@@ -184,7 +195,7 @@ web-public: ## Lancer l'interface web avec lien public
 	promptforge web --host 0.0.0.0 --share
 
 docker-web: ## Lancer l'interface web via Docker
-	$(PYTHON) scripts/docker_helper.py web
+	$(PYTHON) scripts/docker_helper.py -f $(COMPOSE_FILE) web
 
 # ============================================
 # Développement

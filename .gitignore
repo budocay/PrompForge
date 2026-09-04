@@ -38,6 +38,12 @@ promptforge.db
 history/
 data/history/
 data/promptforge.db
+# Configurations de projet creees par l'utilisateur (D-008). Sans cette regle,
+# la negation ci-dessous ne negate rien : `git check-ignore data/projects/x.md`
+# rendait rc=1, donc tout fichier personnel depose la etait suivi par git.
+# On ignore le CONTENU du dossier, pas le dossier : git ne sait pas reinclure
+# un fichier dont le dossier parent est exclu.
+data/projects/*
 
 # Mais garder les exemples de projets
 !projects/exemple-*.md

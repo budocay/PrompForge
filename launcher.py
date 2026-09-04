@@ -66,7 +66,18 @@ RECOMMENDED_MODELS = {
 }
 
 # Mapping des docker-compose par configuration
+#
+# `default` est le chemin par defaut de DEC-010 : seule l'interface tourne en
+# conteneur, Ollama reste natif sur l'hote, a l'identique sur Windows, macOS et
+# Linux. C'est la valeur retenue par `select_docker_compose()` sur les trois
+# systemes. Les autres entrees embarquent Ollama en conteneur et ne se
+# justifient que si le GPU est expose a Docker, donc jamais sur macOS.
 DOCKER_COMPOSE_OPTIONS = {
+    "default": {
+        "file": "compose.yaml",
+        "label": "Par defaut (Ollama natif)",
+        "description": "Interface en conteneur, Ollama natif sur l'hote - Windows, macOS, Linux"
+    },
     "nvidia": {
         "file": "docker/compose/docker-compose.yml",
         "label": "NVIDIA (Docker)",
@@ -303,37 +314,40 @@ def select_recommended_model():
 
 
 def select_docker_compose():
-    """Sélectionne le fichier docker-compose approprié selon l'environnement."""
+    """Selectionne le fichier docker-compose approprie selon l'environnement.
+
+    Le choix par defaut est `default` (compose.yaml) sur les trois systemes,
+    conformement a DEC-010. Les variantes a Ollama conteneurise restent
+    proposees la ou elles ont un sens, c'est-a-dire la ou le GPU peut etre
+    expose a Docker. Sur macOS, elles ne sont pas proposees du tout : Docker
+    Desktop ne passe pas Metal aux conteneurs, un Ollama conteneurise y
+    tournerait CPU-only (D-020).
+    """
     system = state["os"]
     gpu_type = state["gpu_type"]
-    
-    # Déterminer les fichiers disponibles selon l'OS
-    if system == "Windows":
+
+    # Chemin par defaut, identique partout.
+    state["docker_compose_file"] = "default"
+
+    if system == "Darwin":
+        # macOS : aucune variante a Ollama conteneurise n'est proposee.
+        state["available_compose_files"] = ["default"]
+    elif system == "Windows":
         if gpu_type == "amd":
-            # AMD sur Windows nécessite Ollama natif (pas de ROCm dans Docker Windows)
-            state["docker_compose_file"] = "win-amd"
-            state["available_compose_files"] = ["win-amd", "cpu"]
+            # Sur Windows, Docker n'accede pas au GPU AMD : Ollama reste natif.
+            state["available_compose_files"] = ["default", "win-amd", "cpu"]
         elif gpu_type == "nvidia":
-            # NVIDIA sur Windows: Docker par défaut, natif en option si conflit
-            state["docker_compose_file"] = "nvidia"
-            state["available_compose_files"] = ["nvidia", "win-nvidia-native", "cpu"]
+            state["available_compose_files"] = ["default", "win-nvidia-native", "nvidia", "cpu"]
         else:
-            state["docker_compose_file"] = "cpu"
-            state["available_compose_files"] = ["cpu"]
-    else:  # Linux / Mac
+            state["available_compose_files"] = ["default", "cpu"]
+    else:  # Linux
         if gpu_type == "amd":
-            state["docker_compose_file"] = "linux-amd"
-            state["available_compose_files"] = ["linux-amd", "linux-amd-max", "cpu"]
+            state["available_compose_files"] = ["default", "linux-amd", "linux-amd-max", "cpu"]
         elif gpu_type == "nvidia":
-            state["docker_compose_file"] = "nvidia"
-            state["available_compose_files"] = ["nvidia", "cpu"]
-        elif gpu_type == "apple":
-            state["docker_compose_file"] = "cpu"  # Apple Silicon utilise Metal via Ollama natif
-            state["available_compose_files"] = ["cpu"]
+            state["available_compose_files"] = ["default", "nvidia", "cpu"]
         else:
-            state["docker_compose_file"] = "cpu"
-            state["available_compose_files"] = ["cpu"]
-    
+            state["available_compose_files"] = ["default", "cpu"]
+
     compose_info = DOCKER_COMPOSE_OPTIONS.get(state["docker_compose_file"], {})
     log(f"Docker Compose selectionne: {compose_info.get('label', state['docker_compose_file'])}")
 
@@ -539,8 +553,8 @@ def check_rebuild_needed():
 
 def rebuild_docker_images(force=False):
     """Reconstruit les images Docker."""
-    compose_key = state.get("docker_compose_file", "cpu")
-    compose_info = DOCKER_COMPOSE_OPTIONS.get(compose_key, DOCKER_COMPOSE_OPTIONS["cpu"])
+    compose_key = state.get("docker_compose_file", "default")
+    compose_info = DOCKER_COMPOSE_OPTIONS.get(compose_key, DOCKER_COMPOSE_OPTIONS["default"])
     compose_file = compose_info["file"]
     
     if not os.path.exists(compose_file):
@@ -656,8 +670,8 @@ def start_promptforge():
     log("Demarrage de PromptForge...")
     
     # Utiliser le docker-compose sélectionné
-    compose_key = state.get("docker_compose_file", "cpu")
-    compose_info = DOCKER_COMPOSE_OPTIONS.get(compose_key, DOCKER_COMPOSE_OPTIONS["cpu"])
+    compose_key = state.get("docker_compose_file", "default")
+    compose_info = DOCKER_COMPOSE_OPTIONS.get(compose_key, DOCKER_COMPOSE_OPTIONS["default"])
     compose_file = compose_info["file"]
     
     log(f"Utilisation de {compose_file} ({compose_info['label']})")
@@ -674,7 +688,7 @@ def start_promptforge():
     
     # Sur Windows, arrêter Ollama natif si on utilise une config Docker avec Ollama
     # (pour éviter le conflit de port 11434)
-    if state["os"] == "Windows" and compose_key not in ["win-nvidia-native", "win-amd"]:
+    if state["os"] == "Windows" and compose_key not in ["default", "win-nvidia-native", "win-amd"]:
         log("Arret d'Ollama natif (liberation port 11434)...")
         subprocess.run(
             ["taskkill", "/IM", "ollama.exe", "/F"],
@@ -725,8 +739,8 @@ def stop_promptforge():
     log("Arret de PromptForge...")
     
     # Arrêter avec le fichier actuel
-    compose_key = state.get("docker_compose_file", "cpu")
-    compose_info = DOCKER_COMPOSE_OPTIONS.get(compose_key, DOCKER_COMPOSE_OPTIONS["cpu"])
+    compose_key = state.get("docker_compose_file", "default")
+    compose_info = DOCKER_COMPOSE_OPTIONS.get(compose_key, DOCKER_COMPOSE_OPTIONS["default"])
     compose_file = compose_info["file"]
     
     subprocess.run(
@@ -1275,6 +1289,7 @@ HTML_TEMPLATE = """
         }
         
         const COMPOSE_OPTIONS = {
+            "default": { label: "Par defaut (Ollama natif)", desc: "Interface en conteneur, Ollama natif sur l'hote - Windows, macOS, Linux" },
             "nvidia": { label: "NVIDIA (Docker)", desc: "GPU NVIDIA 8GB+ - qwen3:8b (meilleur raisonnement)" },
             "win-nvidia-native": { label: "Windows NVIDIA (Ollama natif)", desc: "Si conflit de port: utilise Ollama natif Windows" },
             "win-amd": { label: "Windows + AMD (Ollama natif)", desc: "Pour Windows avec GPU AMD - Ollama tourne en natif" },
@@ -1290,8 +1305,8 @@ HTML_TEMPLATE = """
                 if (!select || !descEl) return;
                 
                 // Mettre à jour les options disponibles
-                const available = data.available_compose_files || ['cpu'];
-                const current = data.docker_compose_file || 'cpu';
+                const available = data.available_compose_files || ['default'];
+                const current = data.docker_compose_file || 'default';
                 
                 select.innerHTML = available.map(function(key) {
                     var opt = COMPOSE_OPTIONS[key] || { label: key };
@@ -1482,7 +1497,7 @@ class LauncherHandler(SimpleHTTPRequestHandler):
                 select_recommended_model()  # Mettre à jour le modèle
                 select_docker_compose()  # Recalculer le docker-compose
             elif action == "select_compose":
-                compose_key = data.get("compose_key", "cpu")
+                compose_key = data.get("compose_key", "default")
                 if compose_key in DOCKER_COMPOSE_OPTIONS:
                     state["docker_compose_file"] = compose_key
                     compose_info = DOCKER_COMPOSE_OPTIONS[compose_key]

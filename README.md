@@ -41,6 +41,36 @@ python start.py --install # Installe les dependances
 python start.py --check   # Verifie l'installation
 ```
 
+### Launcher graphique
+
+```bash
+python launcher.py        # Interface de controle Docker + Ollama
+```
+
+---
+
+## Ligne de commande
+
+PromptForge est aussi un CLI. Onze commandes, installables par
+`pip install -e .` :
+
+```bash
+promptforge init <nom> --config <fichier.md>  # Creer un projet
+promptforge use <nom>                          # Activer un projet
+promptforge list                               # Lister les projets
+promptforge delete <nom>                       # Supprimer un projet
+promptforge reload <nom>                       # Recharger sa config
+promptforge scan <chemin> --name <nom>         # Scanner un projet existant
+promptforge format [prompt]                    # Reformater un prompt
+promptforge history [--limit N]                # Consulter l'historique
+promptforge status                             # Statut du systeme
+promptforge template                           # Afficher le template de config
+promptforge web [--port 7860]                  # Lancer l'interface web
+```
+
+Le coeur du CLI n'utilise que la bibliotheque standard : Gradio et tiktoken
+sont optionnels, et `promptforge` fonctionne sans eux.
+
 ---
 
 ## 📖 Comment ça marche
@@ -102,10 +132,25 @@ trouve moi des mots clés pour mon site
 
 ---
 
-## 🛠️ Mode Docker (optionnel)
+## 🛠️ Variantes Docker
+
+Le chemin par defaut (`docker compose up`) fait tourner l'interface en
+conteneur et joint l'Ollama natif de l'hote. C'est le seul chemin proposé sur
+macOS : Docker Desktop n'y passe pas le GPU aux conteneurs.
+
+Sur Linux avec un GPU expose a Docker, Ollama peut aussi tourner en conteneur :
 
 ```bash
-python launcher.py  # Lance le launcher Docker GUI
+docker compose -f docker/compose/docker-compose.yml up      # NVIDIA
+docker compose -f docker/compose/docker-compose.amd.yml up  # AMD ROCm
+docker compose -f docker/compose/docker-compose.cpu.yml up  # sans GPU
+```
+
+Les cibles `make` visent le compose par defaut, surchargeable :
+
+```bash
+make docker-start                                                   # compose.yaml
+make docker-start COMPOSE_FILE=docker/compose/docker-compose.cpu.yml
 ```
 
 ---
