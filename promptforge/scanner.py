@@ -88,10 +88,51 @@ LANGUAGE_EXTENSIONS = {
     "PowerShell": [".ps1", ".psm1"],
 }
 
+def normalize_version_constraint(raw: str) -> Optional[str]:
+    """Extract a concrete version from a raw version constraint.
+
+    Version files hold constraints, not versions: `>=3.11`, `^3.11`, `~=3.10`,
+    `>=3.10,<3.13`, `v18.14.2`. Reporting the constraint verbatim is what makes a
+    scanned project claim to run "version >=3.11", and what would feed a
+    constraint string to a CVE lookup.
+
+    The lower bound is retained, because it is the only version the constraint
+    actually guarantees is acceptable.
+
+    Args:
+        raw: The raw captured string, possibly a constraint expression.
+
+    Returns:
+        The first concrete dotted version found, or the stripped input when it
+        holds no version at all (`stable`, `latest`), or None when empty.
+    """
+    if raw is None:
+        return None
+
+    cleaned = raw.strip().strip("\"'")
+    if not cleaned:
+        return None
+
+    match = re.search(r"\d+(?:\.\d+)*", cleaned)
+    if match:
+        return match.group(0)
+
+    # Pas de chiffre du tout : `stable`, `latest`, `nightly`. On rend la valeur
+    # telle quelle plutot que None, c'est une information vraie.
+    return cleaned
+
+
+# Fichiers porteurs d'une version de langage, par langage.
+#
+# Les motifs capturent la chaine brute, contrainte comprise (`>=3.11`, `^3.11`,
+# `~=3.10`) ; c'est `normalize_version_constraint` qui en extrait la version.
 VERSION_FILES = {
     "Python": [
-        ("pyproject.toml", r'python\s*=\s*["\']([^"\']+)["\']'),
-        ("pyproject.toml", r'requires-python\s*=\s*["\']>=?([^"\']+)["\']'),
+        # Le lookbehind est indispensable : sans lui, ce motif Poetry capture aussi
+        # la cle PEP 621 `requires-python`, qui le precede rarement dans le fichier
+        # mais le devance toujours dans cette liste, et rend alors `>=3.11`.
+        ("pyproject.toml", r'(?<![\w-])python\s*=\s*["\']([^"\']+)["\']'),
+        ("pyproject.toml", r'requires-python\s*=\s*["\']([^"\']+)["\']'),
         (".python-version", r"^(\d+\.\d+(?:\.\d+)?)"),
         ("runtime.txt", r"python-(\d+\.\d+(?:\.\d+)?)"),
     ],
@@ -392,6 +433,27 @@ DATABASE_SIGNATURES = {
         "docker": ["elasticsearch"],
         "packages": ["elasticsearch", "@elastic/elasticsearch"],
     },
+}
+
+# Manifestes partages par tout un ecosysteme : leur simple presence ne prouve
+# rien sur un outil donne, il faut y chercher le motif. A l'inverse, un fichier de
+# configuration dedie (`vitest.config.ts`, `pytest.ini`, `.mocharc.json`) porte le
+# nom de son outil : son existence est la preuve, et exiger en plus un motif de
+# contenu revient a exiger qu'un fichier de config se declare lui-meme comme une
+# dependance, ce qu'il ne fait jamais.
+SHARED_MANIFEST_FILES = {
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "Cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "composer.json",
+    "Gemfile",
+    "requirements.txt",
 }
 
 TEST_SIGNATURES = {
@@ -915,7 +977,9 @@ class ProjectScanner:
                 if content:
                     match = re.search(pattern, content, re.MULTILINE | re.IGNORECASE)
                     if match:
-                        return match.group(1)
+                        normalized = normalize_version_constraint(match.group(1))
+                        if normalized:
+                            return normalized
         return None
 
     def _scan_frameworks(self, path: Path) -> list[DetectedFramework]:
@@ -1098,7 +1162,13 @@ class ProjectScanner:
                 else:
                     file_path = path / filename
                     if file_path.exists():
-                        if signature.get("pattern"):
+                        # Un manifeste partage (package.json, pyproject.toml) doit
+                        # contenir le motif ; un fichier de config dedie se suffit.
+                        needs_pattern = (
+                            filename in SHARED_MANIFEST_FILES
+                            and signature.get("pattern") is not None
+                        )
+                        if needs_pattern:
                             content = self._safe_read_file(file_path)
                             if content and re.search(
                                 signature["pattern"], content, re.IGNORECASE
@@ -2188,7 +2258,14 @@ class ProjectScanner:
                     r'\.package\s*\([^)]*url:\s*["\']https?://[^"\']*?/([^/"\']+)(?:\.git)?["\'][^)]*(?:from:|exact:)\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
                     content
                 ):
+                    # L'URL se termine par `.git` dans la quasi-totalite des
+                    # Package.swift. Sans ce retrait, le nom vaut `Alamofire.git`
+                    # alors que Package.resolved indexe sur l'identite `alamofire` :
+                    # la jointure echoue en silence et la version declaree est
+                    # remontee a la place de la version resolue.
                     pkg_name = match.group(1)
+                    if pkg_name.lower().endswith(".git"):
+                        pkg_name = pkg_name[: -len(".git")]
                     declared_version = match.group(2)
                     installed_version = swift_installed.get(pkg_name.lower(), "")
                     packages.append(DetectedPackage(

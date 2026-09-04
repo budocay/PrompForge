@@ -302,9 +302,72 @@ let package = Package(name: "Test", dependencies: [
         swift_packages = [p for p in result.packages if p.ecosystem == "SwiftPM"]
         alamofire = next((p for p in swift_packages if "alamofire" in p.name.lower()), None)
 
-        # Should use lockfile version
-        if alamofire:
-            assert alamofire.version == "5.9.1" or alamofire.installed_version == "5.9.1"
+        # Assertion inconditionnelle : le `if alamofire:` d'origine laissait le
+        # test passer en silence quand le paquet n'etait pas detecte du tout.
+        assert alamofire is not None, f"Alamofire absent de {swift_packages}"
+
+        # Le nom ne doit pas garder le suffixe `.git` de l'URL du depot, sinon la
+        # jointure avec Package.resolved (indexe sur `alamofire`) echoue.
+        assert alamofire.name == "Alamofire"
+
+        # La version resolue du lockfile prime sur la version declaree.
+        assert alamofire.installed_version == "5.9.1"
+        assert alamofire.declared_version == "5.0.0"
+        assert alamofire.version == "5.9.1"
+        assert alamofire.version_source == "installed"
+
+    def test_swift_url_without_git_suffix(self, temp_dir):
+        """Une URL sans `.git` doit se joindre au lockfile de la meme facon."""
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "main.swift").write_text('print("Hello")')
+        (project_dir / "Package.swift").write_text("""
+import PackageDescription
+let package = Package(name: "Test", dependencies: [
+    .package(url: "https://github.com/apple/swift-nio", from: "2.0.0")
+])
+""")
+        (project_dir / "Package.resolved").write_text(json.dumps({
+            "pins": [{"identity": "swift-nio", "state": {"version": "2.65.0"}}],
+            "version": 2
+        }))
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        nio = next(
+            (p for p in result.packages
+             if p.ecosystem == "SwiftPM" and p.name.lower() == "swift-nio"),
+            None,
+        )
+        assert nio is not None
+        assert nio.version == "2.65.0"
+        assert nio.version_source == "installed"
+
+    def test_swift_without_lockfile_stays_declared(self, temp_dir):
+        """Sans Package.resolved, la version reste declaree, pas installee."""
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "main.swift").write_text('print("Hello")')
+        (project_dir / "Package.swift").write_text("""
+import PackageDescription
+let package = Package(name: "Test", dependencies: [
+    .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.0.0")
+])
+""")
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        alamofire = next(
+            (p for p in result.packages
+             if p.ecosystem == "SwiftPM" and p.name.lower() == "alamofire"),
+            None,
+        )
+        assert alamofire is not None
+        assert alamofire.version == "5.0.0"
+        assert alamofire.installed_version == ""
+        assert alamofire.version_source == "declared"
 
     def test_version_source_declared(self, temp_dir):
         """Should mark packages without lockfile as 'declared'."""

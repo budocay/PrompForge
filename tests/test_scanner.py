@@ -18,6 +18,7 @@ from promptforge.scanner import (
     CICDSetup,
     ProjectStructure,
     scan_directory,
+    normalize_version_constraint,
     DEFAULT_IGNORE_PATTERNS,
 )
 
@@ -169,6 +170,78 @@ class TestLanguageDetection:
         result = scanner.scan(project_dir)
 
         assert result.languages[0].version == "3.12.0"
+
+
+class TestVersionNormalization:
+    """Tests pour normalize_version_constraint (F-005)."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        (">=3.11", "3.11"),
+        (">= 3.11", "3.11"),
+        ("^3.11", "3.11"),
+        ("~=3.10", "3.10"),
+        ("~3.10.2", "3.10.2"),
+        (">=3.10,<3.13", "3.10"),      # on garde la borne basse, seule garantie
+        ("3.12.0", "3.12.0"),
+        ("v18.14.2", "18.14.2"),
+        ("==2.0", "2.0"),
+        ("  1.75  ", "1.75"),
+        ('"3.11"', "3.11"),
+    ])
+    def test_extracts_concrete_version(self, raw, expected):
+        assert normalize_version_constraint(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["stable", "latest", "nightly"])
+    def test_keeps_non_numeric_channels_verbatim(self, raw):
+        """Un canal sans chiffre est une information vraie : on la garde."""
+        assert normalize_version_constraint(raw) == raw
+
+    @pytest.mark.parametrize("raw", ["", "   ", None])
+    def test_returns_none_on_empty(self, raw):
+        assert normalize_version_constraint(raw) is None
+
+    def test_no_constraint_operator_leaks_into_result(self):
+        """Aucun operateur de contrainte ne doit survivre a la normalisation."""
+        for raw in [">=3.11", "^3.11", "~=3.10", ">=3.10,<3.13", "==2.0"]:
+            result = normalize_version_constraint(raw)
+            assert not any(c in result for c in "><=^~,")
+
+
+class TestPythonVersionDetection:
+    """Tests de non-regression sur la lecture de version Python (F-005)."""
+
+    def test_poetry_python_constraint(self, temp_dir):
+        """La cle Poetry `python = "^3.10"` est lue et normalisee."""
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "main.py").write_text("print('hello')")
+        (project_dir / "pyproject.toml").write_text(
+            '[tool.poetry.dependencies]\npython = "^3.10"\n'
+        )
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        assert result.languages[0].version == "3.10"
+
+    def test_requires_python_is_not_captured_by_the_poetry_pattern(self, temp_dir):
+        """`requires-python` ne doit pas etre lu par le motif Poetry `python =`.
+
+        C'etait la cause exacte de l'echec F-005 : le motif Poetry, place en
+        premier dans VERSION_FILES, capturait `requires-python` et rendait la
+        contrainte brute.
+        """
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "main.py").write_text("print('hello')")
+        (project_dir / "pyproject.toml").write_text(
+            '[project]\nrequires-python = ">=3.10,<3.13"\n'
+        )
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        assert result.languages[0].version == "3.10"
 
 
 class TestFrameworkDetection:
@@ -405,6 +478,55 @@ class TestTestDetection:
 
         test_names = [t.framework for t in result.tests]
         assert "Vitest" in test_names
+
+    def test_detect_vitest_from_package_json(self, temp_dir):
+        """Vitest declare dans package.json est detecte par le motif de contenu."""
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "app.ts").write_text("console.log('hello')")
+        (project_dir / "package.json").write_text(
+            '{"devDependencies": {"vitest": "^1.0.0"}}'
+        )
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        test_names = [t.framework for t in result.tests]
+        assert "Vitest" in test_names
+
+    def test_shared_manifest_without_the_tool_is_not_a_detection(self, temp_dir):
+        """Un package.json sans vitest ne doit pas faire detecter Vitest.
+
+        Pendant de test_detect_vitest : assouplir la preuve pour les fichiers de
+        config dedies ne doit pas assouplir celle des manifestes partages.
+        """
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "app.ts").write_text("console.log('hello')")
+        (project_dir / "package.json").write_text(
+            '{"devDependencies": {"typescript": "^5.0.0"}}'
+        )
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        test_names = [t.framework for t in result.tests]
+        assert "Vitest" not in test_names
+        assert "Jest" not in test_names
+        assert "Mocha" not in test_names
+
+    def test_detect_mocha_from_dedicated_config(self, temp_dir):
+        """`.mocharc.json` se suffit a lui-meme, comme vitest.config.ts."""
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "app.js").write_text("console.log('hello')")
+        (project_dir / ".mocharc.json").write_text('{"spec": "test/**/*.spec.js"}')
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        test_names = [t.framework for t in result.tests]
+        assert "Mocha" in test_names
 
 
 class TestDockerDetection:
