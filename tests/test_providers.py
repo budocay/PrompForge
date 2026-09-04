@@ -150,15 +150,34 @@ class TestFormatPromptWithOllama:
     """Tests pour la fonction format_prompt_with_ollama."""
 
     def test_format_with_available_provider(self, mock_ollama_available, sample_config_content):
-        """Test du formatage avec provider disponible."""
+        """Le contenu produit par le modele survit au reformatage, section par section.
+
+        F-006 / D-005 : ce test porte sur le CONTENU du prompt reformate, jamais
+        sur la syntaxe qui l'entoure. Aujourd'hui `format_prompt_with_ollama`
+        reecrit en XML la sortie Markdown du modele (providers.py:498-499), donc
+        le libelle `## Contexte` de la reponse simulee devient `<context>` ;
+        DEC-007 §1 supprime cette reecriture (R-009) et le libelle Markdown
+        reapparaitra. Les fragments verifies ci-dessous sont ceux qui survivent
+        aux deux comportements, un par section de `mock_ollama_response`, ce qui
+        prouve en prime qu'aucune section n'est perdue en chemin. L'assertion sur
+        le format de sortie appartient a R-009, pas a ce test.
+        """
         result = format_prompt_with_ollama(
             raw_prompt="create user route",
             project_context=sample_config_content,
             provider=mock_ollama_available
         )
-        
+
         assert result is not None
-        assert "Contexte" in result
+        # Section "Contexte" de la reponse simulee
+        assert "Projet: Test Project" in result
+        assert "Stack: Python 3.12, FastAPI, PostgreSQL" in result
+        # Section "Demande"
+        assert "Créer une route API pour la gestion des utilisateurs" in result
+        # Section "Spécifications"
+        assert "Endpoint REST: /api/v1/users" in result
+        # Section "Contraintes"
+        assert "Respecter la structure src/api/" in result
 
     def test_format_with_unavailable_provider(self, mock_ollama_unavailable, sample_config_content):
         """Test du formatage avec provider indisponible."""
