@@ -2,19 +2,20 @@
 Test de valeur reelle de PromptForge.
 Evalue objectivement si l'enrichissement ameliore vraiment les prompts.
 
-Execution: python -m tests.test_real_value
+Execution: python scripts/evaluate_prompt_quality.py
+
+Ce fichier est un script de validation Ollama, pas une suite de tests pytest :
+il ne contient aucune fonction collectable. Il vivait sous `tests/` et y
+reassignait `sys.stdout` a l'import, ce qui faisait planter la session pytest
+entiere (D-001).
 """
 
 import json
 import time
 import urllib.request
 import sys
-import io
 from dataclasses import dataclass
 from typing import Optional
-
-# Force UTF-8 output on Windows
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 # ============================================
 # CONFIGURATION
@@ -359,5 +360,12 @@ def print_summary(results: list[TestResult]):
 
 
 if __name__ == "__main__":
+    # Sortie UTF-8 sur Windows. `reconfigure()` modifie le flux en place au
+    # lieu de le remplacer : contrairement a l'ancienne reassignation de
+    # `sys.stdout` faite a l'import, il ne casse aucun flux detenu par un
+    # appelant. Et il ne s'execute qu'ici, jamais a l'import (D-001).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     results = run_tests()
     print_summary(results)
