@@ -7,6 +7,7 @@ import pytest
 from pathlib import Path
 
 from promptforge.core import PromptForge
+from promptforge.security import SecurityContext
 
 
 class TestIntegrationWorkflow:
@@ -31,11 +32,15 @@ class TestIntegrationWorkflow:
         assert status["ollama_available"] == True
         
         # 4. Reformater un prompt
-        success, file_path, formatted = forge.format_prompt(
+        result = forge.format_prompt(
             "crée une route REST pour gérer les utilisateurs"
         )
+        assert len(result) == 4
+        success, file_path, formatted, security_ctx = result
         assert success
         assert formatted is not None
+        # check_security vaut True par defaut : le 4e membre porte l'analyse
+        assert isinstance(security_ctx, SecurityContext)
         
         # 5. Vérifier l'historique
         history = forge.get_history()
@@ -155,9 +160,14 @@ class TestEdgeCases:
         forge.ollama = mock_ollama_available
         
         # Un prompt vide devrait quand même fonctionner
-        success, _, formatted = forge.format_prompt("")
+        success, message, formatted, security_ctx = forge.format_prompt("")
         # Le comportement dépend d'Ollama, mais ne devrait pas crasher
-        assert success == True
+        assert success is True
+        assert formatted is not None
+        # Un prompt vide ne suffit pas a qualifier un contexte dev, mais l'analyse
+        # a bien eu lieu : le 4e membre est un SecurityContext, pas None.
+        assert isinstance(security_ctx, SecurityContext)
+        assert Path(message).exists()
 
     def test_very_long_prompt(self, forge, sample_config_file, mock_ollama_available):
         """Test avec prompt très long."""
@@ -166,9 +176,11 @@ class TestEdgeCases:
         forge.ollama = mock_ollama_available
         
         long_prompt = "test " * 1000
-        success, file_path, _ = forge.format_prompt(long_prompt)
-        
-        assert success == True
+        success, file_path, formatted, security_ctx = forge.format_prompt(long_prompt)
+
+        assert success is True
+        assert formatted is not None
+        assert isinstance(security_ctx, SecurityContext)
         # Le slug du fichier est limité
         assert len(Path(file_path).stem) < 100
 
@@ -179,9 +191,11 @@ class TestEdgeCases:
         forge.ollama = mock_ollama_available
         
         special_prompt = "Create a function: f(x) = x² + 2x + 1 # @$%^&*()"
-        success, file_path, _ = forge.format_prompt(special_prompt)
-        
-        assert success == True
+        success, file_path, formatted, security_ctx = forge.format_prompt(special_prompt)
+
+        assert success is True
+        assert formatted is not None
+        assert isinstance(security_ctx, SecurityContext)
         assert Path(file_path).exists()
 
     def test_unicode_in_prompt(self, forge, sample_config_file, mock_ollama_available):
@@ -191,9 +205,11 @@ class TestEdgeCases:
         forge.ollama = mock_ollama_available
         
         unicode_prompt = "Créer une fonction pour gérer les émojis 🚀 et les caractères japonais 日本語"
-        success, file_path, _ = forge.format_prompt(unicode_prompt)
-        
-        assert success == True
+        success, file_path, formatted, security_ctx = forge.format_prompt(unicode_prompt)
+
+        assert success is True
+        assert formatted is not None
+        assert isinstance(security_ctx, SecurityContext)
         
         # Vérifier que le fichier contient l'Unicode
         content = Path(file_path).read_text(encoding="utf-8")

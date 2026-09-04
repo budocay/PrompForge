@@ -128,13 +128,31 @@ class PromptForge:
 
         Args:
             raw_prompt: Le prompt brut à reformater
-            project_name: Nom du projet (utilise le projet actif si None)
+            project_name: Nom du projet. None = utiliser le projet actif
+                (comportement CLI), "" = explicitement sans projet (interface web),
+                "xxx" = ce projet précis, sans changer le projet actif.
             profile_name: Profil de reformatage (claude_technique, chatgpt_standard, etc.)
             check_security: Si True, analyse et injecte les guidelines de sécurité
             check_cves: Si True, vérifie les CVE via OSV.dev (plus lent)
 
         Returns:
-            Tuple (succès, message/erreur, prompt_reformaté, security_context)
+            Un quadruplet (succès, message, prompt_reformaté, security_context) :
+
+            - succès (bool) : True si le reformatage a abouti.
+            - message (str) : en cas de succès avec projet, le chemin du fichier
+              d'historique écrit ; en cas de succès sans projet, la mention que
+              l'historique n'a pas été sauvegardé ; en cas d'échec, le message
+              d'erreur.
+            - prompt_reformaté (Optional[str]) : le prompt produit, ou None dès que
+              succès vaut False.
+            - security_context (Optional[SecurityContext]) : None quand
+              check_security vaut False, et None quand Ollama est indisponible car
+              la fonction sort avant l'analyse. Sinon un SecurityContext, y compris
+              sur le chemin d'échec du reformatage puisque l'analyse a déjà eu lieu.
+
+            Les deux appelants de production déballent ces quatre valeurs et
+            consomment security_context : cli.py pour l'affichage du contexte dev et
+            des CVE, web/interface.py pour les indicateurs de sécurité de l'UI.
         """
         # Récupération du projet (optionnel)
         # project_name = None -> utiliser le projet actif (CLI)

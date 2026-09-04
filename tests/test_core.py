@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from promptforge.core import PromptForge
+from promptforge.security import SecurityContext
 
 
 class TestPromptForgeInit:
@@ -126,53 +127,119 @@ class TestProjectManagement:
 class TestFormatPrompt:
     """Tests pour le reformatage de prompts."""
 
-    def test_format_no_active_project(self, forge):
-        """Test sans projet actif."""
-        success, message, formatted = forge.format_prompt("test prompt")
-        
-        assert success == False
-        assert "Aucun projet actif" in message
-        assert formatted is None
+    def test_format_no_active_project(self, forge, mock_ollama_available):
+        """Sans projet actif, le reformatage aboutit mais n'ecrit aucun historique.
 
-    def test_format_ollama_unavailable(self, forge, sample_config_file):
-        """Test avec Ollama non disponible."""
+        Le message « Aucun projet actif » qu'attendait la version precedente
+        n'existe plus : le mode « sans projet » est un cas nominal, utilise par
+        l'interface web (`project_name=""`) et par le CLI quand aucun projet
+        n'est active. Le double est injecte explicitement pour que la
+        disponibilite reelle d'Ollama sur la machine ne decide pas du verdict.
+        """
+        forge.ollama = mock_ollama_available
+
+        result = forge.format_prompt("test prompt")
+
+        assert len(result) == 4
+        success, message, formatted, security_ctx = result
+
+        assert success is True
+        assert "sans projet" in message.lower()
+        assert formatted is not None
+        # Aucun historique n'est ecrit hors projet
+        assert forge.get_history() == []
+        # check_security vaut True par defaut : l'analyse a bien eu lieu
+        assert isinstance(security_ctx, SecurityContext)
+
+    def test_format_ollama_unavailable(self, forge, sample_config_file, mock_ollama_unavailable):
+        """Ollama indisponible : quadruplet (False, message, None, None).
+
+        Le quatrieme membre vaut None parce que la fonction sort avant l'analyse
+        de securite, pas parce que celle-ci serait desactivee.
+        """
         forge.init_project("test", sample_config_file)
         forge.use_project("test")
-        
-        # Ollama n'est pas lancé dans les tests
-        success, message, formatted = forge.format_prompt("test prompt")
-        
-        assert success == False
+        forge.ollama = mock_ollama_unavailable
+
+        result = forge.format_prompt("test prompt")
+
+        assert len(result) == 4
+        success, message, formatted, security_ctx = result
+
+        assert success is False
         assert "Ollama" in message
+        assert formatted is None
+        assert security_ctx is None
 
     def test_format_with_mock_ollama(self, forge, sample_config_file, mock_ollama_available):
-        """Test avec Ollama simulé."""
+        """Chemin nominal avec projet : quadruplet complet et historique ecrit."""
         forge.init_project("test", sample_config_file)
         forge.use_project("test")
         forge.ollama = mock_ollama_available
-        
-        success, file_path, formatted = forge.format_prompt("create user route")
-        
-        assert success == True
+
+        result = forge.format_prompt("create user route")
+
+        assert len(result) == 4
+        success, file_path, formatted, security_ctx = result
+
+        assert success is True
         assert formatted is not None
-        assert "Contexte" in formatted
-        
-        # Vérifier que le fichier d'historique existe
+
+        # L'assertion porte sur le contenu utile du prompt reformate, pas sur la
+        # syntaxe des delimiteurs. La sortie simulee est du Markdown que
+        # `providers.py` reecrit aujourd'hui en XML (« ## Contexte » devient
+        # « <context> ») ; DEC-007 prevoit de supprimer cette reecriture. Assertion
+        # volontairement neutre vis-a-vis des deux comportements : le choix du
+        # format est tranche par R-009, pas ici.
+        assert "Stack: Python 3.12, FastAPI, PostgreSQL" in formatted
+        assert "/api/v1/users" in formatted
+
+        # Le fichier d'historique existe et son chemin est bien le 2e membre
         assert Path(file_path).exists()
 
+        # La config projet mentionne Python, FastAPI et PostgreSQL : contexte dev
+        assert isinstance(security_ctx, SecurityContext)
+        assert security_ctx.is_dev is True
+        assert "python" in security_ctx.languages
+
+    def test_format_without_security_check(self, forge, sample_config_file, mock_ollama_available):
+        """check_security=False : le quatrieme membre vaut None, le reste est intact.
+
+        Contre-partie de `test_format_with_mock_ollama`, qui couvre l'etat
+        « SecurityContext present ». Les deux etats du quatrieme membre sont ainsi
+        couverts sur le chemin de succes.
+        """
+        forge.init_project("test", sample_config_file)
+        forge.use_project("test")
+        forge.ollama = mock_ollama_available
+
+        success, file_path, formatted, security_ctx = forge.format_prompt(
+            "create user route", check_security=False
+        )
+
+        assert success is True
+        assert formatted is not None
+        assert Path(file_path).exists()
+        assert security_ctx is None
+
     def test_format_with_specific_project(self, forge, sample_config_file, mock_ollama_available):
-        """Test avec projet spécifique."""
+        """Test avec projet specifique."""
         forge.init_project("proj1", sample_config_file)
         forge.init_project("proj2", sample_config_file)
         forge.use_project("proj1")
         forge.ollama = mock_ollama_available
-        
+
         # Reformater pour proj2 sans changer le projet actif
-        success, _, formatted = forge.format_prompt("test", project_name="proj2")
-        
-        assert success == True
+        success, _, formatted, security_ctx = forge.format_prompt("test", project_name="proj2")
+
+        assert success is True
+        assert formatted is not None
+        assert isinstance(security_ctx, SecurityContext)
         # Le projet actif reste proj1
         assert forge.get_current_project().name == "proj1"
+        # L'historique est bien impute a proj2 et non au projet actif
+        assert len(forge.get_history("proj2")) == 1
+        assert forge.get_history("proj1") == []
 
     def test_format_saves_to_history(self, forge, sample_config_file, mock_ollama_available):
         """Test que le prompt est sauvegardé dans l'historique."""
@@ -196,7 +263,12 @@ class TestHistoryFile:
         forge.use_project("test")
         forge.ollama = mock_ollama_available
         
-        success, file_path, formatted = forge.format_prompt("create api endpoint")
+        success, file_path, formatted, security_ctx = forge.format_prompt(
+            "create api endpoint"
+        )
+
+        assert success is True
+        assert security_ctx is not None
         
         content = Path(file_path).read_text()
         
