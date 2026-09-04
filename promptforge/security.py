@@ -182,11 +182,19 @@ SECRET_PATTERNS = [
     # PAT classique : prefixe `ghp_` puis 36 caracteres (30 de donnees aleatoires
     # base62 + 6 de somme de controle CRC32), soit 40 caracteres au total.
     # PAT a portee fine : `github_pat_` + 22 + `_` + 59.
-    # Source de reference : billet GitHub Engineering « Behind GitHub's new
-    # authentication token formats » (2021-04-05),
-    # https://github.blog/engineering/behind-githubs-new-authentication-token-formats/
-    # NON REVERIFIEE EN LIGNE depuis ce depot : le reseau sortant est restreint a
-    # Ollama et OSV.dev. Longueur a confirmer par `agent-veille` (dette D-044).
+    # Deux sources concordantes, verifiees le 2026-09-04 (D-044 levee) :
+    #   1. GitHub Engineering, « Behind GitHub's new authentication token
+    #      formats »,
+    #      https://github.blog/engineering/behind-githubs-new-authentication-token-formats/
+    #      — 30 caracteres aleatoires base62 suivis de « a 32 bit checksum in
+    #      the last 6 digits », soit exactement 36.
+    #   2. Regles gitleaks, `cmd/generate/config/rules/github.go`, branche
+    #      master : `ghp_[0-9a-zA-Z]{36}` et `github_pat_\w{82}`, ce dernier
+    #      confirmant le bornage a 22 + 1 + 59 = 82 du PAT a portee fine.
+    # Reserve, tiree de la source primaire elle-meme : GitHub y ecrit « we will
+    # increase this entropy even more ». Un motif borne a droite est donc
+    # fragile par construction, du fait de l'emetteur. Si GitHub allonge le
+    # corps, ce motif cessera de detecter les nouveaux jetons sans rien signaler.
     # Sans le lookahead, {36} se comporte comme {36,} : une chaine de 40 caracteres
     # serait remontee comme un jeton GitHub valide, ce qui est un faux positif.
     (
@@ -249,9 +257,10 @@ SECRET_SCAN_EXTENSIONS = [
 # cout d'un faux positif est juge superieur au cout d'un faux negatif sur une
 # valeur qui contient litteralement le mot « example ». `.env.example` figure
 # explicitement dans SECRET_SCAN_FILES, les README et les docs d'editeurs sont
-# remplis d'identifiants d'exemple publies (AKIAIOSFODNN7EXAMPLE et
-# wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY sont ceux de la documentation AWS
-# elle-meme). Les remonter contredirait l'exigence de veracite de CLAUDE.md et
+# remplis d'identifiants d'exemple publies : ceux de la documentation AWS
+# elle-meme, `AKIAIOSFO...EXAMPLE` et `wJalrXUtn...EXAMPLEKEY`, sont tronques
+# ici a dessein, un commentaire n'ayant aucune raison d'en porter la forme
+# complete. Les remonter contredirait l'exigence de veracite de CLAUDE.md et
 # provoquerait de la fatigue d'alerte, qui fait ignorer les vraies alertes.
 #
 # Recherche de sous-chaine, insensible a la casse, sur la valeur capturee.
@@ -584,59 +593,338 @@ def parse_cvss_vector(cvss_string: str) -> str:
         return "LOW"
 
 
-def check_cve_osv(dependencies: list[tuple[str, str, str]]) -> list[CVEInfo]:
-    """Check for known vulnerabilities using OSV.dev API."""
-    if not dependencies:
-        return []
+# -----------------------------------------------------------------------------
+# Ecosystemes acceptes par OSV.dev
+# -----------------------------------------------------------------------------
+# Mesure directe du 2026-09-04 depuis ce depot, une requete `querybatch` par
+# ecosysteme, avec le paquet fictif `foo` en version `1.0.0` :
+#
+#   PyPI, npm, Go, crates.io, Maven, NuGet, Packagist, RubyGems,
+#   ConanCenter, vcpkg, SwiftURL ................................. HTTP 200
+#   SwiftPM, CMake, Conan ........................................ HTTP 400
+#     {"code":3,"message":"error in query at index 0: rpc error:
+#      code = InvalidArgument desc = invalid ecosystem"}
+#
+# `scanner.py` etiquette ses paquets avec les libelles de l'outillage reel
+# (`SwiftPM` est le gestionnaire, `Conan` est le client, `CMake` est le systeme
+# de construction) et ces libelles sont affiches a l'utilisateur. La traduction
+# vers les libelles OSV se fait donc ici, a la frontiere reseau, et nulle part
+# ailleurs : l'affichage reste stable, la requete devient valide.
+OSV_ECOSYSTEM_ALIASES = {
+    "SwiftPM": "SwiftURL",
+    "Conan": "ConanCenter",
+}
 
-    queries = []
-    for ecosystem, package, version in dependencies:
-        queries.append({
-            "package": {"name": package, "ecosystem": ecosystem},
-            "version": version
-        })
+OSV_SUPPORTED_ECOSYSTEMS = frozenset({
+    "PyPI", "npm", "Go", "crates.io", "Maven", "NuGet",
+    "Packagist", "RubyGems", "ConanCenter", "vcpkg", "SwiftURL",
+})
+
+# `CMake` n'a pas d'equivalent OSV et n'en aura pas : ce n'est pas un index de
+# paquets mais un systeme de construction. Les dependances lues dans un
+# `CMakeLists.txt` ne sont donc jamais envoyees. Elles sont comptees comme
+# ignorees, jamais comme saines.
+OSV_UNSUPPORTED_ECOSYSTEMS = frozenset({"CMake"})
+
+# Taille de lot. OSV accepte des lots bien plus gros, mais un lot court reduit
+# le cout de la bissection quand une entree est rejetee, et borne la perte quand
+# une requete expire.
+OSV_BATCH_SIZE = 50
+
+# Une version envoyee a OSV doit etre une version concrete. Mesure du
+# 2026-09-04 sur `PyPI/gradio` : version `4.0.0` -> 80 vulnerabilites ; version
+# vide, champ `version` absent, `detected` ou `>=3.10` -> 86 a 100, c'est-a-dire
+# le catalogue entier du paquet, toutes versions confondues. Envoyer une version
+# non concrete ne produit donc pas une reponse vide mais une avalanche de faux
+# positifs, ce que `CLAUDE.md` interdit explicitement.
+_CONCRETE_VERSION_RE = re.compile(r"^v?\d+(\.\d+)*")
+
+# Prefixe du message rendu a l'utilisateur quand la verification est incomplete.
+# Constante partagee : `scanner.generate_config` s'en sert pour reconnaitre le
+# message dans `ScanResult.errors` et afficher un avertissement explicite plutot
+# qu'une absence d'alerte.
+CVE_CHECK_INCOMPLETE_PREFIX = "Verification CVE incomplete :"
+
+
+@dataclass
+class CVECheckOutcome:
+    """Resultat d'une verification CVE, ou l'echec se distingue de l'absence.
+
+    `check_cve_osv` rendait une liste vide aussi bien pour un projet sain que
+    pour une API injoignable ou un lot rejete. Les deux situations sont
+    indiscernables par l'appelant, donc par l'utilisateur. Cette structure les
+    separe : `cves` vide avec `complete` vrai est un constat, `cves` vide avec
+    `complete` faux est une panne.
+    """
+
+    cves: list[CVEInfo] = field(default_factory=list)
+    checked: list[tuple[str, str, str]] = field(default_factory=list)
+    skipped: list[tuple[str, str, str]] = field(default_factory=list)
+    failed: list[tuple[str, str, str]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """Vrai seulement si tout ce qui devait etre verifie l'a ete."""
+        return not self.failed and not self.errors
+
+    def summary(self) -> str:
+        """Message destine a l'utilisateur, vide quand il n'y a rien a signaler.
+
+        Les paquets ignores sont signales meme quand le reste a reussi : un
+        ecosysteme hors index OSV n'est pas un ecosysteme sans vulnerabilite.
+        """
+        parts = []
+        if self.failed:
+            ecosystems = sorted({eco for eco, _, _ in self.failed})
+            parts.append(
+                f"verification CVE echouee pour {len(self.failed)} paquet(s) "
+                f"({', '.join(ecosystems)})"
+            )
+        if self.skipped:
+            ecosystems = sorted({eco for eco, _, _ in self.skipped})
+            parts.append(
+                f"{len(self.skipped)} paquet(s) non verifiables par OSV.dev "
+                f"({', '.join(ecosystems)})"
+            )
+        if not parts:
+            return ""
+        detail = f" — {self.errors[0]}" if self.errors else ""
+        return f"{CVE_CHECK_INCOMPLETE_PREFIX} " + " ; ".join(parts) + detail
+
+
+def normalize_osv_ecosystem(ecosystem: str) -> str | None:
+    """Traduit un libelle interne vers celui attendu par OSV, ou None.
+
+    Returns:
+        Le libelle OSV, ou None quand l'ecosysteme n'est pas indexe par OSV. Un
+        None n'est pas une absence de vulnerabilite : c'est une absence de
+        verification, et l'appelant doit le remonter comme tel.
+    """
+    canonical = OSV_ECOSYSTEM_ALIASES.get(ecosystem, ecosystem)
+    if canonical in OSV_SUPPORTED_ECOSYSTEMS:
+        return canonical
+    return None
+
+
+def normalize_osv_package_name(ecosystem: str, name: str) -> str:
+    """Met un nom de paquet dans la forme qu'indexe OSV pour cet ecosysteme.
+
+    Seul `SwiftURL` demande un traitement : OSV y indexe les paquets Swift par
+    l'URL de leur depot, sans schema ni suffixe `.git`. Mesure du 2026-09-04 sur
+    swift-nio 2.0.0 : `https://github.com/apple/swift-nio.git` -> 0 resultat,
+    `github.com/apple/swift-nio` -> 5 resultats.
+    """
+    if ecosystem != "SwiftURL":
+        return name
+
+    cleaned = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", name.strip())
+    cleaned = cleaned.rstrip("/")
+    if cleaned.lower().endswith(".git"):
+        cleaned = cleaned[: -len(".git")]
+    return cleaned
+
+
+def _osv_querybatch(chunk: list[tuple[str, str, str]]) -> list[dict]:
+    """Envoie un lot a OSV et rend la liste des resultats. Ne rattrape rien."""
+    queries = [
+        {
+            "package": {"name": normalize_osv_package_name(eco, pkg), "ecosystem": eco},
+            "version": version,
+        }
+        for eco, pkg, version in chunk
+    ]
+    data = json.dumps({"queries": queries}).encode("utf-8")
+    req = urllib.request.Request(
+        OSV_API_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=OSV_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload.get("results", [])
+
+
+def _collect_vulns(
+    chunk: list[tuple[str, str, str]],
+    results: list[dict],
+    outcome: "CVECheckOutcome",
+    seen_osv_ids: set,
+    seen_cve_ids: set,
+) -> None:
+    """Transforme les resultats OSV d'un lot en CVEInfo, sans doublon.
+
+    Deux ensembles distincts, et non un seul : l'identifiant OSV et
+    l'identifiant rendu vivent dans le meme espace de noms et coincident quand
+    la vulnerabilite n'a pas d'alias CVE. Les confondre ferait disparaitre
+    toutes les vulnerabilites sans alias.
+    """
+    for (_, package, _version), result_item in zip(chunk, results):
+        for vuln in result_item.get("vulns", [])[:3]:
+            vuln_id = vuln.get("id", "")
+            if not vuln_id or vuln_id in seen_osv_ids:
+                continue
+            seen_osv_ids.add(vuln_id)
+
+            full_vuln = fetch_vuln_details(vuln_id)
+            if not full_vuln:
+                # Une vulnerabilite trouvee puis perdue faute de details est un
+                # faux negatif : elle doit se voir, pas disparaitre.
+                outcome.errors.append(
+                    f"details indisponibles pour {vuln_id} ({package})"
+                )
+                continue
+            cve = parse_osv_vulnerability(full_vuln, package)
+            if not cve:
+                continue
+            # Deuxieme filtre, sur l'identifiant rendu et non sur celui d'OSV :
+            # une meme CVE est indexee plusieurs fois chez OSV (GHSA-..., puis
+            # PYSEC-...), et `parse_osv_vulnerability` ramene ces entrees a leur
+            # alias CVE commun. Sans ce filtre, la meme CVE est comptee deux
+            # fois et le nombre affiche a l'utilisateur est faux. Mesure du
+            # 2026-09-04 sur `PyPI/pytest 8.3.4` : CVE-2025-71176 rendue deux
+            # fois avec le seul filtre sur l'identifiant OSV.
+            if cve.id in seen_cve_ids:
+                continue
+            seen_cve_ids.add(cve.id)
+            outcome.cves.append(cve)
+
+
+def _osv_query_resilient(
+    chunk: list[tuple[str, str, str]],
+    outcome: "CVECheckOutcome",
+    seen_osv_ids: set,
+    seen_cve_ids: set,
+) -> None:
+    """Interroge OSV pour `chunk` en isolant les entrees que l'API rejette.
+
+    OSV valide le lot entier avant de le traiter : une seule entree invalide
+    fait repondre HTTP 400 et le lot complet est perdu. Mesure du 2026-09-04 :
+    `[PyPI/gradio 4.0.0]` seul -> HTTP 200, 80 vulnerabilites ;
+    `[PyPI/gradio 4.0.0, SwiftPM/swift-nio 2.0.0]` -> HTTP 400, zero resultat.
+    Sur un 400, on bissecte donc le lot jusqu'a isoler la ou les entrees
+    fautives, qui sont les seules comptees en echec.
+
+    Toute autre erreur (reseau, expiration, HTTP 5xx) ne vise aucune entree en
+    particulier : bissecter n'apporterait rien et multiplierait les appels. Le
+    lot entier est marque en echec.
+    """
+    if not chunk:
+        return
 
     try:
-        data = json.dumps({"queries": queries}).encode('utf-8')
-        req = urllib.request.Request(
-            OSV_API_URL,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST"
+        results = _osv_querybatch(chunk)
+    except urllib.error.HTTPError as error:
+        if error.code == 400 and len(chunk) > 1:
+            middle = len(chunk) // 2
+            _osv_query_resilient(chunk[:middle], outcome, seen_osv_ids, seen_cve_ids)
+            _osv_query_resilient(chunk[middle:], outcome, seen_osv_ids, seen_cve_ids)
+            return
+        detail = _read_http_error_body(error)
+        outcome.failed.extend(chunk)
+        outcome.errors.append(
+            f"OSV.dev a repondu HTTP {error.code} sur {len(chunk)} paquet(s){detail}"
+        )
+        logger.warning(
+            "OSV.dev HTTP %s sur %s paquet(s)%s", error.code, len(chunk), detail
+        )
+        return
+    except urllib.error.URLError as error:
+        outcome.failed.extend(chunk)
+        outcome.errors.append(f"OSV.dev injoignable : {error.reason}")
+        logger.warning("OSV.dev injoignable : %s", error.reason)
+        return
+    except (ValueError, OSError) as error:
+        # ValueError couvre json.JSONDecodeError ; OSError couvre les coupures
+        # de socket en cours de lecture, qui ne remontent pas en URLError.
+        outcome.failed.extend(chunk)
+        outcome.errors.append(f"reponse OSV.dev illisible : {error}")
+        logger.warning("Reponse OSV.dev illisible : %s", error)
+        return
+
+    if len(results) != len(chunk):
+        outcome.failed.extend(chunk)
+        outcome.errors.append(
+            f"OSV.dev a rendu {len(results)} resultat(s) pour {len(chunk)} requete(s)"
+        )
+        logger.warning(
+            "OSV.dev a rendu %s resultat(s) pour %s requete(s)", len(results), len(chunk)
+        )
+        return
+
+    outcome.checked.extend(chunk)
+    _collect_vulns(chunk, results, outcome, seen_osv_ids, seen_cve_ids)
+
+
+def _read_http_error_body(error: urllib.error.HTTPError) -> str:
+    """Lit le corps d'une erreur HTTP pour le journaliser, sans jamais lever."""
+    try:
+        body = error.read().decode("utf-8", "replace").strip()
+    except OSError as read_error:
+        return f" (corps illisible : {read_error})"
+    return f" : {body[:200]}" if body else ""
+
+
+def check_cve_osv_detailed(
+    dependencies: list[tuple[str, str, str]]
+) -> CVECheckOutcome:
+    """Verifie des dependances aupres d'OSV.dev en distinguant echec et absence.
+
+    Args:
+        dependencies: triplets `(ecosysteme, nom, version)`, avec les libelles
+            d'ecosysteme du scanner, pas ceux d'OSV.
+
+    Returns:
+        Un CVECheckOutcome. `outcome.complete` dit si la reponse est fiable ;
+        `outcome.skipped` liste ce qu'OSV ne peut pas verifier ;
+        `outcome.failed` liste ce qui aurait du l'etre et ne l'a pas ete.
+    """
+    outcome = CVECheckOutcome()
+    if not dependencies:
+        return outcome
+
+    translated: list[tuple[str, str, str]] = []
+    for ecosystem, package, version in dependencies:
+        osv_ecosystem = normalize_osv_ecosystem(ecosystem)
+        if osv_ecosystem is None:
+            outcome.skipped.append((ecosystem, package, version))
+            continue
+        if not version or not _CONCRETE_VERSION_RE.match(version.strip()):
+            outcome.skipped.append((ecosystem, package, version))
+            continue
+        translated.append((osv_ecosystem, package, version.strip()))
+
+    seen_osv_ids: set = set()
+    seen_cve_ids: set = set()
+    for start in range(0, len(translated), OSV_BATCH_SIZE):
+        _osv_query_resilient(
+            translated[start : start + OSV_BATCH_SIZE],
+            outcome,
+            seen_osv_ids,
+            seen_cve_ids,
         )
 
-        with urllib.request.urlopen(req, timeout=OSV_TIMEOUT) as response:
-            result = json.loads(response.read().decode('utf-8'))
+    logger.info(
+        "OSV.dev: %s paquet(s) verifie(s), %s ignore(s), %s en echec, "
+        "%s vulnerabilite(s) trouvee(s)",
+        len(outcome.checked),
+        len(outcome.skipped),
+        len(outcome.failed),
+        len(outcome.cves),
+    )
+    return outcome
 
-        cves = []
-        seen_ids = set()  # Avoid duplicates
 
-        for i, result_item in enumerate(result.get("results", [])):
-            vulns = result_item.get("vulns", [])
-            if vulns:
-                ecosystem, package, version = dependencies[i]
-                for vuln in vulns[:3]:  # Limit to 3 per package to avoid too many API calls
-                    vuln_id = vuln.get("id", "")
-                    if vuln_id in seen_ids:
-                        continue
-                    seen_ids.add(vuln_id)
+def check_cve_osv(dependencies: list[tuple[str, str, str]]) -> list[CVEInfo]:
+    """Check for known vulnerabilities using OSV.dev API.
 
-                    # Fetch full details for severity
-                    full_vuln = fetch_vuln_details(vuln_id)
-                    if full_vuln:
-                        cve = parse_osv_vulnerability(full_vuln, package)
-                        if cve:
-                            cves.append(cve)
-
-        logger.info(f"OSV.dev: Checked {len(dependencies)} packages, found {len(cves)} vulnerabilities")
-        return cves
-
-    except urllib.error.URLError as e:
-        logger.warning(f"OSV.dev API error: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Error checking CVE: {e}")
-        return []
+    Enveloppe de compatibilite : elle ne rend que les vulnerabilites et perd
+    donc la distinction entre « aucune vulnerabilite » et « verification
+    echouee ». Tout appelant qui montre ce resultat a un utilisateur doit passer
+    par `check_cve_osv_detailed` et remonter `outcome.summary()`.
+    """
+    return check_cve_osv_detailed(dependencies).cves
 
 
 def parse_osv_vulnerability(vuln: dict, package: str) -> Optional[CVEInfo]:

@@ -88,23 +88,52 @@ LANGUAGE_EXTENSIONS = {
     "PowerShell": [".ps1", ".psm1"],
 }
 
+
+def _version_sort_key(version: str) -> tuple[int, ...]:
+    """Ordonne deux versions pointees sur leurs composants numeriques."""
+    return tuple(int(part) for part in version.split(".") if part.isdigit())
+
+
+# Operateurs qui ne designent jamais une borne basse : ils plafonnent (`<`, `<=`)
+# ou excluent (`!=`). La version qu'ils portent n'est pas une version du projet.
+_UPPER_OR_EXCLUDING_OPERATORS = frozenset({"<", "<=", "!="})
+
+# Un couple operateur/version. L'operateur est optionnel : une contrainte peut
+# etre une version nue (`3.12.0`, `v18.14.2`). L'ordre des alternatives compte :
+# `>=` doit etre tente avant `>`, `~=` avant `~`, sinon l'operateur long est
+# tronque et sa moitie restante est lue comme un separateur.
+_CONSTRAINT_CLAUSE_RE = re.compile(r"(>=|<=|!=|==|~=|\^|>|<|~|=)?\s*v?(\d+(?:\.\d+)*)")
+
+
 def normalize_version_constraint(raw: str | None) -> str | None:
-    """Extract a concrete version from a raw version constraint.
+    """Extract the lower bound of a raw version constraint.
 
     Version files hold constraints, not versions: `>=3.11`, `^3.11`, `~=3.10`,
     `>=3.10,<3.13`, `v18.14.2`. Reporting the constraint verbatim is what makes a
     scanned project claim to run "version >=3.11", and what would feed a
     constraint string to a CVE lookup.
 
-    The lower bound is retained, because it is the only version the constraint
-    actually guarantees is acceptable.
+    What is returned is the **lower bound**, and only it. Every clause is read
+    with its operator: `<` and `<=` only cap, `!=` only excludes, so none of them
+    ever names a version the project runs on, and all three are dropped. When
+    several clauses raise the floor, the highest floor wins. When no clause
+    states a floor at all (`<4`, `!=3.9`), the result is None: turning a cap or
+    an exclusion into a reported version is exactly the false positive this
+    project forbids.
+
+    Known approximation, deliberate and pinned by a test: `>3.10` is a strict
+    lower bound, so 3.10 itself is excluded, yet 3.10 is returned. It is the
+    closest floor the constraint states, and naming the next released version
+    would require an index of releases that this scanner does not have and must
+    not fetch.
 
     Args:
         raw: The raw captured string, possibly a constraint expression.
 
     Returns:
-        The first concrete dotted version found, or the stripped input when it
-        holds no version at all (`stable`, `latest`), or None when empty.
+        The lowest version the constraint accepts, or the stripped input when it
+        holds no number at all (`stable`, `latest`), or None when the input is
+        empty or states no lower bound at all.
     """
     if raw is None:
         return None
@@ -113,13 +142,21 @@ def normalize_version_constraint(raw: str | None) -> str | None:
     if not cleaned:
         return None
 
-    match = re.search(r"\d+(?:\.\d+)*", cleaned)
-    if match:
-        return match.group(0)
+    clauses = _CONSTRAINT_CLAUSE_RE.findall(cleaned)
+    if not clauses:
+        # Pas de chiffre du tout : `stable`, `latest`, `nightly`. On rend la
+        # valeur telle quelle plutot que None, c'est une information vraie.
+        return cleaned
 
-    # Pas de chiffre du tout : `stable`, `latest`, `nightly`. On rend la valeur
-    # telle quelle plutot que None, c'est une information vraie.
-    return cleaned
+    lower_bounds = [
+        version
+        for operator, version in clauses
+        if operator not in _UPPER_OR_EXCLUDING_OPERATORS
+    ]
+    if not lower_bounds:
+        return None
+
+    return max(lower_bounds, key=_version_sort_key)
 
 
 # Fichiers porteurs d'une version de langage, par langage.
@@ -2301,20 +2338,32 @@ class ProjectScanner:
         return packages[:100]  # Increased limit for multi-language projects
 
     def check_security(self, result: ScanResult) -> list[SecurityAlert]:
-        """Check detected packages for known vulnerabilities via OSV.dev."""
+        """Check detected packages for known vulnerabilities via OSV.dev.
+
+        Effet de bord assume : quand la verification est incomplete, un message
+        est ajoute a `result.errors`. C'est le seul canal deja rendu a
+        l'utilisateur (`generate_config` ecrit une section « Erreurs de scan »)
+        et il ne demande aucun changement de contrat. Sans lui, une API
+        injoignable et un projet sain rendent tous deux une liste vide.
+        """
         if not result.packages:
             return []
 
-        from .security import check_cve_osv
+        from .security import check_cve_osv_detailed
 
         dependencies = [
             (pkg.ecosystem, pkg.name, pkg.version)
             for pkg in result.packages
         ]
 
-        cves = check_cve_osv(dependencies)
+        outcome = check_cve_osv_detailed(dependencies)
+
+        message = outcome.summary()
+        if message and message not in result.errors:
+            result.errors.append(message)
+
         alerts = []
-        for cve in cves:
+        for cve in outcome.cves:
             alerts.append(SecurityAlert(
                 cve_id=cve.id,
                 package=cve.package,
@@ -2768,6 +2817,29 @@ class ProjectScanner:
             lines.append("| A08 | Integrity Failures | CI/CD, désérialisation |")
             lines.append("| A09 | Logging Failures | Monitoring, alerting |")
             lines.append("| A10 | SSRF | Requêtes serveur-side |")
+            lines.append("")
+
+        # Verification CVE incomplete : elle doit se voir, sinon l'absence de
+        # section « Alertes de Securite » se lit comme « aucune vulnerabilite »
+        # alors qu'elle veut dire « on ne sait pas ».
+        from .security import CVE_CHECK_INCOMPLETE_PREFIX
+
+        cve_check_warnings = [
+            error for error in result.errors
+            if error.startswith(CVE_CHECK_INCOMPLETE_PREFIX)
+        ]
+        if cve_check_warnings:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Verification des Vulnerabilites : INCOMPLETE")
+            lines.append("")
+            lines.append(
+                "L'absence d'alerte ci-dessous ne signifie PAS que le projet est sain : "
+                "une partie des dependances n'a pas pu etre verifiee."
+            )
+            lines.append("")
+            for warning in cve_check_warnings:
+                lines.append(f"- {warning}")
             lines.append("")
 
         # Security Alerts (if any)

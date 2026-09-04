@@ -5,15 +5,26 @@ Tests for Scanner Multi-Ecosystem Support
 Tests for C/C++ (Conan, vcpkg, CMake), Swift, and enhanced lockfile parsing.
 """
 
-import pytest
 import json
+import re
+import urllib.error
+import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
+
+from promptforge import scanner as scanner_module
 from promptforge.scanner import (
     ProjectScanner,
     ScanResult,
     DetectedPackage,
     SecurityAlert,
+)
+from promptforge.security import (
+    CVE_CHECK_INCOMPLETE_PREFIX,
+    OSV_UNSUPPORTED_ECOSYSTEMS,
+    normalize_osv_ecosystem,
 )
 
 
@@ -621,6 +632,124 @@ class TestCVEReportingEnhanced:
             # At least should mention the fix version
             assert "2.3.0" in config or "Mettre" in config
 
+
+
+# =============================================================================
+# PARITE ENTRE LES ECOSYSTEMES EMIS PAR LE SCANNER ET CEUX QU'ACCEPTE OSV
+# =============================================================================
+
+def _ecosystems_emitted_by_scanner() -> set:
+    """Libelles passes a `DetectedPackage(ecosystem=...)` dans le scanner.
+
+    Lecture du source plutot qu'enumeration a la main : une chaine ajoutee
+    demain sans traduction OSV fait echouer le test de parite ci-dessous, au
+    lieu de produire un HTTP 400 silencieux en production.
+    """
+    source = Path(scanner_module.__file__).read_text(encoding="utf-8")
+    return set(re.findall(r'ecosystem=["\']([^"\']+)["\']', source))
+
+
+class TestScannerOsvEcosystemParity:
+    """Aucun libelle emis par le scanner ne doit faire tomber une requete OSV."""
+
+    def test_every_emitted_ecosystem_is_translated_or_declared_unsupported(self):
+        emitted = _ecosystems_emitted_by_scanner()
+        assert emitted, "la lecture du source n'a trouve aucun ecosysteme"
+
+        unclassified = {
+            eco for eco in emitted
+            if normalize_osv_ecosystem(eco) is None
+            and eco not in OSV_UNSUPPORTED_ECOSYSTEMS
+        }
+        assert unclassified == set(), (
+            "ces libelles partiraient tels quels vers OSV et le feraient repondre "
+            f"HTTP 400 : {sorted(unclassified)}"
+        )
+
+    def test_the_three_measured_rejects_are_handled(self):
+        """SwiftPM, Conan et CMake : les trois cas mesures le 2026-09-04."""
+        assert normalize_osv_ecosystem("SwiftPM") == "SwiftURL"
+        assert normalize_osv_ecosystem("Conan") == "ConanCenter"
+        assert normalize_osv_ecosystem("CMake") is None
+
+    def test_scanner_still_labels_swift_and_conan_with_the_tooling_names(self):
+        """La traduction est a la frontiere reseau, pas dans l'affichage."""
+        emitted = _ecosystems_emitted_by_scanner()
+        assert "SwiftPM" in emitted
+        assert "Conan" in emitted
+
+
+class TestCveCheckFailureReachesTheUser:
+    """Une verification incomplete doit apparaitre, pas se taire."""
+
+    def _result_with_packages(self):
+        return ScanResult(
+            packages=[
+                DetectedPackage(
+                    ecosystem="PyPI", name="gradio", version="4.0.0",
+                    source_file="requirements.txt",
+                ),
+            ]
+        )
+
+    def test_unreachable_api_is_written_into_scan_errors(self):
+        scanner = ProjectScanner()
+        result = self._result_with_packages()
+
+        def _boom(request, timeout=None):
+            raise urllib.error.URLError("connexion refusee")
+
+        with patch.object(urllib.request, "urlopen", _boom):
+            alerts = scanner.check_security(result)
+
+        assert alerts == []
+        assert any(
+            error.startswith(CVE_CHECK_INCOMPLETE_PREFIX) for error in result.errors
+        )
+
+    def test_healthy_check_adds_no_error(self):
+        """Un projet sain ne doit pas ressembler a une panne."""
+        scanner = ProjectScanner()
+        result = self._result_with_packages()
+
+        class _Response:
+            def read(self):
+                return b'{"results": [{}]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        with patch.object(urllib.request, "urlopen", lambda req, timeout=None: _Response()):
+            alerts = scanner.check_security(result)
+
+        assert alerts == []
+        assert result.errors == []
+
+    def test_generated_config_says_the_check_was_incomplete(self):
+        """Sans cette section, l'absence d'alerte se lit comme « projet sain »."""
+        scanner = ProjectScanner()
+        result = self._result_with_packages()
+
+        def _boom(request, timeout=None):
+            raise urllib.error.URLError("connexion refusee")
+
+        with patch.object(urllib.request, "urlopen", _boom):
+            result.security_alerts = scanner.check_security(result)
+
+        config = scanner.generate_config(result, "projet-test")
+
+        assert "INCOMPLETE" in config
+        assert "ne signifie PAS que le projet est sain" in config
+
+    def test_generated_config_stays_silent_when_the_check_succeeded(self):
+        scanner = ProjectScanner()
+        result = self._result_with_packages()
+        config = scanner.generate_config(result, "projet-test")
+
+        assert "INCOMPLETE" not in config
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

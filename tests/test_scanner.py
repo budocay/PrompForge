@@ -209,6 +209,64 @@ class TestVersionNormalization:
             result = normalize_version_constraint(raw)
             assert not any(c in result for c in "><=^~,")
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "<4",       # rendait "4", une borne HAUTE
+            "<=3.12",   # meme famille
+            "!=3.9",    # rendait "3.9", une version EXCLUE
+        ],
+    )
+    def test_returns_none_when_no_clause_states_a_lower_bound(self, raw):
+        """Contre-exemples mesures par le SECURITY GATE, corriges.
+
+        L'implementation precedente prenait le premier nombre rencontre et
+        rendait donc une borne haute ou une version explicitement exclue. Aucune
+        des deux n'est une version du projet ; None est la seule reponse vraie.
+        """
+        assert normalize_version_constraint(raw) is None
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("<3.13,>=3.10", "3.10"),   # rendait "3.13", la borne HAUTE
+            ("!=3.9,>=3.11", "3.11"),   # rendait "3.9", la version EXCLUE
+            (">=3.10,<3.13", "3.10"),   # deja correct, verrouille dans l'autre ordre
+            ("!=3.9,!=3.10,>=3.8", "3.8"),
+        ],
+    )
+    def test_reads_the_operator_not_the_position(self, raw, expected):
+        """L'ordre d'ecriture des clauses ne doit plus changer le resultat."""
+        assert normalize_version_constraint(raw) == expected
+
+    def test_clause_order_is_irrelevant(self):
+        """Meme contrainte, deux ecritures : meme reponse."""
+        assert (
+            normalize_version_constraint(">=3.10,<3.13")
+            == normalize_version_constraint("<3.13,>=3.10")
+        )
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (">=3.10,>=3.11", "3.11"),
+            (">=3.9,>=3.11,>=3.10", "3.11"),
+            (">=3.9,>=3.10.2", "3.10.2"),
+        ],
+    )
+    def test_highest_floor_wins(self, raw, expected):
+        """Plusieurs planchers : le plus haut est le seul qui contraigne."""
+        assert normalize_version_constraint(raw) == expected
+
+    def test_strict_lower_bound_is_an_accepted_approximation(self):
+        """`>3.10` exclut 3.10, et 3.10 est pourtant rendu.
+
+        Approximation assumee et documentee dans la docstring : nommer la
+        version suivante demanderait un index des versions publiees, que le
+        scanner n'a pas et ne doit pas aller chercher.
+        """
+        assert normalize_version_constraint(">3.10") == "3.10"
+
 
 class TestPythonVersionDetection:
     """Tests de non-regression sur la lecture de version Python (F-005)."""

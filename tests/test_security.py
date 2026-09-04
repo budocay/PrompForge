@@ -6,16 +6,30 @@ Tests dev context detection, CVE checking via OSV.dev, and security guidelines.
 Includes tests with REAL vulnerable packages to verify CVE detection works.
 """
 
+import io
+import json as _json
+import urllib.error
+import urllib.request
+from unittest.mock import patch
+
 import pytest
+
 from promptforge.security import (
     detect_dev_context,
     detect_dependencies_from_text,
     check_cve_osv,
+    check_cve_osv_detailed,
     check_package_cve,
     get_security_guidelines,
     enrich_prompt_with_security,
     format_cve_alert,
+    normalize_osv_ecosystem,
+    normalize_osv_package_name,
+    CVECheckOutcome,
     CVEInfo,
+    CVE_CHECK_INCOMPLETE_PREFIX,
+    OSV_SUPPORTED_ECOSYSTEMS,
+    OSV_UNSUPPORTED_ECOSYSTEMS,
     SecurityContext,
 )
 
@@ -446,19 +460,36 @@ import tempfile
 
 
 # Identifiants synthetiques, invalides, generes pour ces tests uniquement.
+#
 # Ils sont assembles par concatenation a dessein : le fichier source ne contient
-# donc aucun litteral qui declencherait un scanner de secrets sur ce depot
-# (gitleaks, prevu par F-008), tout en donnant au scanner teste une valeur de
-# longueur et de forme exactes.
-FAKE_AWS_ACCESS_KEY_ID = "AKIA" + "3F7KQ2N9WBXDLZ4T"  # 4 + 16 = 20
-FAKE_AWS_SECRET_KEY = "kR9dTn2QvL7mXe4Wz" + "B1sYcJ0pHgAfU6iN3oD8rTq"  # 40
-FAKE_GITHUB_TOKEN = "ghp_" + "Kq7Zx2Vb9NmTr4Lp1Wc6Ys3Hd8Jf0Gu5Ae2B"  # 4 + 36 = 40
+# aucun litteral qui declencherait un scanner de secrets sur ce depot (gitleaks,
+# prevu par F-008), tout en donnant au scanner teste une valeur de longueur et
+# de forme exactes.
+#
+# Le decoupage retenu est de huit caracteres par fragment, et non une simple
+# coupure du prefixe. Motif mesure : la regle `generic-api-key` de gitleaks ne
+# regarde pas le prefixe mais le voisinage d'un nom de variable porteur de
+# `key`, `secret` ou `token` et d'une valeur d'au moins dix caracteres a forte
+# entropie. Or ces cinq noms de variables portent tous l'un de ces mots. Un
+# fragment de dix-sept caracteres (l'ancien decoupage de FAKE_AWS_SECRET_KEY) ou
+# de trente (l'ancien decoupage de la cle d'exemple AWS) suffit donc a
+# declencher la regle, prefixe coupe ou non. Sous dix caracteres, aucun fragment
+# ne peut la satisfaire, quelle que soit son entropie.
+FAKE_AWS_ACCESS_KEY_ID = "AKIA" + "3F7KQ2N" + "9WBXDLZ4T"  # 4 + 16 = 20
+FAKE_AWS_SECRET_KEY = (
+    "kR9dTn2Q" + "vL7mXe4W" + "zB1sYcJ0" + "pHgAfU6i" + "N3oD8rTq"
+)  # 5 x 8 = 40
+FAKE_GITHUB_TOKEN = (
+    "ghp_" + "Kq7Zx2Vb" + "9NmTr4Lp" + "1Wc6Ys3H" + "d8Jf0Gu5" + "Ae2B"
+)  # 4 + 36 = 40
 
 # Identifiants d'exemple publies par la documentation AWS. Ils ne doivent JAMAIS
 # etre remontes comme des secrets : ils sont copies dans d'innombrables README,
-# `.env.example` et tutoriels.
-AWS_DOC_EXAMPLE_ACCESS_KEY_ID = "AKIAIOSFODNN7" + "EXAMPLE"
-AWS_DOC_EXAMPLE_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCY" + "EXAMPLEKEY"
+# `.env.example` et tutoriels. Meme decoupage a huit caracteres, meme motif.
+AWS_DOC_EXAMPLE_ACCESS_KEY_ID = "AKIAIOSF" + "ODNN7" + "EXAMPLE"
+AWS_DOC_EXAMPLE_SECRET_KEY = (
+    "wJalrXUt" + "nFEMI/K7" + "MDENG/bP" + "xRfiCY" + "EXAMPLE" + "KEY"
+)
 
 
 class TestSecretMasking:
@@ -472,7 +503,7 @@ class TestSecretMasking:
 
     def test_mask_long_secret(self):
         """Should show first and last chars of long secrets."""
-        masked = mask_secret("sk-1234567890abcdefghij")
+        masked = mask_secret("sk-12345" + "67890abc" + "defghij")
         assert masked.startswith("sk-1")
         assert masked.endswith("ghij")
         assert "****" in masked
@@ -540,7 +571,10 @@ class TestSecretFileScanning:
     def test_aws_access_key_id_longer_than_20_chars_not_flagged(self):
         """Should not report an AKIA-prefixed blob that is not 20 chars long."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
-            f.write("AWS_ACCESS_KEY_ID=" + "AKIA" + "3F7KQ2N9WBXDLZ4TQRST" + "\n")
+            f.write(
+                "AWS_ACCESS_KEY_ID="
+                + "AKIA" + "3F7KQ2N" + "9WBXDLZ" + "4TQRST" + "\n"
+            )
             f.flush()
             path = Path(f.name)
 
@@ -607,8 +641,9 @@ class TestSecretFileScanning:
     def test_skip_comments(self):
         """Should skip commented lines."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
-            f.write("# API_KEY=sk-1234567890abcdefghijklmnopqrstuvwxyz\n")
-            f.write("// ANOTHER_KEY=secret123456789012345\n")
+            f.write("# API_KEY=sk-12345" + "67890abc" + "defghijk"
+                    + "lmnopqrs" + "tuvwxyz\n")
+            f.write("// ANOTHER_KEY=secret1" + "23456789" + "012345\n")
             f.flush()
             path = Path(f.name)
 
@@ -688,7 +723,9 @@ class TestSecretDirectoryScanning:
             (project / '.env').write_text("API_KEY=sk-1234567890abcdef\n")
 
             # Create config.py
-            (project / 'config.py').write_text('SECRET = "my_secret_value_123456789"\n')
+            (project / 'config.py').write_text(
+                'SECRET = "' + 'my_secre' + 't_value' + '_1234567' + '89"\n'
+            )
 
             findings = scan_directory_for_secrets(project)
             assert len(findings) >= 1
@@ -701,7 +738,9 @@ class TestSecretDirectoryScanning:
             # Create node_modules with secrets (should be skipped)
             nm = project / 'node_modules' / 'some_pkg'
             nm.mkdir(parents=True)
-            (nm / 'config.js').write_text('const KEY = "sk-1234567890abcdef";\n')
+            (nm / 'config.js').write_text(
+                'const KEY = "' + 'sk-12345' + '67890abc' + 'def";\n'
+            )
 
             # Create real file with secret
             (project / '.env').write_text("API_KEY=sk-realkey1234567890\n")
@@ -817,7 +856,7 @@ class TestSecretPatterns:
         """Should detect Stripe live keys as critical."""
         # Use fake key that looks real but won't trigger GitHub scanner
         # Pattern: sk_live_ + 24 alphanumeric (avoid xxx which is filtered as placeholder)
-        fake_stripe_key = "sk_live_" + "0a1b2c3d4e5f6g7h8i9j0k1l"
+        fake_stripe_key = "sk_live_" + "0a1b2c3d" + "4e5f6g7h" + "8i9j0k1l"
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
             f.write(f'STRIPE_SECRET_KEY = "{fake_stripe_key}"\n')
             f.flush()
@@ -861,6 +900,389 @@ class TestSecretPatterns:
         finally:
             path.unlink()
 
+
+
+# =============================================================================
+# OSV.DEV : ECOSYSTEMES, RESILIENCE DES LOTS, ECHEC DISTINCT DE L'ABSENCE
+# =============================================================================
+
+# Chaines d'ecosysteme mesurees le 2026-09-04 par requete reelle sur
+# `POST https://api.osv.dev/v1/querybatch`, paquet fictif `foo` version `1.0.0`.
+# Ce sont des faits, pas une intention : ils verrouillent la table du module.
+OSV_ECOSYSTEMS_MEASURED_200 = {
+    "PyPI", "npm", "Go", "crates.io", "Maven", "NuGet",
+    "Packagist", "RubyGems", "ConanCenter", "vcpkg", "SwiftURL",
+}
+OSV_ECOSYSTEMS_MEASURED_400 = {"SwiftPM", "CMake", "Conan"}
+
+
+class _FakeResponse:
+    """Reponse HTTP minimale, suffisante pour `urlopen` en context manager."""
+
+    def __init__(self, payload):
+        self._body = _json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _http_400(url):
+    """Reproduit le rejet reel d'OSV sur un lot contenant une entree invalide."""
+    body = io.BytesIO(
+        b'{"code":3,"message":"error in query at index 1: rpc error: '
+        b'code = InvalidArgument desc = invalid ecosystem"}'
+    )
+    return urllib.error.HTTPError(url, 400, "Bad Request", {}, body)
+
+
+def _fake_osv(poison_names=(), vulnerable_names=(), calls=None, raise_exc=None):
+    """Fabrique un `urlopen` de substitution pour l'API OSV.
+
+    `poison_names` reproduit le comportement mesure de l'API : le lot ENTIER est
+    rejete des qu'une seule de ses entrees est invalide.
+    """
+    def _urlopen(request, timeout=None):
+        payload = _json.loads(request.data.decode("utf-8"))
+        queries = payload["queries"]
+        if calls is not None:
+            calls.append(queries)
+        if raise_exc is not None:
+            raise raise_exc
+        if any(q["package"]["name"] in poison_names for q in queries):
+            raise _http_400(request.full_url)
+        results = []
+        for query in queries:
+            name = query["package"]["name"]
+            if name in vulnerable_names:
+                results.append({"vulns": [{"id": f"GHSA-fake-{name}"}]})
+            else:
+                results.append({})
+        return _FakeResponse({"results": results})
+
+    return _urlopen
+
+
+def _fake_details(vuln_id):
+    """Detail OSV minimal, parsable par `parse_osv_vulnerability`."""
+    package = vuln_id.replace("GHSA-fake-", "")
+    return {
+        "id": vuln_id,
+        "aliases": [],
+        "summary": f"vuln de test sur {package}",
+        "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/C:H/I:H/A:H"}],
+        "affected": [{"package": {"name": package}, "versions": ["1.0.0"]}],
+        "references": [],
+    }
+
+
+class TestOsvEcosystemStrings:
+    """Verrouille les chaines d'ecosysteme sur la mesure du 2026-09-04."""
+
+    def test_supported_set_matches_what_osv_accepted(self):
+        """La table du module ne contient que des chaines mesurees en HTTP 200."""
+        assert set(OSV_SUPPORTED_ECOSYSTEMS) == OSV_ECOSYSTEMS_MEASURED_200
+
+    @pytest.mark.parametrize("rejected", sorted(OSV_ECOSYSTEMS_MEASURED_400))
+    def test_rejected_strings_are_never_sent_as_is(self, rejected):
+        """Aucune des trois chaines rejetees ne doit rester telle quelle."""
+        assert rejected not in OSV_SUPPORTED_ECOSYSTEMS
+
+    def test_swiftpm_is_translated_to_swifturl(self):
+        assert normalize_osv_ecosystem("SwiftPM") == "SwiftURL"
+
+    def test_conan_is_translated_to_conancenter(self):
+        assert normalize_osv_ecosystem("Conan") == "ConanCenter"
+
+    def test_cmake_has_no_osv_ecosystem(self):
+        """CMake est un systeme de construction, pas un index de paquets."""
+        assert normalize_osv_ecosystem("CMake") is None
+        assert "CMake" in OSV_UNSUPPORTED_ECOSYSTEMS
+
+    def test_unknown_ecosystem_is_refused_not_guessed(self):
+        assert normalize_osv_ecosystem("Bazel") is None
+
+    @pytest.mark.parametrize("supported", sorted(OSV_ECOSYSTEMS_MEASURED_200))
+    def test_supported_ecosystems_pass_through_unchanged(self, supported):
+        assert normalize_osv_ecosystem(supported) == supported
+
+
+class TestOsvPackageNameNormalization:
+    """SwiftURL indexe par URL de depot : le nom doit prendre cette forme."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "https://github.com/apple/swift-nio.git",
+            "https://github.com/apple/swift-nio",
+            "github.com/apple/swift-nio.git",
+            "github.com/apple/swift-nio/",
+        ],
+    )
+    def test_swifturl_names_are_reduced_to_the_indexed_form(self, raw):
+        assert normalize_osv_package_name("SwiftURL", raw) == "github.com/apple/swift-nio"
+
+    @pytest.mark.parametrize("ecosystem", ["PyPI", "npm", "Go", "ConanCenter"])
+    def test_other_ecosystems_are_left_untouched(self, ecosystem):
+        """Ne rien normaliser ailleurs : `requests.git` n'existe pas sur PyPI."""
+        assert normalize_osv_package_name(ecosystem, "some.git") == "some.git"
+
+
+class TestOsvBatchResilience:
+    """Un paquet rejete ne doit plus annuler la verification des autres."""
+
+    def test_mixed_batch_keeps_the_valid_packages(self):
+        """Lot mixte valide/invalide : les valides sont verifies quand meme.
+
+        Reproduit la mesure du 2026-09-04 : `[PyPI/gradio]` seul rend HTTP 200
+        avec des vulnerabilites, `[PyPI/gradio, SwiftPM/...]` rend HTTP 400 et
+        perd tout. La bissection isole l'entree fautive.
+        """
+        calls = []
+        dependencies = [
+            ("PyPI", "gradio", "4.0.0"),
+            ("npm", "poison-pkg", "1.0.0"),
+            ("npm", "express", "4.17.1"),
+        ]
+        with patch.object(
+            urllib.request, "urlopen",
+            _fake_osv(poison_names={"poison-pkg"}, vulnerable_names={"gradio", "express"}, calls=calls),
+        ), patch("promptforge.security.fetch_vuln_details", _fake_details):
+            outcome = check_cve_osv_detailed(dependencies)
+
+        assert {cve.package for cve in outcome.cves} == {"gradio", "express"}
+        assert outcome.failed == [("npm", "poison-pkg", "1.0.0")]
+        assert ("PyPI", "gradio", "4.0.0") in outcome.checked
+        assert outcome.complete is False
+        assert len(calls) > 1, "sans bissection, le lot entier aurait ete perdu"
+
+    def test_a_single_bad_package_does_not_hide_the_others_cves(self):
+        """Contre-mesure directe de l'empoisonnement : la vulnerabilite sort."""
+        dependencies = [
+            ("PyPI", "gradio", "4.0.0"),
+            ("SwiftPM", "swift-nio", "2.0.0"),
+        ]
+        with patch.object(
+            urllib.request, "urlopen",
+            _fake_osv(poison_names={"swift-nio"}, vulnerable_names={"gradio"}),
+        ), patch("promptforge.security.fetch_vuln_details", _fake_details):
+            outcome = check_cve_osv_detailed(dependencies)
+
+        assert len(outcome.cves) == 1
+        assert outcome.cves[0].package == "gradio"
+
+    def test_unsupported_ecosystem_is_never_put_on_the_wire(self):
+        """CMake ne part pas : il ne peut donc plus faire tomber le lot."""
+        calls = []
+        dependencies = [
+            ("PyPI", "gradio", "4.0.0"),
+            ("CMake", "OpenSSL", "1.1.1"),
+        ]
+        with patch.object(
+            urllib.request, "urlopen", _fake_osv(vulnerable_names=set(), calls=calls)
+        ):
+            outcome = check_cve_osv_detailed(dependencies)
+
+        sent = [q["package"]["ecosystem"] for call in calls for q in call]
+        assert sent == ["PyPI"]
+        assert outcome.skipped == [("CMake", "OpenSSL", "1.1.1")]
+
+    def test_non_concrete_versions_are_skipped_not_sent(self):
+        """Une version non concrete ferait remonter TOUT le catalogue du paquet.
+
+        Mesure du 2026-09-04 sur `PyPI/gradio` : `4.0.0` -> 80 vulnerabilites,
+        version vide / `detected` / `>=3.10` -> 86 a 100, soit toutes versions
+        confondues. Les envoyer produirait une avalanche de faux positifs.
+        """
+        calls = []
+        dependencies = [
+            ("PyPI", "gradio", "4.0.0"),
+            ("PyPI", "colorama", ""),
+            ("CMake", "OpenSSL", "detected"),
+            ("PyPI", "django", ">=3.10"),
+        ]
+        with patch.object(
+            urllib.request, "urlopen", _fake_osv(vulnerable_names=set(), calls=calls)
+        ):
+            outcome = check_cve_osv_detailed(dependencies)
+
+        sent = [q["package"]["name"] for call in calls for q in call]
+        assert sent == ["gradio"]
+        assert len(outcome.skipped) == 3
+
+
+class TestOsvFailureIsDistinctFromAbsence:
+    """`cves == []` doit cesser d'etre ambigu."""
+
+    def test_healthy_scan_is_complete_and_silent(self):
+        dependencies = [("PyPI", "gradio", "4.0.0"), ("npm", "express", "4.17.1")]
+        with patch.object(urllib.request, "urlopen", _fake_osv(vulnerable_names=set())):
+            outcome = check_cve_osv_detailed(dependencies)
+
+        assert outcome.cves == []
+        assert outcome.complete is True
+        assert outcome.summary() == ""
+        assert len(outcome.checked) == 2
+
+    def test_unreachable_api_is_reported_not_swallowed(self):
+        dependencies = [("PyPI", "gradio", "4.0.0")]
+        with patch.object(
+            urllib.request, "urlopen",
+            _fake_osv(raise_exc=urllib.error.URLError("connexion refusee")),
+        ):
+            outcome = check_cve_osv_detailed(dependencies)
+
+        assert outcome.cves == []
+        assert outcome.complete is False
+        assert outcome.failed == dependencies
+        assert outcome.summary().startswith(CVE_CHECK_INCOMPLETE_PREFIX)
+
+    def test_the_two_empty_results_do_not_look_alike(self):
+        """Le point du gate : sain et en panne rendaient le meme `[]`."""
+        with patch.object(urllib.request, "urlopen", _fake_osv(vulnerable_names=set())):
+            healthy = check_cve_osv_detailed([("PyPI", "gradio", "4.0.0")])
+        with patch.object(
+            urllib.request, "urlopen", _fake_osv(raise_exc=urllib.error.URLError("boom"))
+        ):
+            broken = check_cve_osv_detailed([("PyPI", "gradio", "4.0.0")])
+
+        assert healthy.cves == broken.cves == []
+        assert healthy.complete != broken.complete
+        assert healthy.summary() == "" and broken.summary() != ""
+
+    def test_http_500_is_not_bisected_but_reported(self):
+        """Une panne serveur ne vise aucune entree : inutile de bissecter."""
+        calls = []
+
+        def _urlopen(request, timeout=None):
+            calls.append(request)
+            raise urllib.error.HTTPError(
+                request.full_url, 500, "Server Error", {}, io.BytesIO(b"boom")
+            )
+
+        with patch.object(urllib.request, "urlopen", _urlopen):
+            outcome = check_cve_osv_detailed(
+                [("PyPI", "gradio", "4.0.0"), ("npm", "express", "4.17.1")]
+            )
+
+        assert len(calls) == 1
+        assert len(outcome.failed) == 2
+        assert outcome.complete is False
+
+    def test_truncated_response_is_a_failure_not_a_clean_bill(self):
+        """Moins de resultats que de requetes : on ne devine pas l'appariement."""
+        def _urlopen(request, timeout=None):
+            return _FakeResponse({"results": [{}]})
+
+        with patch.object(urllib.request, "urlopen", _urlopen):
+            outcome = check_cve_osv_detailed(
+                [("PyPI", "gradio", "4.0.0"), ("npm", "express", "4.17.1")]
+            )
+
+        assert outcome.complete is False
+        assert outcome.cves == []
+
+    def test_lost_vulnerability_details_are_reported(self):
+        """Une vulnerabilite trouvee puis non detaillee ne doit pas disparaitre."""
+        with patch.object(
+            urllib.request, "urlopen", _fake_osv(vulnerable_names={"gradio"})
+        ), patch("promptforge.security.fetch_vuln_details", lambda vuln_id: None):
+            outcome = check_cve_osv_detailed([("PyPI", "gradio", "4.0.0")])
+
+        assert outcome.cves == []
+        assert outcome.complete is False
+        assert any("details indisponibles" in error for error in outcome.errors)
+
+    def test_the_same_cve_indexed_twice_by_osv_is_reported_once(self):
+        """OSV indexe une meme CVE sous plusieurs identifiants (GHSA, PYSEC).
+
+        Le dedoublonnage sur l'identifiant OSV ne les rapproche pas : c'est
+        l'alias CVE commun, produit par `parse_osv_vulnerability`, qui doit
+        aussi etre filtre. Mesure du 2026-09-04 sur `PyPI/pytest 8.3.4` :
+        CVE-2025-71176 rendue deux fois avant ce filtre.
+        """
+        def _urlopen(request, timeout=None):
+            return _FakeResponse({
+                "results": [{"vulns": [{"id": "GHSA-aaaa"}, {"id": "PYSEC-bbbb"}]}]
+            })
+
+        def _details(vuln_id):
+            return {
+                "id": vuln_id,
+                "aliases": ["CVE-2025-71176"],
+                "summary": "meme faille, deux index",
+                "severity": [],
+                "affected": [{"package": {"name": "pytest"}, "versions": ["8.3.4"]}],
+                "references": [],
+            }
+
+        with patch.object(urllib.request, "urlopen", _urlopen), patch(
+            "promptforge.security.fetch_vuln_details", _details
+        ):
+            outcome = check_cve_osv_detailed([("PyPI", "pytest", "8.3.4")])
+
+        assert [cve.id for cve in outcome.cves] == ["CVE-2025-71176"]
+
+    def test_a_vulnerability_without_cve_alias_is_still_reported(self):
+        """Sans alias CVE, l'identifiant rendu EST l'identifiant OSV.
+
+        Un dedoublonnage a un seul ensemble ferait alors collision avec
+        lui-meme et supprimerait toutes les vulnerabilites non aliasees, qui
+        sont la majorite des avis GHSA recents.
+        """
+        with patch.object(
+            urllib.request, "urlopen", _fake_osv(vulnerable_names={"gradio"})
+        ), patch("promptforge.security.fetch_vuln_details", _fake_details):
+            outcome = check_cve_osv_detailed([("PyPI", "gradio", "4.0.0")])
+
+        assert [cve.id for cve in outcome.cves] == ["GHSA-fake-gradio"]
+
+    def test_empty_input_is_complete(self):
+        outcome = check_cve_osv_detailed([])
+        assert outcome.complete is True
+        assert outcome.summary() == ""
+
+    def test_skipped_alone_still_warns_the_user(self):
+        """Ignore n'est pas sain : le message sort meme si rien n'a echoue."""
+        with patch.object(urllib.request, "urlopen", _fake_osv(vulnerable_names=set())):
+            outcome = check_cve_osv_detailed(
+                [("PyPI", "gradio", "4.0.0"), ("CMake", "OpenSSL", "1.1.1")]
+            )
+
+        assert outcome.complete is True
+        assert "non verifiables" in outcome.summary()
+
+    def test_compat_wrapper_still_returns_a_plain_list(self):
+        """`check_cve_osv` garde sa signature pour ses appelants existants."""
+        with patch.object(
+            urllib.request, "urlopen", _fake_osv(vulnerable_names={"gradio"})
+        ), patch("promptforge.security.fetch_vuln_details", _fake_details):
+            cves = check_cve_osv([("PyPI", "gradio", "4.0.0")])
+
+        assert isinstance(cves, list)
+        assert len(cves) == 1
+        assert isinstance(cves[0], CVEInfo)
+
+
+class TestCveCheckOutcomeSummary:
+    """Le message rendu a l'utilisateur doit etre exact."""
+
+    def test_empty_outcome_says_nothing(self):
+        assert CVECheckOutcome().summary() == ""
+
+    def test_failure_message_names_the_ecosystems(self):
+        outcome = CVECheckOutcome(
+            failed=[("PyPI", "gradio", "4.0.0")], errors=["OSV.dev injoignable : boom"]
+        )
+        message = outcome.summary()
+        assert message.startswith(CVE_CHECK_INCOMPLETE_PREFIX)
+        assert "PyPI" in message
+        assert "OSV.dev injoignable" in message
 
 if __name__ == "__main__":
     # Run with: python -m pytest tests/test_security.py -v
