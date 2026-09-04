@@ -6,36 +6,40 @@
 
 ---
 
-## 🚀 Installation Rapide (Mode Natif)
+## 🚀 Installation
 
-### Prérequis
-- **Python 3.10+** ([télécharger](https://python.org))
-- **Ollama** ([télécharger](https://ollama.ai)) - pour le reformatage intelligent
+PromptForge est **multiplateforme et pilote par Docker** : la meme commande sur
+Windows, macOS et Linux.
+
+### Prerequis
+
+- **Docker** ([telecharger](https://docs.docker.com/get-docker/))
+- **Ollama** ([telecharger](https://ollama.com/download)) — installe sur la
+  machine hote, pas dans un conteneur
+
+> **Pourquoi Ollama reste natif.** C'est le seul composant qui a besoin du GPU.
+> Docker Desktop ne donne pas acces a Metal sur macOS, et l'acces GPU sous
+> Windows depend du pilote : un Ollama conteneurise y perdrait l'acceleration
+> materielle. Le conteneur PromptForge le joint sur l'hote. Sur Linux avec un
+> GPU expose a Docker, Ollama peut aussi tourner en conteneur.
 
 ### Lancement
 
-**Windows:**
-```batch
-# Double-cliquer sur Start.bat
-# Ou dans le terminal:
-python start.py
-```
-
-**Mac/Linux:**
 ```bash
-./start.sh
-# Ou: python3 start.py
+docker compose up
 ```
 
-### Commandes
+L'interface s'ouvre sur **http://localhost:7860**.
+
+### Sans Docker
+
+Le mode natif reste disponible sur les trois systemes :
 
 ```bash
 python start.py           # Lance l'interface web
-python start.py --install # Installe les dépendances
-python start.py --check   # Vérifie l'installation
+python start.py --install # Installe les dependances
+python start.py --check   # Verifie l'installation
 ```
-
-L'interface s'ouvre sur **http://localhost:7860**
 
 ---
 

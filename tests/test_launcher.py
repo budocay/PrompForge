@@ -116,42 +116,42 @@ class TestDockerfiles:
         assert 'COPY templates/' in content, "Dockerfile.web ne copie pas les templates"
 
 
-class TestLauncherScripts:
-    """Tests pour les scripts de lancement."""
+class TestEntryPoints:
+    """Points d'entree du produit, apres le nettoyage DEC-011.
 
-    def test_launcher_bat_exists(self):
-        """Vérifie que Launcher.bat existe (Windows)."""
-        script = Path(__file__).parent.parent / 'Launcher.bat'
-        assert script.exists(), "Launcher.bat n'existe pas"
+    Treize scripts de lancement redondants ont ete supprimes : ils
+    dupliquaient, en `.bat`, `.ps1` et `.sh`, ce que deux entrees
+    multiplateformes font deja. Ces tests verrouillent le fait qu'ils ne
+    reviennent pas, et que les deux entrees restantes existent.
+    """
 
-    def test_launcher_sh_exists(self):
-        """Vérifie que launcher.sh existe (Linux/Mac)."""
-        script = Path(__file__).parent.parent / 'launcher.sh'
-        assert script.exists(), "launcher.sh n'existe pas"
+    RETIRES = [
+        "Launcher.bat", "Start.bat", "launcher.ps1", "launcher.sh", "start.sh",
+        "run-web.bat", "run-web.ps1", "run-web.sh", "run.ps1",
+        "start-amd.ps1", "start-nvidia.ps1", "update.ps1", "update.sh",
+    ]
 
-    def test_launcher_ps1_exists(self):
-        """Vérifie que launcher.ps1 existe (PowerShell)."""
-        script = Path(__file__).parent.parent / 'launcher.ps1'
-        assert script.exists(), "launcher.ps1 n'existe pas"
+    def test_cross_platform_entry_points_exist(self):
+        """Les deux entrees multiplateformes sont presentes."""
+        base_dir = Path(__file__).parent.parent
+        for name in ("launcher.py", "start.py"):
+            assert (base_dir / name).exists(), f"{name} n'existe pas"
 
+    def test_no_platform_specific_launcher_returns(self):
+        """Aucun script de lancement specifique a une plateforme a la racine.
 
-class TestStartScripts:
-    """Tests pour les scripts de démarrage spécifiques GPU."""
+        Le produit doit rester multiplateforme et pilote par Docker : un
+        `.bat` ou un `.ps1` de lancement a la racine signale une regression
+        vers un chemin Windows dedie.
+        """
+        base_dir = Path(__file__).parent.parent
+        revenus = [name for name in self.RETIRES if (base_dir / name).exists()]
+        assert not revenus, f"scripts de lancement redondants revenus : {revenus}"
 
-    def test_start_nvidia_exists(self):
-        """Vérifie que start-nvidia.ps1 existe."""
-        script = Path(__file__).parent.parent / 'start-nvidia.ps1'
-        assert script.exists(), "start-nvidia.ps1 n'existe pas"
-
-    def test_start_amd_exists(self):
-        """Vérifie que start-amd.ps1 existe."""
-        script = Path(__file__).parent.parent / 'start-amd.ps1'
-        assert script.exists(), "start-amd.ps1 n'existe pas"
-
-    def test_setup_amd_windows_exists(self):
-        """Vérifie que setup-amd-windows.ps1 existe."""
-        script = Path(__file__).parent.parent / 'setup-amd-windows.ps1'
-        assert script.exists(), "setup-amd-windows.ps1 n'existe pas"
+    def test_makefile_is_the_documented_update_path(self):
+        """`update.sh` et `update.ps1` sont remplaces par une cible Makefile."""
+        makefile = (Path(__file__).parent.parent / "Makefile").read_text()
+        assert "update:" in makefile, "la cible `make update` a disparu"
 
 
 class TestLauncherStateFixes:
