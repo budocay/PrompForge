@@ -327,17 +327,21 @@ let package = Package(name: "Test", dependencies: [
     .package(url: "https://github.com/apple/swift-nio", from: "2.0.0")
 ])
 """)
-        (project_dir / "Package.resolved").write_text(json.dumps({
-            "pins": [{"identity": "swift-nio", "state": {"version": "2.65.0"}}],
-            "version": 2
-        }))
+        (project_dir / "Package.resolved").write_text(
+            json.dumps(
+                {"pins": [{"identity": "swift-nio", "state": {"version": "2.65.0"}}], "version": 2}
+            )
+        )
 
         scanner = ProjectScanner()
         result = scanner.scan(project_dir)
 
         nio = next(
-            (p for p in result.packages
-             if p.ecosystem == "SwiftPM" and p.name.lower() == "swift-nio"),
+            (
+                p
+                for p in result.packages
+                if p.ecosystem == "SwiftPM" and p.name.lower() == "swift-nio"
+            ),
             None,
         )
         assert nio is not None
@@ -360,8 +364,11 @@ let package = Package(name: "Test", dependencies: [
         result = scanner.scan(project_dir)
 
         alamofire = next(
-            (p for p in result.packages
-             if p.ecosystem == "SwiftPM" and p.name.lower() == "alamofire"),
+            (
+                p
+                for p in result.packages
+                if p.ecosystem == "SwiftPM" and p.name.lower() == "alamofire"
+            ),
             None,
         )
         assert alamofire is not None

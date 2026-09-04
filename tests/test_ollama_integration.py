@@ -13,6 +13,7 @@ from pathlib import Path
 
 from promptforge.core import PromptForge
 from promptforge.providers import OllamaProvider, OllamaConfig
+from promptforge.security import SecurityContext
 
 
 def ollama_available() -> bool:
@@ -198,13 +199,18 @@ class TestRealFullWorkflow:
         assert status["active_project"] == "integration-test"
 
         # 4. Format a prompt
-        success, file_path, formatted = forge.format_prompt(
+        # format_prompt rend un 4-uple : (succes, message, prompt, security_context)
+        result = forge.format_prompt(
             "Create a REST endpoint to handle user authentication with JWT"
         )
+        assert len(result) == 4
+        success, file_path, formatted, security_ctx = result
 
         assert success, "Formatting failed"
         assert formatted is not None
         assert len(formatted) > 100, "Formatted prompt too short"
+        # check_security vaut True par defaut : le 4e membre porte l'analyse
+        assert isinstance(security_ctx, SecurityContext)
 
         # 5. Verify history was saved
         history = forge.get_history()
@@ -238,9 +244,10 @@ class TestRealFullWorkflow:
         ]
 
         for i, prompt in enumerate(prompts):
-            success, _, formatted = forge.format_prompt(prompt)
+            success, _, formatted, security_ctx = forge.format_prompt(prompt)
             assert success, f"Failed on prompt {i}: {prompt}"
             assert formatted is not None
+            assert isinstance(security_ctx, SecurityContext)
             print(f"Prompt {i+1} formatted: {len(formatted)} chars")
 
         # Verify all were saved

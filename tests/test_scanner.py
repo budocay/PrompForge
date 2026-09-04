@@ -175,19 +175,22 @@ class TestLanguageDetection:
 class TestVersionNormalization:
     """Tests pour normalize_version_constraint (F-005)."""
 
-    @pytest.mark.parametrize("raw,expected", [
-        (">=3.11", "3.11"),
-        (">= 3.11", "3.11"),
-        ("^3.11", "3.11"),
-        ("~=3.10", "3.10"),
-        ("~3.10.2", "3.10.2"),
-        (">=3.10,<3.13", "3.10"),      # on garde la borne basse, seule garantie
-        ("3.12.0", "3.12.0"),
-        ("v18.14.2", "18.14.2"),
-        ("==2.0", "2.0"),
-        ("  1.75  ", "1.75"),
-        ('"3.11"', "3.11"),
-    ])
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (">=3.11", "3.11"),
+            (">= 3.11", "3.11"),
+            ("^3.11", "3.11"),
+            ("~=3.10", "3.10"),
+            ("~3.10.2", "3.10.2"),
+            (">=3.10,<3.13", "3.10"),  # on garde la borne basse, seule garantie
+            ("3.12.0", "3.12.0"),
+            ("v18.14.2", "18.14.2"),
+            ("==2.0", "2.0"),
+            ("  1.75  ", "1.75"),
+            ('"3.11"', "3.11"),
+        ],
+    )
     def test_extracts_concrete_version(self, raw, expected):
         assert normalize_version_constraint(raw) == expected
 
@@ -224,24 +227,58 @@ class TestPythonVersionDetection:
 
         assert result.languages[0].version == "3.10"
 
-    def test_requires_python_is_not_captured_by_the_poetry_pattern(self, temp_dir):
-        """`requires-python` ne doit pas etre lu par le motif Poetry `python =`.
+    def test_requires_python_alone_is_normalized(self, temp_dir):
+        """Un `pyproject.toml` PEP 621 seul rend la borne basse normalisee.
 
-        C'etait la cause exacte de l'echec F-005 : le motif Poetry, place en
-        premier dans VERSION_FILES, capturait `requires-python` et rendait la
-        contrainte brute.
+        Test de non-regression sur la normalisation, PAS sur le lookbehind : les
+        deux motifs Python rendent ici le meme resultat, donc retirer le
+        lookbehind laisse ce test vert. Le cas discriminant est ci-dessous.
         """
         project_dir = Path(temp_dir) / "project"
         project_dir.mkdir()
         (project_dir / "main.py").write_text("print('hello')")
-        (project_dir / "pyproject.toml").write_text(
-            '[project]\nrequires-python = ">=3.10,<3.13"\n'
-        )
+        (project_dir / "pyproject.toml").write_text('[project]\nrequires-python = ">=3.10,<3.13"\n')
 
         scanner = ProjectScanner()
         result = scanner.scan(project_dir)
 
         assert result.languages[0].version == "3.10"
+
+    def test_poetry_key_wins_over_requires_python_when_both_are_present(self, temp_dir):
+        r"""Le lookbehind de VERSION_FILES["Python"][0] est ici le seul discriminant.
+
+        Les deux cles coexistent avec des valeurs *distinctes*, et
+        `requires-python` precede la cle Poetry dans le fichier :
+
+            [project]
+            requires-python = ">=3.11"
+
+            [tool.poetry.dependencies]
+            python = "^3.9"
+
+        Le motif Poetry est premier dans VERSION_FILES et gagne donc la
+        detection. Avec le lookbehind `(?<![\w-])` il ne peut matcher que la
+        vraie cle Poetry, donc `3.9`. Sans lui, il matche le `python` de
+        `requires-python`, rencontre plus tot dans le fichier, et rend `3.11`.
+
+        Recette du verrou : retirer `(?<![\w-])` du motif doit faire virer ce
+        test au rouge sur `assert "3.9" == "3.11"`.
+        """
+        project_dir = Path(temp_dir) / "project"
+        project_dir.mkdir()
+        (project_dir / "main.py").write_text("print('hello')")
+        (project_dir / "pyproject.toml").write_text(
+            "[project]\n"
+            'requires-python = ">=3.11"\n'
+            "\n"
+            "[tool.poetry.dependencies]\n"
+            'python = "^3.9"\n'
+        )
+
+        scanner = ProjectScanner()
+        result = scanner.scan(project_dir)
+
+        assert result.languages[0].version == "3.9"
 
 
 class TestFrameworkDetection:
@@ -484,9 +521,7 @@ class TestTestDetection:
         project_dir = Path(temp_dir) / "project"
         project_dir.mkdir()
         (project_dir / "app.ts").write_text("console.log('hello')")
-        (project_dir / "package.json").write_text(
-            '{"devDependencies": {"vitest": "^1.0.0"}}'
-        )
+        (project_dir / "package.json").write_text('{"devDependencies": {"vitest": "^1.0.0"}}')
 
         scanner = ProjectScanner()
         result = scanner.scan(project_dir)
@@ -503,9 +538,7 @@ class TestTestDetection:
         project_dir = Path(temp_dir) / "project"
         project_dir.mkdir()
         (project_dir / "app.ts").write_text("console.log('hello')")
-        (project_dir / "package.json").write_text(
-            '{"devDependencies": {"typescript": "^5.0.0"}}'
-        )
+        (project_dir / "package.json").write_text('{"devDependencies": {"typescript": "^5.0.0"}}')
 
         scanner = ProjectScanner()
         result = scanner.scan(project_dir)

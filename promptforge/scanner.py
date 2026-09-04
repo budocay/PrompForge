@@ -88,7 +88,7 @@ LANGUAGE_EXTENSIONS = {
     "PowerShell": [".ps1", ".psm1"],
 }
 
-def normalize_version_constraint(raw: str) -> Optional[str]:
+def normalize_version_constraint(raw: str | None) -> str | None:
     """Extract a concrete version from a raw version constraint.
 
     Version files hold constraints, not versions: `>=3.11`, `^3.11`, `~=3.10`,
@@ -128,9 +128,12 @@ def normalize_version_constraint(raw: str) -> Optional[str]:
 # `~=3.10`) ; c'est `normalize_version_constraint` qui en extrait la version.
 VERSION_FILES = {
     "Python": [
-        # Le lookbehind est indispensable : sans lui, ce motif Poetry capture aussi
-        # la cle PEP 621 `requires-python`, qui le precede rarement dans le fichier
-        # mais le devance toujours dans cette liste, et rend alors `>=3.11`.
+        # Le lookbehind empeche ce motif Poetry de capturer aussi le `python` de la
+        # cle PEP 621 `requires-python`. Effet mesure, sur un fichier portant les
+        # deux cles avec des valeurs distinctes : avec lookbehind -> `^3.9` (la
+        # vraie cle Poetry), sans lookbehind -> `>=3.11` (rencontre plus tot).
+        # Verrou : tests/test_scanner.py::TestPythonVersionDetection::
+        # test_poetry_key_wins_over_requires_python_when_both_are_present.
         ("pyproject.toml", r'(?<![\w-])python\s*=\s*["\']([^"\']+)["\']'),
         ("pyproject.toml", r'requires-python\s*=\s*["\']([^"\']+)["\']'),
         (".python-version", r"^(\d+\.\d+(?:\.\d+)?)"),

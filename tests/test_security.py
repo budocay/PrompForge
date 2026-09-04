@@ -450,9 +450,9 @@ import tempfile
 # donc aucun litteral qui declencherait un scanner de secrets sur ce depot
 # (gitleaks, prevu par F-008), tout en donnant au scanner teste une valeur de
 # longueur et de forme exactes.
-FAKE_AWS_ACCESS_KEY_ID = "AKIA" + "3F7KQ2N9WBXDLZ4T"                    # 4 + 16 = 20
-FAKE_AWS_SECRET_KEY = "kR9dTn2QvL7mXe4Wz" + "B1sYcJ0pHgAfU6iN3oD8rTq"   # 40
-FAKE_GITHUB_TOKEN = "ghp_" + "Kq7Zx2Vb9NmTr4Lp1Wc6Ys3Hd8Jf0Gu5Ae2B"     # 4 + 36 = 40
+FAKE_AWS_ACCESS_KEY_ID = "AKIA" + "3F7KQ2N9WBXDLZ4T"  # 4 + 16 = 20
+FAKE_AWS_SECRET_KEY = "kR9dTn2QvL7mXe4Wz" + "B1sYcJ0pHgAfU6iN3oD8rTq"  # 40
+FAKE_GITHUB_TOKEN = "ghp_" + "Kq7Zx2Vb9NmTr4Lp1Wc6Ys3Hd8Jf0Gu5Ae2B"  # 4 + 36 = 40
 
 # Identifiants d'exemple publies par la documentation AWS. Ils ne doivent JAMAIS
 # etre remontes comme des secrets : ils sont copies dans d'innombrables README,
@@ -525,7 +525,7 @@ class TestSecretFileScanning:
         example credentials produces false positives on a large share of real
         projects, which CLAUDE.md forbids.
         """
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
             f.write(f"AWS_ACCESS_KEY_ID={AWS_DOC_EXAMPLE_ACCESS_KEY_ID}\n")
             f.write(f"AWS_SECRET_ACCESS_KEY={AWS_DOC_EXAMPLE_SECRET_KEY}\n")
             f.flush()
@@ -539,7 +539,7 @@ class TestSecretFileScanning:
 
     def test_aws_access_key_id_longer_than_20_chars_not_flagged(self):
         """Should not report an AKIA-prefixed blob that is not 20 chars long."""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
             f.write("AWS_ACCESS_KEY_ID=" + "AKIA" + "3F7KQ2N9WBXDLZ4TQRST" + "\n")
             f.flush()
             path = Path(f.name)
@@ -577,7 +577,7 @@ class TestSecretFileScanning:
         Guards both directions of the length rule: too short (32) and too long
         (40). The upper bound only holds because the pattern is right-bounded.
         """
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
             f.write("GITHUB_TOKEN=" + "ghp_" + ("a" * body_length) + "\n")
             f.flush()
             path = Path(f.name)
@@ -622,28 +622,34 @@ class TestSecretFileScanning:
 class TestPlaceholderFilter:
     """Tests for is_placeholder_value, the anti-false-positive filter (F-004)."""
 
-    @pytest.mark.parametrize("value", [
-        "your_api_key_here",
-        "XXXXXXXXXXXXXXXX",
-        "changeme",
-        "replace_with_secret",
-        "placeholder_value",
-        "TODO_set_this",
-        "${VAULT_DB_PASSWORD}",
-        "{{ db_password }}",
-        "<SET-ME-IN-VAULT>",
-        "",
-    ])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "your_api_key_here",
+            "XXXXXXXXXXXXXXXX",
+            "changeme",
+            "replace_with_secret",
+            "placeholder_value",
+            "TODO_set_this",
+            "${VAULT_DB_PASSWORD}",
+            "{{ db_password }}",
+            "<SET-ME-IN-VAULT>",
+            "",
+        ],
+    )
     def test_rejects_placeholders(self, value):
         assert is_placeholder_value(value) is True
 
-    @pytest.mark.parametrize("value", [
-        FAKE_AWS_ACCESS_KEY_ID,
-        FAKE_AWS_SECRET_KEY,
-        FAKE_GITHUB_TOKEN,
-        "Tr0ub4dor<3!",          # un chevron isole ne fait pas un gabarit
-        "a<b>c_D3f9hK2mQ",       # chevrons au milieu, valeur non encadree
-    ])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            FAKE_AWS_ACCESS_KEY_ID,
+            FAKE_AWS_SECRET_KEY,
+            FAKE_GITHUB_TOKEN,
+            "Tr0ub4dor<3!",  # un chevron isole ne fait pas un gabarit
+            "a<b>c_D3f9hK2mQ",  # chevrons au milieu, valeur non encadree
+        ],
+    )
     def test_accepts_real_looking_values(self, value):
         assert is_placeholder_value(value) is False
 
@@ -658,7 +664,7 @@ class TestPlaceholderFilter:
         Before F-004 the filter rejected any value containing `<` or `>`, which
         silently dropped a whole class of real passwords.
         """
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
             f.write("DB_PASSWORD=Tr0ub4dor<3!xK9\n")
             f.flush()
             path = Path(f.name)

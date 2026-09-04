@@ -122,8 +122,12 @@ SECRET_PATTERNS = [
     # Longueur bornee a droite : un AWS Access Key ID fait exactement 20 caracteres
     # (prefixe AKIA + 16). Sans le lookahead, {16} se comporte comme {16,} et une
     # chaine plus longue commencant par AKIA serait remontee a tort.
-    ("AWS Access Key ID", r'(?:AWS|aws)?_?(?:ACCESS|access)?_?(?:KEY|key)?_?(?:ID|id)?\s*[=:]\s*["\']?(AKIA[0-9A-Z]{16})(?![0-9A-Za-z])["\']?', "CRITICAL",
-     "Utilisez AWS IAM roles ou AWS Secrets Manager au lieu de credentials en dur"),
+    (
+        "AWS Access Key ID",
+        r'(?:AWS|aws)?_?(?:ACCESS|access)?_?(?:KEY|key)?_?(?:ID|id)?\s*[=:]\s*["\']?(AKIA[0-9A-Z]{16})(?![0-9A-Za-z])["\']?',
+        "CRITICAL",
+        "Utilisez AWS IAM roles ou AWS Secrets Manager au lieu de credentials en dur",
+    ),
     ("AWS Secret Access Key", r'(?:AWS|aws)?_?(?:SECRET|secret)?_?(?:ACCESS|access)?_?(?:KEY|key)\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?', "CRITICAL",
      "Ne jamais commiter les AWS secret keys. Utilisez des variables d'environnement securisees"),
 
@@ -185,8 +189,12 @@ SECRET_PATTERNS = [
     # Ollama et OSV.dev. Longueur a confirmer par `agent-veille` (dette D-044).
     # Sans le lookahead, {36} se comporte comme {36,} : une chaine de 40 caracteres
     # serait remontee comme un jeton GitHub valide, ce qui est un faux positif.
-    ("GitHub Token", r'(?:GITHUB|github)(?:_TOKEN|_token|_PAT)?\s*[=:]\s*["\']?(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})(?![a-zA-Z0-9])["\']?', "CRITICAL",
-     "Token GitHub detecte! Revoquez ce token dans les settings GitHub"),
+    (
+        "GitHub Token",
+        r'(?:GITHUB|github)(?:_TOKEN|_token|_PAT)?\s*[=:]\s*["\']?(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})(?![a-zA-Z0-9])["\']?',
+        "CRITICAL",
+        "Token GitHub detecte! Revoquez ce token dans les settings GitHub",
+    ),
     ("GitLab Token", r'(?:GITLAB|gitlab)(?:_TOKEN|_token)?\s*[=:]\s*["\']?(glpat-[a-zA-Z0-9\-]{20})["\']?', "CRITICAL",
      "Token GitLab detecte! Revoquez ce token dans les settings GitLab"),
 
@@ -248,7 +256,13 @@ SECRET_SCAN_EXTENSIONS = [
 #
 # Recherche de sous-chaine, insensible a la casse, sur la valeur capturee.
 PLACEHOLDER_SUBSTRINGS = [
-    "your_", "xxx", "changeme", "replace", "example", "placeholder", "todo",
+    "your_",
+    "xxx",
+    "changeme",
+    "replace",
+    "example",
+    "placeholder",
+    "todo",
 ]
 
 # Marqueurs d'interpolation de gabarit : leur seule presence suffit.

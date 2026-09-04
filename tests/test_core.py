@@ -263,9 +263,7 @@ class TestHistoryFile:
         forge.use_project("test")
         forge.ollama = mock_ollama_available
         
-        success, file_path, formatted, security_ctx = forge.format_prompt(
-            "create api endpoint"
-        )
+        success, file_path, formatted, security_ctx = forge.format_prompt("create api endpoint")
 
         assert success is True
         assert security_ctx is not None

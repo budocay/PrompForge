@@ -32,9 +32,7 @@ class TestIntegrationWorkflow:
         assert status["ollama_available"] == True
         
         # 4. Reformater un prompt
-        result = forge.format_prompt(
-            "crée une route REST pour gérer les utilisateurs"
-        )
+        result = forge.format_prompt("crée une route REST pour gérer les utilisateurs")
         assert len(result) == 4
         success, file_path, formatted, security_ctx = result
         assert success
