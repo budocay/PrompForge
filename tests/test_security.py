@@ -438,10 +438,27 @@ from promptforge.security import (
     scan_directory_for_secrets,
     format_secret_alerts,
     mask_secret,
+    is_placeholder_value,
     SecretFinding,
 )
 from pathlib import Path
 import tempfile
+
+
+# Identifiants synthetiques, invalides, generes pour ces tests uniquement.
+# Ils sont assembles par concatenation a dessein : le fichier source ne contient
+# donc aucun litteral qui declencherait un scanner de secrets sur ce depot
+# (gitleaks, prevu par F-008), tout en donnant au scanner teste une valeur de
+# longueur et de forme exactes.
+FAKE_AWS_ACCESS_KEY_ID = "AKIA" + "3F7KQ2N9WBXDLZ4T"                    # 4 + 16 = 20
+FAKE_AWS_SECRET_KEY = "kR9dTn2QvL7mXe4Wz" + "B1sYcJ0pHgAfU6iN3oD8rTq"   # 40
+FAKE_GITHUB_TOKEN = "ghp_" + "Kq7Zx2Vb9NmTr4Lp1Wc6Ys3Hd8Jf0Gu5Ae2B"     # 4 + 36 = 40
+
+# Identifiants d'exemple publies par la documentation AWS. Ils ne doivent JAMAIS
+# etre remontes comme des secrets : ils sont copies dans d'innombrables README,
+# `.env.example` et tutoriels.
+AWS_DOC_EXAMPLE_ACCESS_KEY_ID = "AKIAIOSFODNN7" + "EXAMPLE"
+AWS_DOC_EXAMPLE_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCY" + "EXAMPLEKEY"
 
 
 class TestSecretMasking:
@@ -486,10 +503,10 @@ class TestSecretFileScanning:
             path.unlink()
 
     def test_scan_file_with_aws_keys(self):
-        """Should detect AWS credentials."""
+        """Should detect AWS credentials that are not documentation examples."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
-            f.write("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
-            f.write("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n")
+            f.write(f"AWS_ACCESS_KEY_ID={FAKE_AWS_ACCESS_KEY_ID}\n")
+            f.write(f"AWS_SECRET_ACCESS_KEY={FAKE_AWS_SECRET_KEY}\n")
             f.flush()
             path = Path(f.name)
 
@@ -501,10 +518,48 @@ class TestSecretFileScanning:
         finally:
             path.unlink()
 
-    def test_scan_file_with_github_token(self):
-        """Should detect GitHub tokens."""
+    def test_skip_aws_documentation_example_keys(self):
+        """Should NOT flag the credentials published by the AWS documentation.
+
+        Pins the F-004 arbitration: a scanner that reports AWS's own published
+        example credentials produces false positives on a large share of real
+        projects, which CLAUDE.md forbids.
+        """
         with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
-            f.write("GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456\n")
+            f.write(f"AWS_ACCESS_KEY_ID={AWS_DOC_EXAMPLE_ACCESS_KEY_ID}\n")
+            f.write(f"AWS_SECRET_ACCESS_KEY={AWS_DOC_EXAMPLE_SECRET_KEY}\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert findings == []
+        finally:
+            path.unlink()
+
+    def test_aws_access_key_id_longer_than_20_chars_not_flagged(self):
+        """Should not report an AKIA-prefixed blob that is not 20 chars long."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("AWS_ACCESS_KEY_ID=" + "AKIA" + "3F7KQ2N9WBXDLZ4TQRST" + "\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert not any("AWS Access Key ID" == f.secret_type for f in findings)
+        finally:
+            path.unlink()
+
+    def test_scan_file_with_github_token(self):
+        """Should detect a GitHub PAT of the documented length.
+
+        A classic PAT is `ghp_` followed by exactly 36 characters (40 total).
+        See the length note on the GitHub Token pattern in security.py.
+        """
+        assert len(FAKE_GITHUB_TOKEN) == 40
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write(f"GITHUB_TOKEN={FAKE_GITHUB_TOKEN}\n")
             f.flush()
             path = Path(f.name)
 
@@ -512,6 +567,24 @@ class TestSecretFileScanning:
             findings = scan_file_for_secrets(path)
             assert len(findings) >= 1
             assert any("GitHub" in f.secret_type for f in findings)
+        finally:
+            path.unlink()
+
+    @pytest.mark.parametrize("body_length", [32, 40])
+    def test_github_token_of_wrong_length_not_flagged(self, body_length):
+        """Should not report a `ghp_` blob whose body is not 36 chars long.
+
+        Guards both directions of the length rule: too short (32) and too long
+        (40). The upper bound only holds because the pattern is right-bounded.
+        """
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("GITHUB_TOKEN=" + "ghp_" + ("a" * body_length) + "\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert not any("GitHub" in f.secret_type for f in findings)
         finally:
             path.unlink()
 
@@ -542,6 +615,57 @@ class TestSecretFileScanning:
         try:
             findings = scan_file_for_secrets(path)
             assert len(findings) == 0
+        finally:
+            path.unlink()
+
+
+class TestPlaceholderFilter:
+    """Tests for is_placeholder_value, the anti-false-positive filter (F-004)."""
+
+    @pytest.mark.parametrize("value", [
+        "your_api_key_here",
+        "XXXXXXXXXXXXXXXX",
+        "changeme",
+        "replace_with_secret",
+        "placeholder_value",
+        "TODO_set_this",
+        "${VAULT_DB_PASSWORD}",
+        "{{ db_password }}",
+        "<SET-ME-IN-VAULT>",
+        "",
+    ])
+    def test_rejects_placeholders(self, value):
+        assert is_placeholder_value(value) is True
+
+    @pytest.mark.parametrize("value", [
+        FAKE_AWS_ACCESS_KEY_ID,
+        FAKE_AWS_SECRET_KEY,
+        FAKE_GITHUB_TOKEN,
+        "Tr0ub4dor<3!",          # un chevron isole ne fait pas un gabarit
+        "a<b>c_D3f9hK2mQ",       # chevrons au milieu, valeur non encadree
+    ])
+    def test_accepts_real_looking_values(self, value):
+        assert is_placeholder_value(value) is False
+
+    def test_documented_example_credentials_are_placeholders(self):
+        """AWS's published example credentials are placeholders, by decision."""
+        assert is_placeholder_value(AWS_DOC_EXAMPLE_ACCESS_KEY_ID) is True
+        assert is_placeholder_value(AWS_DOC_EXAMPLE_SECRET_KEY) is True
+
+    def test_password_containing_angle_bracket_is_detected(self):
+        """A password merely containing `<` must still be reported.
+
+        Before F-004 the filter rejected any value containing `<` or `>`, which
+        silently dropped a whole class of real passwords.
+        """
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+            f.write("DB_PASSWORD=Tr0ub4dor<3!xK9\n")
+            f.flush()
+            path = Path(f.name)
+
+        try:
+            findings = scan_file_for_secrets(path)
+            assert len(findings) >= 1
         finally:
             path.unlink()
 

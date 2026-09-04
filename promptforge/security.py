@@ -119,7 +119,10 @@ class SecretFinding:
 # Patterns for detecting secrets - (name, regex, severity, recommendation)
 SECRET_PATTERNS = [
     # AWS
-    ("AWS Access Key ID", r'(?:AWS|aws)?_?(?:ACCESS|access)?_?(?:KEY|key)?_?(?:ID|id)?\s*[=:]\s*["\']?(AKIA[0-9A-Z]{16})["\']?', "CRITICAL",
+    # Longueur bornee a droite : un AWS Access Key ID fait exactement 20 caracteres
+    # (prefixe AKIA + 16). Sans le lookahead, {16} se comporte comme {16,} et une
+    # chaine plus longue commencant par AKIA serait remontee a tort.
+    ("AWS Access Key ID", r'(?:AWS|aws)?_?(?:ACCESS|access)?_?(?:KEY|key)?_?(?:ID|id)?\s*[=:]\s*["\']?(AKIA[0-9A-Z]{16})(?![0-9A-Za-z])["\']?', "CRITICAL",
      "Utilisez AWS IAM roles ou AWS Secrets Manager au lieu de credentials en dur"),
     ("AWS Secret Access Key", r'(?:AWS|aws)?_?(?:SECRET|secret)?_?(?:ACCESS|access)?_?(?:KEY|key)\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?', "CRITICAL",
      "Ne jamais commiter les AWS secret keys. Utilisez des variables d'environnement securisees"),
@@ -171,7 +174,18 @@ SECRET_PATTERNS = [
      "Cle privee PGP detectee! Ne jamais exposer de cles privees"),
 
     # GitHub / GitLab
-    ("GitHub Token", r'(?:GITHUB|github)(?:_TOKEN|_token|_PAT)?\s*[=:]\s*["\']?(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})["\']?', "CRITICAL",
+    # Longueurs volontairement exactes et bornees a droite par un lookahead.
+    # PAT classique : prefixe `ghp_` puis 36 caracteres (30 de donnees aleatoires
+    # base62 + 6 de somme de controle CRC32), soit 40 caracteres au total.
+    # PAT a portee fine : `github_pat_` + 22 + `_` + 59.
+    # Source de reference : billet GitHub Engineering « Behind GitHub's new
+    # authentication token formats » (2021-04-05),
+    # https://github.blog/engineering/behind-githubs-new-authentication-token-formats/
+    # NON REVERIFIEE EN LIGNE depuis ce depot : le reseau sortant est restreint a
+    # Ollama et OSV.dev. Longueur a confirmer par `agent-veille` (dette D-044).
+    # Sans le lookahead, {36} se comporte comme {36,} : une chaine de 40 caracteres
+    # serait remontee comme un jeton GitHub valide, ce qui est un faux positif.
+    ("GitHub Token", r'(?:GITHUB|github)(?:_TOKEN|_token|_PAT)?\s*[=:]\s*["\']?(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})(?![a-zA-Z0-9])["\']?', "CRITICAL",
      "Token GitHub detecte! Revoquez ce token dans les settings GitHub"),
     ("GitLab Token", r'(?:GITLAB|gitlab)(?:_TOKEN|_token)?\s*[=:]\s*["\']?(glpat-[a-zA-Z0-9\-]{20})["\']?', "CRITICAL",
      "Token GitLab detecte! Revoquez ce token dans les settings GitLab"),
@@ -221,6 +235,53 @@ SECRET_SCAN_EXTENSIONS = [
 ]
 
 
+# Marqueurs de valeur factice.
+#
+# Arbitrage F-004, assume et pin par des tests : sur un scanner de secrets, le
+# cout d'un faux positif est juge superieur au cout d'un faux negatif sur une
+# valeur qui contient litteralement le mot « example ». `.env.example` figure
+# explicitement dans SECRET_SCAN_FILES, les README et les docs d'editeurs sont
+# remplis d'identifiants d'exemple publies (AKIAIOSFODNN7EXAMPLE et
+# wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY sont ceux de la documentation AWS
+# elle-meme). Les remonter contredirait l'exigence de veracite de CLAUDE.md et
+# provoquerait de la fatigue d'alerte, qui fait ignorer les vraies alertes.
+#
+# Recherche de sous-chaine, insensible a la casse, sur la valeur capturee.
+PLACEHOLDER_SUBSTRINGS = [
+    "your_", "xxx", "changeme", "replace", "example", "placeholder", "todo",
+]
+
+# Marqueurs d'interpolation de gabarit : leur seule presence suffit.
+PLACEHOLDER_TEMPLATE_MARKERS = ["${", "{{"]
+
+
+def is_placeholder_value(value: str) -> bool:
+    """Tell whether a captured secret value is an obvious placeholder.
+
+    Args:
+        value: The raw value captured by a secret pattern.
+
+    Returns:
+        True when the value should not be reported as a secret.
+    """
+    if not value:
+        return True
+
+    lowered = value.lower()
+    if any(marker in lowered for marker in PLACEHOLDER_SUBSTRINGS):
+        return True
+    if any(marker in value for marker in PLACEHOLDER_TEMPLATE_MARKERS):
+        return True
+
+    # Convention `<A_REMPLACER>` : c'est l'encadrement qui fait le gabarit, pas la
+    # simple presence d'un chevron. Rejeter toute valeur *contenant* `<` ou `>`
+    # ferait manquer les mots de passe qui en contiennent, ce qui est frequent.
+    if value.startswith("<") and value.endswith(">"):
+        return True
+
+    return False
+
+
 def mask_secret(value: str, show_chars: int = 4) -> str:
     """Mask a secret value for safe display."""
     if not value or len(value) <= show_chars * 2:
@@ -252,8 +313,7 @@ def scan_file_for_secrets(file_path: Path) -> list[SecretFinding]:
                     secret_value = match.group(1) if match.lastindex else match.group(0)
 
                     # Skip placeholder values
-                    placeholders = ["your_", "xxx", "changeme", "replace", "example", "placeholder", "todo", "<", ">", "${", "{{"]
-                    if any(p in secret_value.lower() for p in placeholders):
+                    if is_placeholder_value(secret_value):
                         continue
 
                     # Skip very short values (likely not real secrets)
