@@ -24,12 +24,12 @@ from pathlib import Path
 
 # Configurations Docker Compose disponibles
 COMPOSE_FILES = {
-    "nvidia": "docker-compose.yml",
-    "linux-amd": "docker-compose.amd.yml",
-    "linux-amd-max": "docker-compose.amd-max.yml",
-    "cpu": "docker-compose.cpu.yml",
-    "win-amd": "docker-compose.win-amd.yml",
-    "win-nvidia-native": "docker-compose.win-nvidia.yml"
+    "nvidia": "docker/compose/docker-compose.yml",
+    "linux-amd": "docker/compose/docker-compose.amd.yml",
+    "linux-amd-max": "docker/compose/docker-compose.amd-max.yml",
+    "cpu": "docker/compose/docker-compose.cpu.yml",
+    "win-amd": "docker/compose/docker-compose.win-amd.yml",
+    "win-nvidia-native": "docker/compose/docker-compose.win-nvidia.yml"
 }
 
 # Couleurs pour le terminal

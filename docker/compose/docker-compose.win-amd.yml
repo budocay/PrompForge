@@ -20,11 +20,11 @@ services:
   # Interface Web uniquement (Ollama tourne en natif sur Windows)
   promptforge-web:
     build:
-      context: .
-      dockerfile: Dockerfile.web
+      context: ../..
+      dockerfile: docker/Dockerfile.web
     container_name: promptforge-web
     ports:
-      - "7860:7860"
+      - "127.0.0.1:7860:7860"
     environment:
       # Connecte à Ollama natif Windows (host.docker.internal)
       - OLLAMA_HOST=http://host.docker.internal:11434
@@ -32,12 +32,12 @@ services:
       - PROMPTFORGE_DATA_PATH=/data
     volumes:
       # IMPORTANT: Persistance de la BDD SQLite et des projets
-      - ./data:/data
+      - ../../data:/data
       # Projets pré-existants (exemples) - lecture seule
-      - ./projects:/app/example-projects:ro
+      - ../../projects:/app/example-projects:ro
       # === SCANNER : Monte le dossier parent automatiquement ===
       # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
-      - ${HOSTFS_PATH:-../}:/hostfs:ro
+      - ${HOSTFS_PATH:-../../..}:/hostfs:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

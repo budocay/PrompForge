@@ -18,12 +18,13 @@ class TestDockerComposeFiles:
         base_dir = Path(__file__).parent.parent
         
         expected_files = [
-            'docker-compose.yml',           # NVIDIA
-            'docker-compose.cpu.yml',       # CPU
-            'docker-compose.amd.yml',       # Linux AMD
-            'docker-compose.amd-max.yml',   # Linux AMD MAX
-            'docker-compose.win-nvidia.yml', # Windows NVIDIA
-            'docker-compose.win-amd.yml',   # Windows AMD
+            'compose.yaml',                                 # defaut, les 3 OS
+            'docker/compose/docker-compose.yml',            # NVIDIA
+            'docker/compose/docker-compose.cpu.yml',        # CPU
+            'docker/compose/docker-compose.amd.yml',        # Linux AMD
+            'docker/compose/docker-compose.amd-max.yml',    # Linux AMD MAX
+            'docker/compose/docker-compose.win-nvidia.yml', # Windows NVIDIA
+            'docker/compose/docker-compose.win-amd.yml',    # Windows AMD
         ]
         
         for filename in expected_files:
@@ -35,7 +36,7 @@ class TestDockerComposeFiles:
         import yaml
         
         base_dir = Path(__file__).parent.parent
-        compose_files = list(base_dir.glob('docker-compose*.yml'))
+        compose_files = list(base_dir.glob('docker/compose/*.yml')) + [base_dir / 'compose.yaml']
         
         for filepath in compose_files:
             try:
@@ -49,7 +50,7 @@ class TestDockerComposeFiles:
         import yaml
         
         base_dir = Path(__file__).parent.parent
-        compose_files = list(base_dir.glob('docker-compose*.yml'))
+        compose_files = list(base_dir.glob('docker/compose/*.yml')) + [base_dir / 'compose.yaml']
         
         for filepath in compose_files:
             with open(filepath) as f:
@@ -100,17 +101,17 @@ class TestDockerfiles:
 
     def test_dockerfile_exists(self):
         """Vérifie que Dockerfile existe."""
-        dockerfile = Path(__file__).parent.parent / 'Dockerfile'
+        dockerfile = Path(__file__).parent.parent / 'docker' / 'Dockerfile'
         assert dockerfile.exists(), "Dockerfile n'existe pas"
 
     def test_dockerfile_web_exists(self):
         """Vérifie que Dockerfile.web existe."""
-        dockerfile = Path(__file__).parent.parent / 'Dockerfile.web'
+        dockerfile = Path(__file__).parent.parent / 'docker' / 'Dockerfile.web'
         assert dockerfile.exists(), "Dockerfile.web n'existe pas"
 
     def test_dockerfile_web_copies_templates(self):
         """Vérifie que Dockerfile.web copie les templates."""
-        dockerfile = Path(__file__).parent.parent / 'Dockerfile.web'
+        dockerfile = Path(__file__).parent.parent / 'docker' / 'Dockerfile.web'
         content = dockerfile.read_text()
         
         assert 'COPY templates/' in content, "Dockerfile.web ne copie pas les templates"

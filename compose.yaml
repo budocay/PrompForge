@@ -1,0 +1,46 @@
+# ══════════════════════════════════════════════════════════════════════
+# PromptForge — configuration par defaut, identique sur Windows, macOS
+# et Linux.
+#
+#   docker compose up
+#
+# Seule l'interface tourne en conteneur. Ollama reste natif sur la machine
+# hote parce que c'est le seul composant qui a besoin du GPU : Docker
+# Desktop ne donne pas acces a Metal sur macOS, et l'acces GPU sous Windows
+# depend du pilote. Un Ollama conteneurise y perdrait l'acceleration
+# materielle (decision DEC-010).
+#
+# Prerequis : Ollama installe et demarre sur l'hote.
+#   ollama serve
+#   ollama pull qwen3:8b
+#
+# Variantes GPU, pour Linux avec un GPU expose a Docker :
+#   docker compose -f docker/compose/docker-compose.yml up      # NVIDIA
+#   docker compose -f docker/compose/docker-compose.amd.yml up  # AMD ROCm
+#   docker compose -f docker/compose/docker-compose.cpu.yml up  # sans GPU
+# ══════════════════════════════════════════════════════════════════════
+
+services:
+  promptforge-web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    container_name: promptforge-web
+    ports:
+      # Restreint a la boucle locale : l'interface n'a aucune raison d'etre
+      # joignable depuis le reseau (D-036).
+      - "127.0.0.1:7860:7860"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:8b}
+      - PROMPTFORGE_DATA_PATH=/data
+    volumes:
+      # Base SQLite et projets crees depuis l'interface
+      - ./data:/data
+      # Projets d'exemple, lecture seule
+      - ./projects:/app/example-projects:ro
+      # Scanner : dossier parent du depot par defaut
+      - ${HOSTFS_PATH:-../}:/hostfs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

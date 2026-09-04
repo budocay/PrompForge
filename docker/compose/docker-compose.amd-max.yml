@@ -15,7 +15,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     environment:
       - HSA_OVERRIDE_GFX_VERSION=11.0.0
       - GPU_MAX_HEAP_SIZE=100
@@ -38,11 +38,11 @@ services:
 
   promptforge-web:
     build:
-      context: .
-      dockerfile: Dockerfile.web
+      context: ../..
+      dockerfile: docker/Dockerfile.web
     container_name: promptforge-web
     ports:
-      - "7860:7860"
+      - "127.0.0.1:7860:7860"
     environment:
       - OLLAMA_HOST=http://ollama:11434
       # Modèle 32B - Maximum qualité pour 18GB+ VRAM
@@ -50,12 +50,12 @@ services:
       - PROMPTFORGE_DATA_PATH=/data
     volumes:
       # IMPORTANT: Persistance de la BDD SQLite et des projets
-      - ./data:/data
+      - ../../data:/data
       # Projets pré-existants (exemples) - lecture seule
-      - ./projects:/app/example-projects:ro
+      - ../../projects:/app/example-projects:ro
       # === SCANNER : Monte le dossier parent automatiquement ===
       # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
-      - ${HOSTFS_PATH:-../}:/hostfs:ro
+      - ${HOSTFS_PATH:-../../..}:/hostfs:ro
     depends_on:
       ollama:
         condition: service_healthy

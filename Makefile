@@ -156,22 +156,22 @@ update-all: ## Mettre à jour + nettoyer les anciennes images
 
 docker-amd: ## Démarrer avec GPU AMD (ROCm) - modèle 14B
 	@echo "$(BLUE)🎮 Démarrage avec GPU AMD (qwen2.5:14b)...$(NC)"
-	docker compose -f docker-compose.amd.yml up -d
+	docker compose -f docker/compose/docker-compose.amd.yml up -d
 	@echo "$(GREEN)✅ Interface: http://localhost:7860$(NC)"
 
 docker-amd-max: ## Démarrer avec GPU AMD - modèle 32B (max qualité)
 	@echo "$(BLUE)🎮 Démarrage avec GPU AMD MAX (qwen2.5:32b)...$(NC)"
 	@echo "$(YELLOW)⚠️  Premier lancement: téléchargement ~18GB$(NC)"
-	docker compose -f docker-compose.amd-max.yml up -d
+	docker compose -f docker/compose/docker-compose.amd-max.yml up -d
 	@echo "$(GREEN)✅ Interface: http://localhost:7860$(NC)"
 
 docker-amd-stop: ## Arrêter les services AMD
-	docker compose -f docker-compose.amd.yml down 2>/dev/null || true
-	docker compose -f docker-compose.amd-max.yml down 2>/dev/null || true
+	docker compose -f docker/compose/docker-compose.amd.yml down 2>/dev/null || true
+	docker compose -f docker/compose/docker-compose.amd-max.yml down 2>/dev/null || true
 
 docker-amd-logs: ## Logs AMD (vérifier détection GPU)
-	docker compose -f docker-compose.amd.yml logs ollama 2>/dev/null || \
-	docker compose -f docker-compose.amd-max.yml logs ollama
+	docker compose -f docker/compose/docker-compose.amd.yml logs ollama 2>/dev/null || \
+	docker compose -f docker/compose/docker-compose.amd-max.yml logs ollama
 
 # ============================================
 # Interface Web

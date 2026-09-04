@@ -14,7 +14,7 @@ services:
     image: ollama/ollama:latest
     container_name: promptforge-ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama-data:/root/.ollama
     restart: unless-stopped
@@ -47,22 +47,22 @@ services:
   # Interface Web PromptForge
   promptforge-web:
     build:
-      context: .
-      dockerfile: Dockerfile.web
+      context: ../..
+      dockerfile: docker/Dockerfile.web
     container_name: promptforge-web
     depends_on:
       ollama:
         condition: service_healthy
     ports:
-      - "7860:7860"
+      - "127.0.0.1:7860:7860"
     volumes:
       # IMPORTANT: ./data contient la BDD ET les projets créés via l'interface
-      - ./data:/data
+      - ../../data:/data
       # Projets pré-existants (exemples) - lecture seule
-      - ./projects:/app/example-projects:ro
+      - ../../projects:/app/example-projects:ro
       # === SCANNER : Monte le dossier parent automatiquement ===
       # Par défaut ../ = dossier parent (là où tu as cloné promptforge)
-      - ${HOSTFS_PATH:-../}:/hostfs:ro
+      - ${HOSTFS_PATH:-../../..}:/hostfs:ro
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=phi4-mini
@@ -71,15 +71,15 @@ services:
   # PromptForge CLI (interactif)
   promptforge:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: docker/Dockerfile
     container_name: promptforge-app
     depends_on:
       ollama:
         condition: service_healthy
     volumes:
-      - ./data:/data
-      - ./projects:/app/example-projects:ro
+      - ../../data:/data
+      - ../../projects:/app/example-projects:ro
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=phi4-mini

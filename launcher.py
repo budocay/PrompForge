@@ -68,32 +68,32 @@ RECOMMENDED_MODELS = {
 # Mapping des docker-compose par configuration
 DOCKER_COMPOSE_OPTIONS = {
     "nvidia": {
-        "file": "docker-compose.yml",
+        "file": "docker/compose/docker-compose.yml",
         "label": "NVIDIA (Docker)",
         "description": "GPU NVIDIA 8GB+ - qwen3:8b (meilleur raisonnement)"
     },
     "win-nvidia-native": {
-        "file": "docker-compose.win-nvidia.yml",
+        "file": "docker/compose/docker-compose.win-nvidia.yml",
         "label": "Windows NVIDIA (Ollama natif)",
         "description": "Si conflit de port: utilise Ollama natif Windows"
     },
     "win-amd": {
-        "file": "docker-compose.win-amd.yml",
+        "file": "docker/compose/docker-compose.win-amd.yml",
         "label": "Windows + AMD (Ollama natif)",
         "description": "Pour Windows avec GPU AMD - Ollama tourne en natif"
     },
     "linux-amd": {
-        "file": "docker-compose.amd.yml",
+        "file": "docker/compose/docker-compose.amd.yml",
         "label": "Linux + AMD",
         "description": "Pour Linux avec GPU AMD 12GB+ - qwen3:14b"
     },
     "linux-amd-max": {
-        "file": "docker-compose.amd-max.yml",
+        "file": "docker/compose/docker-compose.amd-max.yml",
         "label": "Linux + AMD MAX (32B)",
         "description": "Pour Linux avec GPU AMD 20GB+ - qwen3:32b"
     },
     "cpu": {
-        "file": "docker-compose.cpu.yml",
+        "file": "docker/compose/docker-compose.cpu.yml",
         "label": "CPU uniquement",
         "description": "Sans GPU - phi4-mini (Microsoft, optimise CPU, 8GB+ RAM)"
     }
