@@ -369,3 +369,109 @@ class TestEndToEndWithContext:
         prompt = "trouve des mots clés pour mon site e-commerce"
         domain = detect_domain(prompt)
         assert domain == "seo"
+
+
+class TestProfilesUiDomainParity:
+    """Parité entre l'adapter d'interface et le domaine (F-022 bloc 2).
+
+    Ces tests existent parce que la divergence a réellement eu lieu : trois
+    tarifs et une fenêtre de contexte affichés par `web/profiles_ui.py`
+    contredisaient `MODEL_PRICING`, et l'un des libellés avait été corrigé à la
+    main sans que la source le soit.
+    """
+
+    def test_profile_descriptions_cover_exactly_domain_profiles(self):
+        """Les clés de PROFILE_DESCRIPTIONS sont celles de list_profiles()."""
+        from promptforge.profiles import list_profiles
+        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS
+
+        assert set(PROFILE_DESCRIPTIONS) == set(list_profiles())
+
+    def test_profile_details_cover_exactly_domain_profiles(self):
+        """Les clés du panneau de détail sont celles de list_profiles()."""
+        from promptforge.profiles import list_profiles
+        from promptforge.web.profiles_ui import PROFILE_DETAILS
+
+        assert set(PROFILE_DETAILS) == set(list_profiles())
+
+    def test_domain_expertise_covers_exactly_target_model(self):
+        """DOMAIN_EXPERTISE couvre exactement TargetModel, ni plus ni moins.
+
+        Un membre manquant provoque un KeyError au runtime dans
+        `generate_recommendation()` ; un membre en trop signale une
+        énumération désynchronisée du domaine.
+        """
+        from promptforge.profiles import TargetModel
+        from promptforge.web.recommendations import DOMAIN_EXPERTISE
+
+        assert set(DOMAIN_EXPERTISE) == set(TargetModel)
+
+    def test_profile_label_price_comes_from_model_pricing(self):
+        """Le tarif du libellé est composé depuis MODEL_PRICING, pas recopié."""
+        from promptforge.profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
+        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS, get_profile_label
+
+        for name in PROFILE_DESCRIPTIONS:
+            target = PRESET_PROFILES[name].target_model
+            if target is TargetModel.UNIVERSAL:
+                # Moyenne synthétique : aucun tarif affiché (D-032).
+                continue
+            pricing = MODEL_PRICING[target]
+            label = get_profile_label(name)
+            expected = f"(${pricing.input_price:g}/${pricing.output_price:g})"
+            assert label.endswith(expected), f"{name}: {label!r} n'expose pas {expected!r}"
+
+    def test_profile_info_context_window_comes_from_model_pricing(self):
+        """La fenêtre de contexte affichée est celle du domaine."""
+        from promptforge.profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
+        from promptforge.web.profiles_ui import PROFILE_DETAILS, get_profile_info
+
+        for name in PROFILE_DETAILS:
+            target = PRESET_PROFILES[name].target_model
+            if target is TargetModel.UNIVERSAL:
+                continue
+            window = MODEL_PRICING[target].context_window
+            if window >= 1_000_000 and window % 1_000_000 == 0:
+                expected = f"- Contexte: {window // 1_000_000}M tokens"
+            else:
+                expected = f"- Contexte: {window // 1_000}K tokens"
+            assert expected in get_profile_info(name), f"{name}: attendu {expected!r}"
+
+    def test_profile_info_reports_pricing_provenance(self):
+        """Une valeur sans source officielle est signalée comme telle."""
+        from promptforge.profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
+        from promptforge.web.profiles_ui import PROFILE_DETAILS, get_profile_info
+
+        for name in PROFILE_DETAILS:
+            target = PRESET_PROFILES[name].target_model
+            if target is TargetModel.UNIVERSAL:
+                continue
+            info = get_profile_info(name)
+            if MODEL_PRICING[target].source_url:
+                assert MODEL_PRICING[target].source_url in info, name
+            else:
+                assert "non confirmé" in info, name
+
+    def test_unknown_profile_label_and_info_do_not_invent_a_price(self):
+        """Profil inconnu : aucun tarif inventé, aucune exception."""
+        from promptforge.web.profiles_ui import get_profile_info, get_profile_label
+
+        assert get_profile_label("profil-inexistant") == "profil-inexistant"
+        info = get_profile_info("profil-inexistant")
+        assert "$" not in info
+
+    def test_recommendation_iterates_over_model_pricing(self):
+        """`generate_recommendation()` couvre toutes les entrées de MODEL_PRICING."""
+        from promptforge.profiles import MODEL_PRICING
+        from promptforge.web.recommendations import generate_recommendation
+
+        rendered = generate_recommendation(
+            formatted_prompt="<task>Revue de code</task>",
+            task_type="code",
+            ollama_model=None,
+            domain_override="code",
+        )
+        assert isinstance(rendered, str) and rendered
+        # Le tableau n'affiche que le top 5 : on vérifie qu'aucun modèle du
+        # domaine ne fait échouer le rendu (KeyError sur une entrée manquante).
+        assert len(MODEL_PRICING) >= 5

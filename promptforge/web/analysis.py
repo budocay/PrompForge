@@ -12,6 +12,7 @@ Aucun chiffre n'est inventé. Voir RESEARCH_SOURCES.md pour les sources.
 
 import re
 from ..tokens import estimate_tokens
+from ..profiles import MODEL_PRICING, TargetModel
 from .template_helpers import TEMPLATE_INFO
 
 
@@ -449,8 +450,9 @@ def compare_prompts(raw_prompt: str, formatted_prompt: str) -> str:
     # Coût tokens supplémentaires
     extra_tokens = formatted_analysis['token_count'] - raw_analysis['token_count']
     if extra_tokens > 0:
-        # Estimation coût avec Claude Sonnet ($3/$15 per M)
-        extra_cost = extra_tokens * 0.000003
+        # Tarif lu dans le domaine, jamais recopié ici (F-022 bloc 2).
+        sonnet_input_price = MODEL_PRICING[TargetModel.CLAUDE_SONNET_4_5].input_price
+        extra_cost = extra_tokens * sonnet_input_price / 1_000_000
         lines.append(f"\n**Tokens supplémentaires:** +{extra_tokens} (~${extra_cost:.6f} par requête avec Sonnet)")
 
     # ==========================================================================

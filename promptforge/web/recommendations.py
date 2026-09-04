@@ -85,19 +85,31 @@ OLLAMA_MODELS_INFO = {
     'qwen3:4b': {'size': '4B', 'reformat_score': 68, 'tier': 'cpu', 'note': 'Qwen - suivi XML limité'},
 }
 
+def _context_of(model: TargetModel) -> str:
+    """Fenêtre de contexte lisible, composée depuis MODEL_PRICING.
+
+    Aucune fenêtre de contexte n'est écrite en dur dans le package web
+    (F-022 bloc 2) : elle est lue dans le domaine au moment du rendu.
+    """
+    window = MODEL_PRICING[model].context_window
+    if window >= 1_000_000 and window % 1_000_000 == 0:
+        return f"{window // 1_000_000}M"
+    return f"{window // 1_000}K"
+
+
 # Domain expertise scores by model
 DOMAIN_EXPERTISE = {
     TargetModel.CLAUDE_OPUS_4_5: {
         'code': (98, "SWE-bench 80.9% (leader)"),
-        'legal': (92, "ASL-3 safety + 200K contexte"),
+        'legal': (92, f"ASL-3 safety + {_context_of(TargetModel.CLAUDE_OPUS_4_5)} contexte"),
         'finance': (90, "ASL-3 safety filters"),
         'medical': (75, "Prudent, HealthBench < GPT-5"),
         'creative': (82, "Style structuré"),
-        'research': (88, "200K contexte"),
+        'research': (88, f"{_context_of(TargetModel.CLAUDE_OPUS_4_5)} contexte"),
         'data': (85, "Analyse structurée"),
         'math': (85, "AIME ~85%"),
         'image': (60, "Prompts seulement"),
-        'document': (92, "200K tokens"),
+        'document': (92, f"{_context_of(TargetModel.CLAUDE_OPUS_4_5)} tokens"),
         'general': (88, "Polyvalent"),
         # Nouveaux domaines métiers
         'seo': (85, "Analyse structurée, recommandations précises"),
@@ -109,7 +121,7 @@ DOMAIN_EXPERTISE = {
     },
     TargetModel.CLAUDE_SONNET_4_5: {
         'code': (95, "SWE-bench 77.2%"),
-        'legal': (88, "200K contexte"),
+        'legal': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_4_5)} contexte"),
         'finance': (86, "Bon ratio Q/P"),
         'medical': (72, "Correct"),
         'creative': (80, "Style structuré"),
@@ -117,7 +129,7 @@ DOMAIN_EXPERTISE = {
         'data': (82, "Solide"),
         'math': (83, "AIME 87%"),
         'image': (58, "Prompts seulement"),
-        'document': (88, "200K tokens"),
+        'document': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_4_5)} tokens"),
         'general': (85, "Meilleur Q/P Claude"),
         # Nouveaux domaines métiers
         'seo': (82, "Bon équilibre qualité/coût"),
@@ -157,7 +169,7 @@ DOMAIN_EXPERTISE = {
         'data': (88, "Multimodal"),
         'math': (96, "AIME 94.6%"),
         'image': (95, "DALL-E 3 intégré!"),
-        'document': (82, "128K tokens"),
+        'document': (82, f"{_context_of(TargetModel.GPT_5_1)} tokens"),
         'general': (93, "Polyvalent"),
         # Nouveaux domaines métiers
         'seo': (90, "Excellent pour keyword research"),
@@ -197,7 +209,7 @@ DOMAIN_EXPERTISE = {
         'data': (90, "Multi-étapes"),
         'math': (100, "AIME 100% (tools)"),
         'image': (90, "DALL-E 3++"),
-        'document': (85, "128K approfondi"),
+        'document': (85, f"{_context_of(TargetModel.GPT_5_PRO)} approfondi"),
         'general': (91, "Premium"),
         # Nouveaux domaines métiers
         'seo': (88, "Analyse approfondie"),
@@ -209,15 +221,15 @@ DOMAIN_EXPERTISE = {
     },
     TargetModel.GEMINI_3_PRO: {
         'code': (88, "SWE-bench 76.2%"),
-        'legal': (92, "1M tokens!"),
-        'finance': (85, "1M contexte"),
+        'legal': (92, f"{_context_of(TargetModel.GEMINI_3_PRO)} tokens!"),
+        'finance': (85, f"{_context_of(TargetModel.GEMINI_3_PRO)} contexte"),
         'medical': (78, "Bon"),
         'creative': (83, "Interfaces créatives"),
         'research': (96, "GPQA 91.9% leader!"),
-        'data': (94, "1M tokens"),
+        'data': (94, f"{_context_of(TargetModel.GEMINI_3_PRO)} tokens"),
         'math': (95, "AIME 95-100%"),
         'image': (75, "Imagen 3 via API"),
-        'document': (98, "🏆 1M tokens!"),
+        'document': (98, f"🏆 {_context_of(TargetModel.GEMINI_3_PRO)} tokens!"),
         'general': (89, "Long contexte"),
         # Nouveaux domaines métiers
         'seo': (85, "Analyse de grands sites"),
@@ -229,15 +241,15 @@ DOMAIN_EXPERTISE = {
     },
     TargetModel.GEMINI_3_FLASH: {
         'code': (68, "Prototypage"),
-        'legal': (65, "1M ctx"),
+        'legal': (65, f"{_context_of(TargetModel.GEMINI_3_FLASH)} ctx"),
         'finance': (63, "Basique"),
         'medical': (58, "Non recommandé"),
         'creative': (72, "Rapide"),
         'research': (70, "Grand ctx"),
-        'data': (75, "1M tokens"),
+        'data': (75, f"{_context_of(TargetModel.GEMINI_3_FLASH)} tokens"),
         'math': (70, "Basiques"),
         'image': (65, "Imagen via API"),
-        'document': (85, "1M rapide"),
+        'document': (85, f"{_context_of(TargetModel.GEMINI_3_FLASH)} rapide"),
         'general': (70, "Économique"),
         # Nouveaux domaines métiers
         'seo': (68, "Tâches rapides"),
@@ -375,8 +387,9 @@ def generate_recommendation(
 
     # Calculate scores for all models
     all_models = []
-    for model in TargetModel:
-        pricing = MODEL_PRICING[model]
+    # Itère sur MODEL_PRICING, pas sur TargetModel : un adapter d'interface
+    # n'énumère pas exhaustivement une énumération du domaine (F-022 bloc 2).
+    for model, pricing in MODEL_PRICING.items():
         cost = pricing.estimate_cost(input_tokens, output_tokens)
 
         expertise = DOMAIN_EXPERTISE[model]
@@ -431,7 +444,11 @@ def generate_recommendation(
         lines.append(f"| **{ollama_info['name']}** | {ollama_info['size']} | {score_icon} {score}% ({verdict}) | {tier_labels.get(ollama_info['tier'], '❓')} | **$0** |")
         lines.append(f"\n📝 *{ollama_info['note']}*")
 
-        cloud_cost = input_tokens * 0.000003 + output_tokens * 0.000015
+        # Référence cloud : tarif lu dans le domaine, jamais recopié ici
+        # (F-022 bloc 2).
+        cloud_cost = MODEL_PRICING[TargetModel.CLAUDE_SONNET_4_5].estimate_cost(
+            input_tokens, output_tokens
+        )
         lines.append(f"\n💰 **Économie vs Cloud:** ${cloud_cost * 1000:.2f} économisés sur 1000 reformatages")
 
     # Cloud models section
@@ -494,13 +511,20 @@ def generate_recommendation(
     # Domain tips
     domain_tips = {
         'code': "💡 Pour du code complexe, Opus 4.5 vaut le coup.",
-        'legal': "💡 Gemini 3 Pro peut analyser des dossiers complets (1M tokens).",
+        'legal': (
+            f"💡 Gemini 3 Pro peut analyser des dossiers complets "
+            f"({_context_of(TargetModel.GEMINI_3_PRO)} tokens)."
+        ),
         'medical': "💡 GPT-5 a le moins d'hallucinations (-45%).",
         'finance': "💡 Claude a des safety filters ASL-3.",
         'research': "💡 Gemini 3 Pro (GPQA 91.9%) excelle en PhD-level.",
         'math': "💡 GPT-5 Pro atteint 100% sur AIME 2025.",
         'image': "🎨 GPT-5 avec DALL-E intégré génère directement.",
-        'document': "📄 Gemini 3 Pro (1M tokens) > Claude (200K) > GPT (128K).",
+        'document': (
+            f"📄 Gemini 3 Pro ({_context_of(TargetModel.GEMINI_3_PRO)}) > "
+            f"Claude ({_context_of(TargetModel.CLAUDE_OPUS_4_5)}) > "
+            f"GPT ({_context_of(TargetModel.GPT_5_1)})."
+        ),
         'general': "💡 GPT-5.1 offre le meilleur équilibre.",
     }
     lines.append(f"\n{domain_tips.get(domain, domain_tips['general'])}")
