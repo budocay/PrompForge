@@ -22,6 +22,16 @@ import json
 import argparse
 from pathlib import Path
 
+# `detect_gpu()` vivait ici en 45 lignes, sans branche Darwin : sur macOS elle
+# retombait silencieusement sur `cpu` (D-018), donc sur un Ollama conteneurise
+# sans acces Metal. Elle est supprimee au profit de `promptforge/hardware.py`,
+# qui mesure. Le chargement passe par `scripts/core_loader.py`, qui documente
+# pourquoi il se fait par chemin plutot que par `import promptforge`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from core_loader import compose_selection, load_core  # noqa: E402
+
+CORE = load_core()
+
 # Configurations Docker Compose disponibles
 #
 # `default` est le chemin par defaut de DEC-010 : seule l'interface tourne en
@@ -87,63 +97,54 @@ def get_project_root():
     """Retourne le chemin racine du projet."""
     return Path(__file__).parent.parent
 
-def detect_gpu():
-    """Détecte le type de GPU disponible."""
-    try:
-        # Vérifier NVIDIA
-        result = subprocess.run(
-            ["nvidia-smi"],
-            capture_output=True,
-            timeout=5
+def detect_config():
+    """Rend la cle de compose deduite du materiel reellement mesure.
+
+    Ne devine plus un fabricant : `detect_hardware()` mesure, et dit ce qu'elle
+    n'a pas pu mesurer. Quand rien n'est mesurable, ou quand aucune variante
+    GPU n'a de sens (macOS, D-020), on rend `default` — le chemin de DEC-010,
+    jamais `cpu` par depit.
+
+    La regle de correspondance est celle de `core_loader.compose_selection()`,
+    partagee avec `launcher.py` : deux tables separees redivergeraient.
+    """
+    if not CORE.available:
+        print_status(
+            f"Mesure materielle indisponible ({CORE.error}) : configuration "
+            f"'{DEFAULT_CONFIG}' retenue", "warning"
         )
-        if result.returncode == 0:
-            return "nvidia"
-    except:
-        pass
-    
-    try:
-        # Vérifier AMD (Linux)
-        result = subprocess.run(
-            ["lspci"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if "amd" in result.stdout.lower() or "radeon" in result.stdout.lower():
-            return "linux-amd"
-    except:
-        pass
-    
-    # Vérifier AMD sur Windows
-    try:
-        import platform
-        if platform.system() == "Windows":
-            result = subprocess.run(
-                ["powershell", "-Command", "Get-WmiObject Win32_VideoController | Select-Object -ExpandProperty Name"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if "amd" in result.stdout.lower() or "radeon" in result.stdout.lower():
-                return "win-amd"
-    except:
-        pass
-    
-    return "cpu"
+        return DEFAULT_CONFIG
+
+    profile = CORE.detect_hardware()
+    selection = compose_selection(profile.system, profile.gpu_vendor)
+    variante = selection["gpu_variant"]
+
+    memoire = profile.available_memory_bytes
+    lisible = f"{memoire / (1024 ** 3):.1f} Gio" if memoire else "non mesuree"
+    print_status(
+        f"Materiel mesure : {profile.system} / GPU "
+        f"{profile.gpu_vendor or 'non mesure'} / memoire {lisible}", "info"
+    )
+    for note in profile.notes:
+        print_status(f"  non mesure : {note}", "warning")
+
+    return variante or selection["default"]
+
 
 def get_compose_file(config=None):
     """Retourne le fichier docker-compose approprié.
 
     Sans `-c`, on ne devine plus : on prend le chemin par defaut de DEC-010,
-    identique sur les trois systemes. `detect_gpu()` n'a aucune branche Darwin
-    (D-018) et retombait silencieusement sur `cpu` sur macOS, c'est-a-dire sur
+    identique sur les trois systemes. L'ancienne `detect_gpu()` n'avait aucune
+    branche Darwin (D-018) et retombait silencieusement sur `cpu` sur macOS,
+    c'est-a-dire sur
     un Ollama conteneurise sans acces Metal — exactement ce que DEC-010
     remplace. La detection reste disponible, mais seulement si on la demande.
     """
     if config is None:
         config = DEFAULT_CONFIG
     elif config == AUTO_CONFIG:
-        config = detect_gpu()
+        config = detect_config()
         print_status(f"Detection materielle : configuration '{config}'", "info")
 
     if config not in COMPOSE_FILES:

@@ -14,11 +14,14 @@ d'un fichier ; il ne sait rien des commandes qui le consomment.
 import http.server
 import importlib.util
 import json as _json
+import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -224,6 +227,98 @@ def load_script(name):
     return load_script_at(BASE_DIR / "scripts" / f"{name}.py", f"_seam_{name}")
 
 
+def code_without_comments(path):
+    """Le source d'un fichier prive de ses lignes de commentaire entieres.
+
+    Les commentaires expliquent ce qui a ete supprime et pourquoi : les
+    inclure dans une assertion « ce symbole n'existe plus » ferait echouer le
+    test sur sa propre justification, et pousserait a effacer l'explication.
+    """
+    lignes = Path(path).read_text(encoding="utf-8").splitlines()
+    return "\n".join(l for l in lignes if not l.lstrip().startswith("#"))
+
+
+def load_core_bridge(package_dir=None):
+    """Charge `scripts/core_loader.py` et rend son pont vers le coeur.
+
+    Les tests recalculent la recommandation par ce chemin, independamment du
+    launcher : comparer le launcher a lui-meme ne prouverait rien.
+    """
+    module = load_script("core_loader")
+    return module.load_core(package_dir)
+
+
+def python39_interpreter():
+    """Un interpreteur Python 3.9 reel, ou `None`.
+
+    D-061 : `launcher.py` tourne sous le Python systeme (3.9.6 sur la machine
+    de reference), pas sous le venv du projet (3.14). Verifier la
+    compatibilite 3.9 par lecture de source serait une affirmation ; on
+    execute.
+    """
+    for candidat in ("/usr/bin/python3", "python3.9"):
+        try:
+            sortie = subprocess.run(
+                [candidat, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if sortie.returncode == 0 and sortie.stdout.strip() == "3.9":
+            return candidat
+    return None
+
+
+def extract_launcher_script(module):
+    """Le contenu du bloc <script> servi par le launcher."""
+    trouve = re.search(r"<script>(.*?)</script>", module.HTML_TEMPLATE, re.S)
+    assert trouve, "le gabarit HTML ne contient plus de bloc <script>"
+    return trouve.group(1)
+
+
+def render_launcher_ui(script, payload):
+    """Execute `updateUI(payload)` dans Node et rend l'etat des elements.
+
+    Un `HTTP 200` sur `/` ne prouve rien : il a deja ete pris pour une preuve
+    que l'interface fonctionnait, alors que le bloc <script> entier ne se
+    compilait pas. Ici le JavaScript reellement servi est reellement execute,
+    sur le payload reellement rendu, et on lit ce qui s'affiche.
+    """
+    harnais = """
+const elements = {};
+function el(id) {
+  if (!elements[id]) elements[id] = {id: id, textContent: '', innerHTML: '',
+    className: '', title: '', value: '', disabled: false, style: {}};
+  return elements[id];
+}
+const document = { getElementById: function (id) { return el(id); },
+                   addEventListener: function () {} };
+const console = { error: function () {}, log: function () {} };
+function setInterval() {}
+async function fetch() { throw new Error('pas de reseau dans ce harnais'); }
+function confirm() { return false; }
+const window = { open: function () {} };
+"""
+    queue = "\nupdateUI(" + _json.dumps(payload) + ");\n"
+    queue += "process.stdout.write(JSON.stringify(elements));\n"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                     encoding="utf-8") as fichier:
+        fichier.write(harnais + script + queue)
+        chemin = fichier.name
+    try:
+        sortie = subprocess.run(["node", chemin], capture_output=True, text=True,
+                                timeout=60)
+    finally:
+        os.unlink(chemin)
+
+    assert sortie.returncode == 0, (
+        "le JavaScript servi par le launcher n'a pas pu s'executer :\n"
+        + sortie.stderr[:2000]
+    )
+    return _json.loads(sortie.stdout)
+
+
 class RecordingSubprocess:
     """Faux module `subprocess` : enregistre les argv au lieu de les executer.
 
@@ -354,14 +449,33 @@ class TestLauncherConfig:
         for option in expected_options:
             assert f'"{option}"' in content, f"Option {option} manquante dans launcher"
 
-    def test_launcher_has_recommended_models(self):
-        """Vérifie que le launcher a les modèles recommandés."""
-        launcher = Path(__file__).parent.parent / 'launcher.py'
-        content = launcher.read_text()
-        
-        # Doit avoir des modèles recommandés pour chaque type de GPU
-        assert 'qwen3' in content.lower() or 'phi4' in content.lower()
-        assert 'RECOMMENDED_MODELS' in content
+    def test_launcher_carries_no_model_catalog_of_its_own(self):
+        """Remplace `test_launcher_has_recommended_models`, devenu faux.
+
+        L'ancien test exigeait `RECOMMENDED_MODELS` dans le fichier, c'est-a-dire
+        exactement ce que D-019 et D-022 reprochent au launcher : une table qui
+        mappe un fabricant vers un tag et annonce des seuils de VRAM que rien ne
+        mesure. Le verrou est retourne : la table ne doit PLUS exister, et aucun
+        tag du catalogue ne doit apparaitre en litteral dans le fichier.
+
+        Il est reecrit dans le meme commit que la suppression : un verrou qu'on
+        laisse rougir « le temps de », c'est une suite de tests qu'on apprend a
+        ignorer.
+        """
+        contenu = code_without_comments(BASE_DIR / "launcher.py")
+        assert "RECOMMENDED_MODELS" not in contenu, (
+            "la table par fabricant est revenue : elle annonce des seuils de "
+            "VRAM que rien ne mesure (D-019)"
+        )
+
+        pont = load_core_bridge()
+        assert pont.available, f"catalogue du coeur illisible : {pont.error}"
+
+        residus = [tag for tag in pont.known_tags() if tag in contenu]
+        assert not residus, (
+            f"tags du catalogue recopies dans launcher.py : {residus}. "
+            "Le catalogue est unique (DEC-003) ; une copie diverge (D-022)."
+        )
 
 
 class TestDockerfiles:
@@ -1260,3 +1374,566 @@ class TestComposeTableIsNotDuplicated:
         for cle, info in module.DOCKER_COMPOSE_OPTIONS.items():
             assert payload["compose_options"][cle]["label"] == info["label"]
             assert payload["compose_options"][cle]["description"] == info["description"]
+
+
+# ======================================================================
+# Le launcher consomme le catalogue et la mesure, il ne les recopie pas
+# ======================================================================
+#
+# R-007 bloc 4 et R-002 bloc 3. `launcher.py` portait trente et un litteraux
+# de tag Ollama (D-059) et sa propre `detect_gpu()` (D-018), dupliquee dans
+# `scripts/build.py` sans branche Darwin. Les deux sources uniques vivent
+# desormais dans le coeur ; ces tests verrouillent le fait qu'aucune copie ne
+# revienne, et surtout que ce qui est SERVI vient bien de la.
+
+
+class TestNoHardwareDetectionSurvives:
+    """Les deux `detect_gpu()` ont disparu, pas une seule des deux."""
+
+    def test_launcher_has_no_detect_gpu_left(self):
+        contenu = code_without_comments(BASE_DIR / "launcher.py")
+        assert "def detect_gpu(" not in contenu
+
+    def test_build_script_has_no_detect_gpu_left(self):
+        contenu = code_without_comments(BASE_DIR / "scripts" / "build.py")
+        assert "def detect_gpu(" not in contenu, (
+            "la copie sans branche Darwin de D-018 est revenue"
+        )
+
+    def test_build_script_no_longer_falls_back_to_cpu_on_macos(self):
+        """D-018, cote consequence : macOS retombait en silence sur `cpu`.
+
+        Le compose `cpu` conteneurise Ollama, qui n'a pas acces a Metal sous
+        Docker Desktop (D-020). L'ancienne detection choisissait donc le pire
+        chemin sur la plateforme du dev, sans rien dire.
+        """
+        module = load_script("build")
+        selection = module.compose_selection("macos", "apple")
+        assert selection["gpu_variant"] is None
+        assert selection["options"] == ("default",)
+
+    def test_the_two_compose_mappings_are_one(self):
+        """Un seul mapping materiel -> compose, partage par les deux scripts.
+
+        `detect_gpu()` disparait des deux cotes ; si chacun garde SON mapping,
+        la moitie de D-018 survit et redivergera.
+        """
+        build = load_script("build")
+        launcher = fresh_launcher("_mapping_partage")
+        for systeme, marque in [
+            ("Darwin", "apple"), ("Darwin", None), ("Windows", "nvidia"),
+            ("Windows", "amd"), ("Windows", None), ("Linux", "nvidia"),
+            ("Linux", "amd"), ("Linux", "none"),
+        ]:
+            attendu = build.compose_selection(systeme, marque)
+            launcher.state["os"] = systeme
+            launcher.state["gpu_type"] = marque
+            launcher.select_docker_compose()
+            assert launcher.state["available_compose_files"] == list(attendu["options"])
+            variante = attendu["gpu_variant"]
+            if variante is not None:
+                assert variante in attendu["options"], (
+                    f"{systeme}/{marque} : `build.py -c auto` retiendrait "
+                    f"'{variante}', que le launcher ne propose pas"
+                )
+
+
+class TestServedCatalogComesFromTheCore:
+    """Ce que `/api/status` sert vient du catalogue, entree par entree."""
+
+    def test_the_payload_ships_the_whole_catalog_in_footprint_order(self):
+        module = fresh_launcher("_payload_catalogue")
+        pont = load_core_bridge()
+        payload = module.status_payload()
+
+        attendus = [m.tag for m in pont.models_by_footprint()]
+        assert [entree["tag"] for entree in payload["models"]] == attendus, (
+            "l'ordre servi doit etre celui de l'empreinte memoire (DEC-006)"
+        )
+
+    def test_every_served_figure_matches_the_catalog(self):
+        module = fresh_launcher("_payload_chiffres")
+        pont = load_core_bridge()
+        catalogue = {m.tag: m for m in pont.models_by_footprint()}
+
+        for entree in module.status_payload()["models"]:
+            modele = catalogue[entree["tag"]]
+            assert entree["download_gb"] == round(modele.download_size_gb, 1)
+            assert entree["footprint_gb"] == round(modele.memory_footprint_gb, 1)
+            assert entree["estimated"] is modele.memory_footprint_is_estimated
+            assert entree["source_url"] == modele.source_url
+            assert entree["verified_on"] == modele.verified_on
+
+    def test_the_two_corrected_sizes_are_repercuted(self):
+        """Deux chiffres que le launcher affichait faux, mesures par la veille.
+
+        `llama3.1:70b` pese 43 Go et non 40 ; `gemma3n:e4b` 7,5 Go et non 3.
+        Le second est le plus grave : il figurait au palier « CPU, peu de RAM »,
+        donc l'erreur penalisait exactement ceux qu'elle visait a servir.
+        """
+        module = fresh_launcher("_tailles_corrigees")
+        servis = {e["tag"]: e for e in module.status_payload()["models"]}
+
+        assert servis["llama3.1:70b"]["download_gb"] == 43.0
+        assert servis["gemma3n:e4b"]["download_gb"] == 7.5
+
+        gabarit = module.HTML_TEMPLATE
+        for perime in ("(40GB)", "(3GB)", "(2.5GB)", "(5GB)", "(9GB)", "(20GB)"):
+            assert perime not in gabarit, (
+                f"taille figee '{perime}' encore ecrite dans le HTML"
+            )
+
+    def test_the_html_carries_no_option_of_its_own(self):
+        module = fresh_launcher("_html_sans_option")
+        assert '<option value="qwen' not in module.HTML_TEMPLATE
+        assert "updateModelSelector" in module.HTML_TEMPLATE
+        assert "data.models" in module.HTML_TEMPLATE
+
+    def test_the_quality_disclaimer_is_served_and_rendered(self):
+        """DEC-006 : le tri porte sur la memoire, jamais sur une qualite.
+
+        Le dire dans un commentaire ne suffit pas : l'utilisateur qui lit une
+        liste ordonnee conclut « le premier est le meilleur ». La reserve doit
+        etre dans la page.
+        """
+        module = fresh_launcher("_reserve_qualite")
+        payload = module.status_payload()
+        assert "qualite" in payload["quality_disclaimer"].lower()
+        assert "pas mesuree" in payload["quality_disclaimer"]
+        assert "quality_disclaimer" in module.HTML_TEMPLATE
+        assert "model-disclaimer" in module.HTML_TEMPLATE
+
+
+class TestRecommendationIsMeasuredNotGuessed:
+    """La recommandation servie doit egaler celle du coeur, sur CETTE machine.
+
+    C'est le coeur de R-002 bloc 3 et de D-019 : le launcher affichait
+    « qwen3:8b (Apple Silicon) » sans avoir lu un seul octet de memoire.
+    """
+
+    @staticmethod
+    def _serve(module):
+        serveur = http.server.HTTPServer(("127.0.0.1", 0), module.LauncherHandler)
+        fil = threading.Thread(target=serveur.serve_forever, daemon=True)
+        fil.start()
+        return serveur, fil
+
+    def test_api_status_serves_exactly_what_the_core_recommends(self):
+        pont = load_core_bridge()
+        assert pont.available, f"catalogue du coeur illisible : {pont.error}"
+
+        # Recalcul independant : mesure du materiel puis recommandation, sans
+        # passer par le launcher. Comparer le launcher a lui-meme ne prouverait
+        # rien.
+        profil = pont.detect_hardware()
+        attendue = pont.recommend_for(profil)
+
+        module = fresh_launcher("_reco_mesuree")
+        module.subprocess = DockerStub()
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+        module.detect_hardware()
+
+        serveur, fil = self._serve(module)
+        port = serveur.server_address[1]
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/status", timeout=10
+            ) as reponse:
+                assert reponse.status == 200
+                recu = _json.loads(reponse.read().decode())
+        finally:
+            serveur.shutdown()
+            serveur.server_close()
+            fil.join(timeout=5)
+
+        servie = recu["recommendation"]
+        assert servie is not None, "aucune recommandation servie"
+        assert servie["measured"] is attendue.measured
+
+        if attendue.recommended is None:
+            assert servie["recommended"] is None
+            assert recu["ollama_model"] is None, (
+                "aucun modele ne tient : le launcher ne doit surtout pas en "
+                "proposer un quand meme"
+            )
+        else:
+            assert servie["recommended"]["tag"] == attendue.recommended.tag
+            assert recu["ollama_model"] == attendue.recommended.tag
+            assert servie["maximum"]["tag"] == attendue.maximum.tag
+            assert servie["basis"] == attendue.basis
+            assert servie["margin_gb"] == round(
+                attendue.margin_bytes / (1024 ** 3), 1
+            )
+
+        # La memoire servie est celle qui a ete mesuree, pas une constante.
+        assert recu["hardware"]["available_memory_basis"] == profil.available_memory_basis
+        if profil.available_memory_bytes is None:
+            assert recu["hardware"]["available_memory_gb"] is None
+        else:
+            assert recu["hardware"]["available_memory_gb"] == round(
+                profil.available_memory_bytes / (1024 ** 3), 1
+            )
+
+    def test_forcing_a_gpu_brand_does_not_move_the_recommendation(self):
+        """Forcer la marque ne peut pas changer la memoire de la machine.
+
+        L'ancien code recalculait le modele depuis le fabricant force : forcer
+        « nvidia » sur un Mac faisait apparaitre une recommandation « NVIDIA
+        8GB+ VRAM » sur une machine sans carte NVIDIA.
+        """
+        module = fresh_launcher("_force_marque")
+        module.detect_hardware()
+        avant = module.state["ollama_model"]
+
+        module.state["gpu_type"] = "nvidia"
+        module.select_docker_compose()
+        assert module.state["ollama_model"] == avant
+
+    def test_an_unmeasured_machine_recommends_nothing(self):
+        """Sans mesure, pas de recommandation : surtout pas un repli en dur."""
+        module = fresh_launcher("_sans_mesure")
+        pont = load_core_bridge()
+        catalogue = pont.catalog_module
+
+        profil_muet = pont.hardware_module.HardwareProfile(
+            system="linux",
+            notes=("Memoire totale non mesurable : sonde muette.",),
+        )
+        assert profil_muet.available_memory_bytes is None
+
+        reco = catalogue.recommend(profil_muet.available_memory_bytes)
+        module.state["ollama_model"] = None
+        module.state["recommendation"] = module.recommendation_entry(reco)
+
+        payload = module.status_payload()
+        assert payload["recommendation"]["measured"] is False
+        assert payload["recommendation"]["recommended"] is None
+        assert payload["ollama_model"] is None
+
+
+class TestDegradedModeIsVisible:
+    """D-061 : quand le coeur n'est pas chargeable, l'interface le DIT.
+
+    L'issue (a) — exiger 3.10 et refuser de demarrer — a ete ecartee : le
+    launcher existe pour amorcer une machine nue, ou le seul interpreteur est
+    celui du systeme. L'issue retenue est le chargement par chemin, avec ce
+    mode degrade visible derriere, pour le cas d'un depot incomplet. Ce qui
+    est formellement exclu, c'est le repli muet vers une liste en dur.
+    """
+
+    @staticmethod
+    def _degrade(module, tmp_path):
+        pont = load_script("core_loader").load_core(tmp_path / "absent")
+        assert pont.available is False
+        module.CORE = pont
+        module.state["catalog_available"] = False
+        module.state["catalog_error"] = pont.error
+        return pont
+
+    def test_the_payload_announces_the_failure(self, tmp_path):
+        module = fresh_launcher("_degrade_payload")
+        pont = self._degrade(module, tmp_path)
+        module.detect_hardware()
+
+        payload = module.status_payload()
+        assert payload["catalog_available"] is False
+        assert payload["catalog_error"] == pont.error
+        assert payload["models"] == []
+        assert payload["recommendation"] is None
+        assert payload["ollama_model"] is None, (
+            "un modele par defaut en mode degrade serait le repli muet refuse"
+        )
+
+    def test_no_hardcoded_list_takes_over(self, tmp_path):
+        module = fresh_launcher("_degrade_pas_de_repli")
+        self._degrade(module, tmp_path)
+        module.detect_hardware()
+        assert module.catalog_entries() == []
+        assert module.state["gpu_type"] is None
+
+    def test_the_interface_renders_the_degraded_state(self):
+        module = fresh_launcher("_degrade_html")
+        assert "data.catalog_available === false" in module.HTML_TEMPLATE
+        assert "Catalogue de modeles indisponible" in module.HTML_TEMPLATE
+        assert "catalog_error" in module.HTML_TEMPLATE
+
+    def test_actions_refuse_a_tag_outside_the_catalog(self, tmp_path):
+        """`ollama pull` recoit une chaine venue du reseau : liste blanche."""
+        module = fresh_launcher("_degrade_actions")
+        assert module.CORE.is_known_tag("qwen3:8b") is True
+        assert module.CORE.is_known_tag("modele-invente:1b") is False
+        assert module.CORE.is_known_tag(None) is False
+
+        self._degrade(module, tmp_path)
+        assert module.CORE.is_known_tag("qwen3:8b") is False
+
+
+class TestLauncherListensOnBothLoopbackFamilies:
+    """D-062 et D-037, indissociables : le meme `bind` portait les deux.
+
+    Mesure du 2026-09-07 sur la version precedente :
+        curl http://localhost:7850  -> HTTP 000
+        curl http://127.0.0.1:7850  -> HTTP 200
+    macOS resout `localhost` en `::1` d'abord ; `0.0.0.0` n'ecoute qu'en IPv4.
+    Le launcher imprimait « accessible sur http://localhost:7850 ».
+    """
+
+    def test_the_source_no_longer_binds_every_interface(self):
+        contenu = code_without_comments(BASE_DIR / "launcher.py")
+        assert '"0.0.0.0"' not in contenu, (
+            "D-037 : ce serveur demarre des conteneurs et telecharge des "
+            "modeles ; il n'a rien a faire sur le reseau local"
+        )
+        assert 'LOOPBACK_HOSTS = ("127.0.0.1", "::1")' in contenu
+
+    def test_localhost_and_127_0_0_1_both_answer(self):
+        module = fresh_launcher("_double_pile")
+        module.subprocess = DockerStub()
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+
+        port = free_port()
+        serveurs, fils, servis = module.serve_loopback(port)
+        try:
+            assert "127.0.0.1" in servis
+            adresses = [f"http://127.0.0.1:{port}/api/status",
+                        f"http://localhost:{port}/api/status"]
+            if "::1" in servis:
+                adresses.append(f"http://[::1]:{port}/api/status")
+            for adresse in adresses:
+                with urllib.request.urlopen(adresse, timeout=10) as reponse:
+                    assert reponse.status == 200, adresse
+                    assert _json.loads(reponse.read().decode())["os"]
+        finally:
+            for serveur in serveurs:
+                serveur.shutdown()
+                serveur.server_close()
+            for fil in fils:
+                fil.join(timeout=5)
+
+    def test_nothing_listens_outside_the_loopback(self):
+        """Contrepartie de D-037 : l'adresse routable ne doit pas repondre."""
+        module = fresh_launcher("_pas_de_route")
+        module.subprocess = DockerStub()
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+
+        externe = None
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            adresse = info[4][0]
+            if not adresse.startswith("127."):
+                externe = adresse
+                break
+        if externe is None:
+            pytest.skip("aucune adresse IPv4 routable sur cette machine")
+
+        port = free_port()
+        serveurs, fils, _ = module.serve_loopback(port)
+        try:
+            prise = socket.socket()
+            prise.settimeout(2)
+            code = prise.connect_ex((externe, port))
+            prise.close()
+            assert code != 0, (
+                f"le launcher accepte une connexion sur {externe}:{port} : "
+                "D-037 est de retour"
+            )
+        finally:
+            for serveur in serveurs:
+                serveur.shutdown()
+                serveur.server_close()
+            for fil in fils:
+                fil.join(timeout=5)
+
+
+class TestTheServedJavaScriptActuallyRuns:
+    """Une page qui rend HTTP 200 peut n'executer aucune ligne de son script.
+
+    Constat du 2026-09-07, present des HEAD `4ef64f4` : le bloc <script> servi
+    ne se compilait pas. `HTML_TEMPLATE` est une triple-quote Python NON brute,
+    et une ligne y ecrivait `'Etat d\\'Ollama indetermine'` ; Python mangeait
+    l'echappement et servait une apostrophe nue au navigateur, soit un
+    `SyntaxError` qui tue TOUT le bloc. Aucune fonction de l'interface ne
+    tournait donc : ni `refresh`, ni `updateUI`. La page restait figee sur
+    « Detection... » pendant que `/api/status` rendait 200.
+
+    Ces tests executent le JavaScript reellement servi.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _node_requis(self):
+        if shutil.which("node") is None:
+            pytest.skip("Node absent : execution du JavaScript servi impossible")
+
+    def test_the_script_block_compiles(self):
+        module = fresh_launcher("_js_compile")
+        script = extract_launcher_script(module)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         encoding="utf-8") as fichier:
+            fichier.write(script)
+            chemin = fichier.name
+        try:
+            sortie = subprocess.run(["node", "--check", chemin],
+                                    capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(chemin)
+        assert sortie.returncode == 0, (
+            "le JavaScript servi ne compile pas :\n" + sortie.stderr[:2000]
+        )
+
+    def test_the_page_displays_the_measured_recommendation(self):
+        module = fresh_launcher("_js_rendu")
+        module.detect_hardware()
+        module.select_docker_compose()
+        payload = module.status_payload()
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+
+        reco = payload["recommendation"]
+        assert reco and reco["measured"], "cette machine doit etre mesurable"
+        tag = reco["recommended"]["tag"]
+
+        bloc = rendu["model-recommendation"]["innerHTML"]
+        assert tag in bloc, f"le modele recommande n'apparait pas : {bloc[:200]}"
+        marge = re.search(r"marge ([\d.]+) Gio", bloc)
+        assert marge, f"la marge n'est pas affichee : {bloc[:200]}"
+        assert float(marge.group(1)) == reco["margin_gb"], (
+            "la marge affichee ne correspond pas a la marge calculee"
+        )
+        assert reco["maximum"]["tag"] in bloc, "le choix maximal n'est pas affiche"
+
+        liste = rendu["model-select"]["innerHTML"]
+        assert f'value="{tag}"' in liste and "selected" in liste
+        for entree in payload["models"]:
+            assert f'value="{entree["tag"]}"' in liste, (
+                f"{entree['tag']} absent de la liste rendue"
+            )
+
+        memoire = rendu["memory-value"]["textContent"]
+        assert "Gio" in memoire and "Non mesuree" not in memoire
+
+        assert "pas mesuree" in rendu["model-disclaimer"]["textContent"], (
+            "la reserve DEC-006 doit etre lisible dans la page, pas seulement "
+            "dans le payload"
+        )
+
+    def test_the_page_says_so_when_nothing_is_measured(self):
+        module = fresh_launcher("_js_rendu_degrade")
+        payload = module.status_payload()
+        payload["catalog_available"] = False
+        payload["catalog_error"] = "module du coeur introuvable : /absent"
+        payload["models"] = []
+        payload["recommendation"] = None
+        payload["ollama_model"] = None
+
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+        bloc = rendu["model-recommendation"]["innerHTML"]
+        assert "Catalogue de modeles indisponible" in bloc
+        assert "/absent" in bloc, "le motif doit etre affiche, pas avale"
+        assert "Catalogue indisponible" in rendu["model-select"]["innerHTML"]
+        assert rendu["model-select"]["disabled"] is True
+
+
+class TestLauncherRunsUnderTheSystemPython:
+    """D-061, tranchee et verifiee par execution, pas par lecture.
+
+    `launcher.py` amorce une machine nue : il tourne sous le Python systeme,
+    3.9.6 ici, alors que le paquet exige 3.10. Mesure du 2026-09-07 :
+
+        /usr/bin/python3 -c "import promptforge"
+          -> TypeError: unsupported operand type(s) for |   (security.py:696)
+
+    D'ou le chargement par chemin de `scripts/core_loader.py`. Ce test le
+    verifie de bout en bout sur un vrai 3.9, jusqu'a la recommandation.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _python39(self):
+        interpreteur = python39_interpreter()
+        if interpreteur is None:
+            pytest.skip("aucun Python 3.9 sur cette machine")
+        self.python39 = interpreteur
+
+    def test_importing_the_package_still_fails_under_39(self):
+        """Le motif de tout le montage : il doit rester vrai, ou tomber.
+
+        Le jour ou `import promptforge` passera sous 3.9, ce test rougira et
+        le detour par chemin pourra etre reexamine. Un contournement dont on
+        ne surveille pas la cause devient un dogme.
+        """
+        sortie = subprocess.run(
+            [self.python39, "-c", "import promptforge"],
+            capture_output=True, text=True, cwd=str(BASE_DIR), timeout=60,
+        )
+        assert sortie.returncode != 0, (
+            "`import promptforge` fonctionne desormais sous 3.9 : le "
+            "chargement par chemin (D-061) merite d'etre reexamine"
+        )
+
+    def test_the_launcher_recommends_a_model_under_39(self):
+        programme = (
+            "import importlib.util, json, sys\n"
+            "spec = importlib.util.spec_from_file_location('l', 'launcher.py')\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "module.detect_hardware()\n"
+            "charge = module.status_payload()\n"
+            "print(json.dumps({'python': '%d.%d' % sys.version_info[:2],\n"
+            "                  'catalogue': charge['catalog_available'],\n"
+            "                  'modeles': len(charge['models']),\n"
+            "                  'modele': charge['ollama_model'],\n"
+            "                  'mesure': (charge['recommendation'] or {}).get('measured')}))\n"
+        )
+        sortie = subprocess.run(
+            [self.python39, "-c", programme],
+            capture_output=True, text=True, cwd=str(BASE_DIR), timeout=120,
+        )
+        assert sortie.returncode == 0, (
+            "`launcher.py` ne tourne plus sous le Python systeme :\n"
+            + sortie.stderr[-2000:]
+        )
+        resultat = _json.loads(sortie.stdout.strip().splitlines()[-1])
+        assert resultat["python"] == "3.9"
+        assert resultat["catalogue"] is True, (
+            "sous 3.9, le catalogue doit etre CHARGE, pas degrade : sinon le "
+            "mode degrade devient le mode nominal"
+        )
+        assert resultat["modeles"] > 0
+        assert resultat["mesure"] is True
+        assert resultat["modele"], "aucun modele recommande sous 3.9"
+
+    def test_the_bridge_registers_modules_before_executing_them(self):
+        """Le piege mesure de `core_loader`, verrouille pour de bon.
+
+        Sous 3.9, `dataclasses` resout les annotations differees en lisant
+        `sys.modules[cls.__module__].__dict__` sans verifier la cle. Omettre
+        l'inscription prealable donne, sur les deux modules du coeur :
+        `AttributeError: 'NoneType' object has no attribute '__dict__'`.
+        Sous 3.14 la meme omission passe : le defaut n'apparait que sur la
+        version qui compte.
+        """
+        contenu = (BASE_DIR / "scripts" / "core_loader.py").read_text(encoding="utf-8")
+        assert "sys.modules[spec.name] = module" in contenu
+
+        programme = (
+            "import importlib.util, sys\n"
+            "spec = importlib.util.spec_from_file_location("
+            "'nu', 'promptforge/models_catalog.py')\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "try:\n"
+            "    spec.loader.exec_module(module)\n"
+            "    print('SANS_INSCRIPTION_OK')\n"
+            "except AttributeError as exc:\n"
+            "    print('SANS_INSCRIPTION_ECHOUE')\n"
+        )
+        sortie = subprocess.run(
+            [self.python39, "-c", programme],
+            capture_output=True, text=True, cwd=str(BASE_DIR), timeout=60,
+        )
+        assert "SANS_INSCRIPTION_ECHOUE" in sortie.stdout, (
+            "la recette naive passe desormais sous 3.9 ; verifier que "
+            "`core_loader` reste correct avant de la simplifier"
+        )

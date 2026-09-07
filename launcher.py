@@ -12,14 +12,36 @@ import json
 import threading
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
 import urllib.request
 import urllib.error
-import re
 
 # Port du launcher
 LAUNCHER_PORT = 7850
 PROMPTFORGE_PORT = 7860
 OLLAMA_PORT = 11434
+
+# ---------------------------------------------------------------------------
+# Le launcher ne connait ni les modeles, ni le materiel : il les demande
+# ---------------------------------------------------------------------------
+# Il portait trente et un litteraux de tag Ollama (D-059) et sa propre
+# `detect_gpu()` (D-018), qui annoncait des seuils de VRAM que rien ne mesurait
+# (D-019). Les deux sources uniques sont desormais dans le coeur :
+# `promptforge/models_catalog.py` (DEC-003) et `promptforge/hardware.py`
+# (DEC-001). Elles sont chargees par `scripts/core_loader.py`, qui documente
+# pourquoi le chargement se fait par chemin plutot que par `import promptforge`
+# (D-061 : ce fichier tourne sous le Python systeme, 3.9.6 ici).
+#
+# Rien n'est recopie ici. Si le pont est indisponible, l'interface le dit :
+# aucune liste en dur ne prend le relais, sinon D-022 renaitrait a l'endroit
+# meme ou on la ferme.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent / "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from core_loader import compose_selection, load_core  # noqa: E402
+
+CORE = load_core()
 
 # ---------------------------------------------------------------------------
 # Trois etats de service, jamais deux
@@ -82,9 +104,17 @@ state = {
     "ollama_status": STATUS_UNKNOWN,  # up | down | unknown
     "promptforge_running": False,
     "promptforge_status": STATUS_UNKNOWN,  # up | down | unknown
-    "ollama_model": "qwen3:8b",  # Qwen3 = meilleur raisonnement + post-traitement XML
+    # Aucun modele par defaut : tant que la memoire n'est pas mesuree, il n'y
+    # a rien a recommander. Ecrire un tag ici serait presenter un defaut cable
+    # comme une recommandation, ce que D-019 reprochait a l'ancien code.
+    "ollama_model": None,
     "installed_models": [],  # Liste des modèles Ollama installés
     "model_installed": False,  # True si le modèle recommandé est installé
+    # Mesure materielle (DEC-001) et recommandation (DEC-003/DEC-006).
+    "hardware": None,        # Instantane serialisable de HardwareProfile
+    "recommendation": None,  # Instantane serialisable de Recommendation
+    "catalog_available": CORE.available,
+    "catalog_error": CORE.error,
     "docker_compose_file": None,  # Fichier docker-compose sélectionné
     "available_compose_files": [],  # Fichiers disponibles
     "docker_images": {},  # État des images Docker {name: {exists, created, size}}
@@ -98,27 +128,68 @@ state = {
     "action_in_progress": False
 }
 
-# Modèles recommandés selon le type de GPU
-# IMPORTANT: Les petits modèles (4b, 8b) suivent moins bien les instructions XML
-# mais sont nécessaires pour les configs limitées
-RECOMMENDED_MODELS = {
-    "amd": {
-        "model": "qwen3:14b",
-        "reason": "AMD (12GB+ VRAM) - qwen3:14b pour meilleur suivi XML"
-    },
-    "nvidia": {
-        "model": "qwen3:8b",  # Meilleur raisonnement + post-traitement XML
-        "reason": "NVIDIA (8GB+ VRAM) - qwen3:8b (meilleur raisonnement)"
-    },
-    "cpu": {
-        "model": "phi4-mini",  # Optimisé CPU par Microsoft
-        "reason": "CPU - phi4-mini (excellent rapport qualite/vitesse sur CPU)"
-    },
-    "apple": {
-        "model": "qwen3:8b",
-        "reason": "Apple Silicon - qwen3:8b via Metal (meilleur raisonnement)"
+# ---------------------------------------------------------------------------
+# Presentation du catalogue, jamais une copie du catalogue
+# ---------------------------------------------------------------------------
+# `RECOMMENDED_MODELS` mappait un fabricant vers un tag et annoncait des seuils
+# (« NVIDIA 8GB+ VRAM ») que rien ne mesurait : une carte de 2 Go se voyait
+# proposer un modele de 5 Go (D-019). Il est supprime. La recommandation vient
+# desormais de `recommend()` du catalogue, alimentee par la memoire reellement
+# mesuree par `detect_hardware()`.
+#
+# Les fonctions ci-dessous ne font que **mettre en forme** ce que le coeur
+# rend. Aucun tag, aucune taille, aucun seuil n'est ecrit dans ce fichier.
+
+
+#: Ce que le classement ne dit pas, ecrit noir sur blanc dans l'interface.
+#:
+#: DEC-006 : les modeles sont ordonnes sur leur empreinte memoire, un fait
+#: source. Les notes de qualite maison de `OLLAMA_MODELS_INFO` ont ete
+#: supprimees (D-021) parce qu'aucune source ne les etayait. Taire cette
+#: limite laisserait croire que le premier de la liste est « le meilleur ».
+QUALITY_DISCLAIMER = (
+    "Classement par empreinte memoire, pas par qualite. La qualite de "
+    "reformatage de ces modeles n'est pas mesuree a ce jour : le premier de "
+    "la liste est le plus lourd que la machine encaisse, pas le meilleur."
+)
+
+
+def _bytes_to_gb(num_bytes):
+    """Octets en Go binaires, dans l'unite qu'affichent les fiches sources."""
+    if num_bytes is None:
+        return None
+    return round(num_bytes / (1024 ** 3), 1)
+
+
+def model_entry(model):
+    """Instantane serialisable d'une entree de catalogue, pour l'interface.
+
+    `estimated` est expose parce qu'il change la force de ce qui est affiche :
+    recommander sur un chiffre publie par l'editeur n'a pas la meme valeur que
+    recommander sur une estimation d'ingenierie.
+    """
+    return {
+        "tag": model.tag,
+        "download_gb": _bytes_to_gb(model.download_size_bytes),
+        "footprint_gb": _bytes_to_gb(model.memory_footprint_bytes),
+        "footprint_low_gb": _bytes_to_gb(model.memory_footprint_low_bytes),
+        "estimated": model.memory_footprint_is_estimated,
+        "context_tokens": model.context_window_tokens,
+        "license": model.license_name,
+        "source_url": model.source_url,
+        "verified_on": model.verified_on,
     }
-}
+
+
+def catalog_entries():
+    """Le catalogue, du plus lourd au plus leger (DEC-006).
+
+    L'ordre est celui de l'empreinte memoire, **jamais** celui d'une note de
+    qualite : aucune source n'en publie, et les scores maison ont ete
+    supprimes (D-021).
+    """
+    return [model_entry(model) for model in CORE.models_by_footprint()]
+
 
 # Mapping des docker-compose par configuration
 #
@@ -127,6 +198,11 @@ RECOMMENDED_MODELS = {
 # Linux. C'est la valeur retenue par `select_docker_compose()` sur les trois
 # systemes. Les autres entrees embarquent Ollama en conteneur et ne se
 # justifient que si le GPU est expose a Docker, donc jamais sur macOS.
+#
+# Les descriptions ne nomment plus de modele : le tag servi par une variante
+# conteneurisee est celui de son `OLLAMA_MODEL`, qui vit dans le fichier
+# compose. Le recopier ici en faisait un quatrieme lieu de verite (D-022) et
+# il avait deja divergé.
 DOCKER_COMPOSE_OPTIONS = {
     "default": {
         "file": "compose.yaml",
@@ -136,7 +212,7 @@ DOCKER_COMPOSE_OPTIONS = {
     "nvidia": {
         "file": "docker/compose/docker-compose.yml",
         "label": "NVIDIA (Docker)",
-        "description": "GPU NVIDIA 8GB+ - qwen3:8b (meilleur raisonnement)"
+        "description": "GPU NVIDIA expose a Docker - Ollama conteneurise"
     },
     "win-nvidia-native": {
         "file": "docker/compose/docker-compose.win-nvidia.yml",
@@ -151,17 +227,17 @@ DOCKER_COMPOSE_OPTIONS = {
     "linux-amd": {
         "file": "docker/compose/docker-compose.amd.yml",
         "label": "Linux + AMD",
-        "description": "Pour Linux avec GPU AMD 12GB+ - qwen3:14b"
+        "description": "Linux + GPU AMD (ROCm) - Ollama conteneurise"
     },
     "linux-amd-max": {
         "file": "docker/compose/docker-compose.amd-max.yml",
         "label": "Linux + AMD MAX (32B)",
-        "description": "Pour Linux avec GPU AMD 20GB+ - qwen3:32b"
+        "description": "Linux + GPU AMD (ROCm), variante large - Ollama conteneurise"
     },
     "cpu": {
         "file": "docker/compose/docker-compose.cpu.yml",
         "label": "CPU uniquement",
-        "description": "Sans GPU - phi4-mini (Microsoft, optimise CPU, 8GB+ RAM)"
+        "description": "Sans GPU expose - Ollama conteneurise, inference sur processeur"
     }
 }
 
@@ -316,130 +392,146 @@ def install_docker():
     log("Installez Docker puis cliquez 'Rafraichir'")
 
 
-def detect_gpu():
-    """Détecte le type de GPU."""
-    system = platform.system()
-    
-    if system == "Windows":
-        try:
-            # Méthode 1: PowerShell (plus fiable)
-            result = subprocess.run(
-                ["powershell", "-Command", 
-                 "Get-WmiObject Win32_VideoController | Select-Object -ExpandProperty Name"],
-                capture_output=True, text=True, timeout=10,
-                encoding='utf-8', errors='replace'
-            )
-            output = result.stdout
-            
-            if result.returncode != 0 or not output.strip():
-                # Méthode 2: WMIC fallback
-                result = subprocess.run(
-                    ["wmic", "path", "win32_videocontroller", "get", "name"],
-                    capture_output=True, text=True, timeout=10,
-                    encoding='utf-8', errors='replace'
-                )
-                output = result.stdout
-            
-            log(f"Detection GPU - Sortie brute: {repr(output[:300])}")
-            output_lower = output.lower()
-            
-            # Détecter AMD
-            if "radeon" in output_lower or ("amd" in output_lower and "microsoft" not in output_lower):
-                state["gpu_type"] = "amd"
-                # Extraire le nom du GPU
-                for line in output.split("\n"):
-                    line = line.strip()
-                    if line and ("radeon" in line.lower() or "amd" in line.lower()):
-                        if "Microsoft" not in line and "Name" not in line:
-                            state["gpu"] = line
-                            break
-                
-                if not state["gpu"]:
-                    state["gpu"] = "AMD Radeon (detecte)"
-                
-                # Déterminer la version GFX
-                gpu_str = state["gpu"] or ""
-                if re.search(r"7[0-9]{3}", gpu_str):
-                    state["gfx_version"] = "11.0.0"
-                    log(f"GPU AMD detecte: {state['gpu']} (RX 7000 -> gfx 11.0.0)")
-                elif re.search(r"6[0-9]{3}", gpu_str):
-                    state["gfx_version"] = "10.3.0"
-                    log(f"GPU AMD detecte: {state['gpu']} (RX 6000 -> gfx 10.3.0)")
-                else:
-                    state["gfx_version"] = "11.0.0"
-                    log(f"GPU AMD detecte: {state['gpu']} (gfx 11.0.0 par defaut)")
-                return
-                
-            # Détecter NVIDIA
-            elif "nvidia" in output_lower or "geforce" in output_lower or "rtx" in output_lower or "gtx" in output_lower:
-                state["gpu_type"] = "nvidia"
-                for line in output.split("\n"):
-                    line = line.strip()
-                    if line and ("nvidia" in line.lower() or "geforce" in line.lower() or "rtx" in line.lower()):
-                        if "Name" not in line:
-                            state["gpu"] = line
-                            break
-                if not state["gpu"]:
-                    state["gpu"] = "NVIDIA (detecte)"
-                log(f"GPU NVIDIA detecte: {state['gpu']}")
-                return
-            else:
-                log(f"Aucun GPU reconnu dans: {output[:200]}")
-                
-        except Exception as e:
-            log(f"Erreur detection GPU Windows: {e}")
-    
-    elif system == "Linux":
-        try:
-            # Essayer lspci
-            result = subprocess.run(
-                ["lspci"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                encoding='utf-8',
-                errors='replace'
-            )
-            output = result.stdout.lower()
-            
-            if "amd" in output or "radeon" in output:
-                state["gpu_type"] = "amd"
-                state["gpu"] = "AMD Radeon (Linux)"
-                state["gfx_version"] = "11.0.0"
-                log("GPU AMD detecte (Linux)")
-                return
-            elif "nvidia" in output:
-                state["gpu_type"] = "nvidia"
-                state["gpu"] = "NVIDIA (Linux)"
-                log("GPU NVIDIA detecte (Linux)")
-                return
-        except Exception as e:
-            log(f"Erreur detection GPU Linux: {e}")
-    
-    elif system == "Darwin":  # macOS
-        state["gpu_type"] = "apple"
-        state["gpu"] = "Apple Silicon / Metal"
-        log("macOS detecte - utilisation Metal")
-        return
-    
-    # Fallback CPU
-    state["gpu_type"] = "cpu"
-    state["gpu"] = "Aucun GPU compatible detecte"
-    log("Aucun GPU detecte - mode CPU")
+# ---------------------------------------------------------------------------
+# Mesure materielle : une seule implementation, celle du coeur
+# ---------------------------------------------------------------------------
+# `detect_gpu()` vivait ici en 110 lignes et une seconde fois, differente, dans
+# `scripts/build.py` (D-018). Les deux devinaient un fabricant et ne mesuraient
+# aucune capacite. `promptforge/hardware.py` mesure, et dit ce qu'il n'a pas pu
+# mesurer. Les deux copies sont supprimees.
+
+# Correspondance entre la marque rendue par la mesure et la classe d'affichage
+# CSS historique de l'interface. `None` reste `None` : une marque non mesuree
+# n'est pas un « cpu », c'est une absence de mesure (le defaut meme de D-018).
+_GPU_TYPE_BY_VENDOR = {
+    "apple": "apple",
+    "nvidia": "nvidia",
+    "amd": "amd",
+    "intel": "cpu",
+}
 
 
-def select_recommended_model():
-    """Sélectionne le modèle recommandé selon le GPU détecté."""
-    gpu_type = state.get("gpu_type", "cpu")
-    
-    if gpu_type in RECOMMENDED_MODELS:
-        recommended = RECOMMENDED_MODELS[gpu_type]
-        state["ollama_model"] = recommended["model"]
-        log(f"Modele recommande: {recommended['model']} ({recommended['reason']})")
+def hardware_entry(profile):
+    """Instantane serialisable d'un `HardwareProfile`, pour l'interface.
+
+    Tout ce qui n'a pas ete mesure vaut `None` et est rendu tel quel : c'est
+    l'interface qui affichera « non mesure », jamais une valeur de confort.
+    """
+    if profile is None:
+        return None
+    return {
+        "system": profile.system,
+        "machine": profile.machine,
+        "cpu_brand": profile.cpu_brand,
+        "gpu_vendor": profile.gpu_vendor,
+        "gpu_name": profile.gpu_name,
+        "total_memory_gb": _bytes_to_gb(profile.total_memory_bytes),
+        "total_memory_source": profile.total_memory_source,
+        "vram_gb": _bytes_to_gb(profile.vram_bytes),
+        "vram_source": profile.vram_source,
+        "unified_memory": profile.unified_memory,
+        "available_memory_gb": _bytes_to_gb(profile.available_memory_bytes),
+        "available_memory_basis": profile.available_memory_basis,
+        "notes": list(profile.notes),
+    }
+
+
+def recommendation_entry(reco):
+    """Instantane serialisable d'une `Recommendation`, pour l'interface."""
+    if reco is None:
+        return None
+    return {
+        "measured": reco.measured,
+        "recommended": model_entry(reco.recommended) if reco.recommended else None,
+        "maximum": model_entry(reco.maximum) if reco.maximum else None,
+        "fits": [model.tag for model in reco.fits],
+        "unified": reco.unified,
+        "available_memory_gb": _bytes_to_gb(reco.available_memory_bytes),
+        "reserved_gb": _bytes_to_gb(reco.reserved_bytes),
+        "margin_gb": _bytes_to_gb(reco.margin_bytes),
+        "basis": reco.basis,
+        "reason": reco.reason,
+    }
+
+
+def detect_hardware():
+    """Mesure la machine et en deduit la recommandation de modele.
+
+    Ne devine rien : si le pont vers le coeur est indisponible, ou si la
+    memoire n'est pas mesurable, l'etat le dit et aucun modele n'est
+    recommande. Le repli muet vers un tag en dur est precisement ce que
+    D-019 reprochait au code precedent.
+    """
+    if not CORE.available:
+        state["catalog_available"] = False
+        state["catalog_error"] = CORE.error
+        state["hardware"] = None
+        state["recommendation"] = None
+        state["gpu_type"] = None
+        state["gpu"] = "Non mesure"
+        log(f"Mesure materielle indisponible : {CORE.error}")
+        return None
+
+    profile = CORE.detect_hardware()
+    state["catalog_available"] = True
+    state["catalog_error"] = None
+    state["hardware"] = hardware_entry(profile)
+    state["gpu_type"] = _GPU_TYPE_BY_VENDOR.get(profile.gpu_vendor)
+    state["gpu"] = profile.gpu_name or profile.cpu_brand or "Non mesure"
+
+    # `gfx_version` ne sert qu'a `HSA_OVERRIDE_GFX_VERSION` sous Windows+AMD.
+    # Aucune sonde du depot ne la mesure : elle reste absente plutot que
+    # devinee depuis un numero de modele, ce que faisait l'ancien code.
+    state["gfx_version"] = None
+
+    memoire = state["hardware"]["available_memory_gb"]
+    if memoire is None:
+        log("Memoire disponible : non mesurable sur cette machine")
     else:
-        # Fallback: qwen3:8b - meilleur raisonnement + post-traitement XML
-        state["ollama_model"] = "qwen3:8b"
-        log("Modele par defaut: qwen3:8b (GPU non detecte)")
+        log(
+            f"Materiel mesure : {profile.system} {profile.machine or ''} - "
+            f"{memoire} Gio disponibles ({profile.available_memory_basis})"
+        )
+    for note in profile.notes:
+        log(f"Non mesure : {note}")
+
+    apply_recommendation(profile)
+    return profile
+
+
+def apply_recommendation(profile=None):
+    """Ecrit la recommandation de modele deduite de la mesure memoire.
+
+    Le classement est celui de DEC-006 : empreinte memoire, jamais une note de
+    qualite. Aucune qualite de reformatage n'est mesuree a ce jour ;
+    l'interface doit le dire, et le dit.
+    """
+    if not CORE.available:
+        state["recommendation"] = None
+        return None
+
+    reco = CORE.recommend_for(profile) if profile is not None else None
+    if reco is None:
+        state["recommendation"] = None
+        return None
+
+    state["recommendation"] = recommendation_entry(reco)
+
+    if reco.recommended is None:
+        # Rien ne tient : on n'ecrit surtout pas un tag arbitraire.
+        state["ollama_model"] = None
+        state["model_installed"] = False
+        log(f"Aucun modele recommande. {reco.reason}")
+        return reco
+
+    state["ollama_model"] = reco.recommended.tag
+    state["model_installed"] = is_model_installed(
+        reco.recommended.tag, state.get("installed_models", [])
+    )
+    log(f"Modele recommande : {reco.reason}")
+    if reco.maximum is not None and reco.maximum.tag != reco.recommended.tag:
+        log(f"Choix maximal possible : {reco.maximum.tag} (marge reduite)")
+    return reco
 
 
 def select_docker_compose():
@@ -451,31 +543,15 @@ def select_docker_compose():
     expose a Docker. Sur macOS, elles ne sont pas proposees du tout : Docker
     Desktop ne passe pas Metal aux conteneurs, un Ollama conteneurise y
     tournerait CPU-only (D-020).
+
+    La regle elle-meme vit dans `scripts/core_loader.compose_selection()`,
+    partagee avec `scripts/build.py -c auto`. Deux mappings separes, c'est
+    la moitie de D-018 qui survit a la disparition de `detect_gpu()`.
     """
-    system = state["os"]
-    gpu_type = state["gpu_type"]
+    selection = compose_selection(state["os"], state["gpu_type"])
 
-    # Chemin par defaut, identique partout.
-    state["docker_compose_file"] = "default"
-
-    if system == "Darwin":
-        # macOS : aucune variante a Ollama conteneurise n'est proposee.
-        state["available_compose_files"] = ["default"]
-    elif system == "Windows":
-        if gpu_type == "amd":
-            # Sur Windows, Docker n'accede pas au GPU AMD : Ollama reste natif.
-            state["available_compose_files"] = ["default", "win-amd", "cpu"]
-        elif gpu_type == "nvidia":
-            state["available_compose_files"] = ["default", "win-nvidia-native", "nvidia", "cpu"]
-        else:
-            state["available_compose_files"] = ["default", "cpu"]
-    else:  # Linux
-        if gpu_type == "amd":
-            state["available_compose_files"] = ["default", "linux-amd", "linux-amd-max", "cpu"]
-        elif gpu_type == "nvidia":
-            state["available_compose_files"] = ["default", "nvidia", "cpu"]
-        else:
-            state["available_compose_files"] = ["default", "cpu"]
+    state["docker_compose_file"] = selection["default"]
+    state["available_compose_files"] = list(selection["options"])
 
     compose_info = DOCKER_COMPOSE_OPTIONS.get(state["docker_compose_file"], {})
     log(f"Docker Compose selectionne: {compose_info.get('label', state['docker_compose_file'])}")
@@ -537,7 +613,14 @@ def check_ollama():
             return set_service_status("ollama", STATUS_UNKNOWN)
 
         state["installed_models"] = models
-        current_model = state.get("ollama_model", "qwen3:8b")
+        current_model = state.get("ollama_model")
+        if not current_model:
+            # Aucun modele retenu : soit la memoire n'a pas ete mesuree, soit
+            # rien ne tient. Ne rien affirmer sur un modele inexistant.
+            state["model_installed"] = False
+            log_change("ollama", f"Ollama: OK - {len(models)} modele(s) - aucun modele retenu")
+            return set_service_status("ollama", STATUS_UP)
+
         model_installed = is_model_installed(current_model, models)
         state["model_installed"] = model_installed
 
@@ -564,14 +647,17 @@ def check_ollama():
 
 
 def is_model_installed(target_model, installed_models):
+    """Verifie si un modele cible est installe.
+
+    Gere les trois facons dont Ollama peut nommer un meme modele :
+    correspondance exacte du tag, tag suffixe d'une quantization
+    (``<famille>:<taille>-q4_0``), et tag ``latest``.
+
+    Aucun tag n'est cite en exemple ici : les tags connus sont ceux du
+    catalogue (DEC-003), et un exemple fige dans une docstring est la
+    premiere marche vers la copie qui diverge (D-022).
     """
-    Vérifie si un modèle cible est installé.
-    Gère les différentes façons dont Ollama peut nommer les modèles:
-    - qwen3:14b (exact)
-    - qwen3:14b-q4_0 (avec suffixe de quantization)
-    - qwen3:latest (tag latest)
-    """
-    if not installed_models:
+    if not target_model or not installed_models:
         return False
     
     # Normaliser le modèle cible
@@ -703,6 +789,14 @@ def status_payload(now=None):
     # D-060 : la table de compose n'existe qu'ici, en Python. Elle est
     # envoyee au client au lieu d'etre recopiee en JavaScript.
     payload["compose_options"] = DOCKER_COMPOSE_OPTIONS
+    # D-059 / DEC-003 : la liste de modeles n'existe pas dans ce fichier. Elle
+    # est lue au catalogue du coeur et envoyee au client, qui ne porte plus
+    # aucun `<option>` en dur. Ordre : empreinte memoire decroissante (DEC-006).
+    payload["models"] = catalog_entries()
+    # DEC-006, dit a l'utilisateur au lieu d'etre suppose : le tri porte sur la
+    # memoire, aucune qualite de reformatage n'est mesuree a ce jour.
+    payload["quality_disclaimer"] = QUALITY_DISCLAIMER
+    payload["catalog_source"] = CORE.catalog_source() if CORE.available else None
     return payload
 
 
@@ -1252,7 +1346,12 @@ HTML_TEMPLATE = """
                 <div class="status-item" id="gpu-status">
                     <div class="icon">🎮</div>
                     <div class="label">GPU</div>
-                    <div class="value" id="gpu-value">Detection...</div>
+                    <div class="value" id="gpu-value">Mesure...</div>
+                </div>
+                <div class="status-item" id="memory-status">
+                    <div class="icon">🧠</div>
+                    <div class="label">Memoire pour l'inference</div>
+                    <div class="value" id="memory-value">Mesure...</div>
                 </div>
                 <div class="status-item">
                     <div class="icon">🐳</div>
@@ -1294,39 +1393,15 @@ HTML_TEMPLATE = """
                     <div>
                         <label style="display: block; font-size: 0.85em; color: #aaa; margin-bottom: 5px;">Modele IA:</label>
                         <div style="display: flex; align-items: center; gap: 10px;">
-                            <select id="model-select" onchange="onModelChange(this.value)">
-                                <optgroup label="🖥️ CPU Only (8GB+ RAM) - Optimises pour CPU">
-                                    <option value="phi4-mini">phi4-mini (2.5GB) - Microsoft, excellent CPU</option>
-                                    <option value="gemma3n:e4b">gemma3n:e4b (3GB) - Google, edge optimise</option>
-                                    <option value="qwen3:4b">qwen3:4b (3GB) - Qwen leger</option>
-                                    <option value="llama3.2:3b">llama3.2:3b (2GB) - Meta ultra leger</option>
-                                </optgroup>
-                                <optgroup label="⚡ GPU 8GB - Recommandés pour PromptForge">
-                                    <option value="qwen3:8b" selected>qwen3:8b (5GB) - Meilleur raisonnement ⭐</option>
-                                    <option value="llama3.1:8b">llama3.1:8b (5GB) - Meilleur format natif</option>
-                                    <option value="mistral:7b">mistral:7b (4GB) - Alternative légère</option>
-                                </optgroup>
-                                <optgroup label="⭐ GPU 12GB+ (qualité supérieure)">
-                                    <option value="llama3.1:70b">llama3.1:70b (40GB) - Qualité maximale</option>
-                                    <option value="qwen3:14b">qwen3:14b (9GB) - Recommande pour qualite</option>
-                                    <option value="qwen2.5:14b">qwen2.5:14b (9GB) - Alternative stable</option>
-                                    <option value="deepseek-r1:14b">deepseek-r1:14b (9GB) - Raisonnement</option>
-                                </optgroup>
-                                <optgroup label="💪 GPU 20GB+ (excellent suivi XML)">
-                                    <option value="qwen3:32b">qwen3:32b (20GB) - Meilleure qualite</option>
-                                    <option value="qwen3:30b-a3b">qwen3:30b-a3b (18GB) - MoE optimal</option>
-                                    <option value="deepseek-r1:32b">deepseek-r1:32b (20GB) - Raisonnement max</option>
-                                </optgroup>
-                                <optgroup label="💻 Specialises Code">
-                                    <option value="qwen2.5-coder:7b">qwen2.5-coder:7b (5GB) - Code GPU 8GB</option>
-                                    <option value="qwen2.5-coder:14b">qwen2.5-coder:14b (9GB) - Code GPU 12GB+</option>
-                                </optgroup>
-                            </select>
+                            <!-- D-059 : aucun <option> en dur. La liste est
+                                 rendue par updateModelSelector() a partir de
+                                 data.models, servi par /api/status depuis le
+                                 catalogue du coeur. -->
+                            <select id="model-select" onchange="onModelChange(this.value)"></select>
                             <span id="model-status" style="font-size: 1.2em;" title="Statut du modele"></span>
                         </div>
-                        <div style="margin-top: 5px; font-size: 0.75em; color: #4CAF50;">
-                            ✅ qwen3:8b recommandé - Meilleur raisonnement (format XML via post-traitement)
-                        </div>
+                        <div id="model-recommendation" style="margin-top: 6px; font-size: 0.78em; color: #aaa; max-width: 640px;"></div>
+                        <div id="model-disclaimer" style="margin-top: 4px; font-size: 0.72em; color: #888; max-width: 640px;"></div>
                     </div>
                 </div>
                 <div id="compose-description" style="margin-top: 10px; font-size: 0.85em; color: #888;"></div>
@@ -1367,14 +1442,14 @@ HTML_TEMPLATE = """
                     <button class="btn btn-danger" onclick="confirmClean()" id="btn-clean" style="font-size: 0.9em;">
                         🗑️ Nettoyer
                     </button>
-                    <button class="btn btn-secondary" onclick="action('detect_gpu')" style="font-size: 0.9em;">
-                        🔍 Re-detecter GPU
+                    <button class="btn btn-secondary" onclick="action('detect_hardware')" style="font-size: 0.9em;">
+                        🔍 Re-mesurer la machine
                     </button>
                 </div>
             </div>
             
             <div style="margin-top: 15px;">
-                <label>Forcer le type de GPU:</label>
+                <label title="N'affecte que le choix du fichier compose. La recommandation de modele depend de la memoire mesuree, pas de la marque.">Forcer la marque du GPU (choix du compose uniquement):</label>
                 <select id="force-gpu" onchange="forceGpu(this.value)">
                     <option value="">-- Auto --</option>
                     <option value="amd">AMD (ROCm)</option>
@@ -1403,11 +1478,29 @@ HTML_TEMPLATE = """
     <script>
         function updateUI(data) {
             try {
-                // GPU
+                // GPU et memoire : ce qui est mesure, et ce qui ne l'est pas.
+                //
+                // L'ancien code ecrivait 'cpu' des que la sonde ne concluait
+                // pas : « non mesurable » devenait « pas de GPU » (D-018).
+                // Une marque absente s'affiche desormais comme telle.
                 const gpuEl = document.getElementById('gpu-value');
                 const gpuCard = document.getElementById('gpu-status');
-                if (gpuEl) gpuEl.textContent = data.gpu || 'Non detecte';
-                if (gpuCard) gpuCard.className = 'status-item gpu-' + (data.gpu_type || 'cpu');
+                const hw = data.hardware || null;
+                if (gpuEl) {
+                    if (!hw) {
+                        gpuEl.textContent = 'Non mesure';
+                        gpuEl.title = data.catalog_error || 'Aucune mesure disponible';
+                    } else if (hw.gpu_vendor) {
+                        gpuEl.textContent = hw.gpu_name || hw.cpu_brand || hw.gpu_vendor;
+                        gpuEl.title = 'Marque mesuree : ' + hw.gpu_vendor
+                            + ((hw.notes || []).length ? ' | ' + hw.notes.join(' | ') : '');
+                    } else {
+                        gpuEl.textContent = 'Marque non mesuree';
+                        gpuEl.title = (hw.notes || []).join(' | ');
+                    }
+                }
+                if (gpuCard) gpuCard.className = 'status-item gpu-' + (data.gpu_type || 'unknown');
+                updateMemory(data);
                 
                 // Fraicheur de la mesure affichee
                 updateFreshness(data);
@@ -1480,16 +1573,19 @@ HTML_TEMPLATE = """
                 // État des images Docker
                 updateDockerImagesStatus(data);
                 
-                // Sélectionner le modèle recommandé et mettre à jour l'indicateur
-                var modelSelect = document.getElementById('model-select');
+                // Liste des modeles, recommandation et reserve de DEC-006
+                updateModelSelector(data);
+                updateRecommendation(data);
+
                 var modelStatus = document.getElementById('model-status');
-                if (modelSelect && data.ollama_model) {
-                    modelSelect.value = data.ollama_model;
-                }
                 if (modelStatus) {
                     if (data.ollama_status === 'unknown') {
                         modelStatus.textContent = '❔';
-                        modelStatus.title = 'Etat d\'Ollama indetermine - la liste des modeles peut etre perimee';
+                        // Chaine JS entre guillemets doubles : `\'` dans une
+                        // triple-quote Python NON brute est mange par Python et
+                        // produit une apostrophe nue, donc un `SyntaxError` qui
+                        // tue TOUT le bloc <script>. Verifie par `node --check`.
+                        modelStatus.title = "Etat d'Ollama indetermine - la liste des modeles peut etre perimee";
                     } else if (data.ollama_status !== 'up') {
                         modelStatus.textContent = '⏸️';
                         modelStatus.title = 'Ollama non demarre';
@@ -1641,6 +1737,152 @@ HTML_TEMPLATE = """
             }
         }
         
+        // ------------------------------------------------------------------
+        // Materiel mesure, catalogue et recommandation
+        // ------------------------------------------------------------------
+        // Aucune de ces trois choses n'existe en JavaScript : elles arrivent
+        // par /api/status, depuis `promptforge/hardware.py` et
+        // `promptforge/models_catalog.py`. La copie JS de la table de compose
+        // avait deja divergé de son original (D-060) ; on ne recommence pas
+        // avec les modeles.
+
+        function gb(value) {
+            return (value === null || value === undefined) ? null : value + ' Gio';
+        }
+
+        function updateMemory(data) {
+            var el = document.getElementById('memory-value');
+            if (!el) return;
+            var hw = data.hardware || null;
+            if (!hw || hw.available_memory_gb === null || hw.available_memory_gb === undefined) {
+                el.textContent = '❔ Non mesuree';
+                el.className = 'value status-unknown';
+                el.title = hw ? (hw.notes || []).join(' | ')
+                              : (data.catalog_error || 'Aucune mesure disponible');
+                return;
+            }
+            var bases = {
+                'unified_memory': 'memoire unifiee (CPU et GPU partagent le meme reservoir)',
+                'dedicated_vram': 'VRAM dediee du GPU',
+                'system_ram': 'RAM systeme (inference sur processeur)'
+            };
+            el.textContent = gb(hw.available_memory_gb);
+            el.className = 'value status-ok';
+            el.title = 'Base : ' + (bases[hw.available_memory_basis] || hw.available_memory_basis)
+                + (hw.total_memory_source ? ' | sonde : ' + hw.total_memory_source : '');
+        }
+
+        function modelLabel(model, fits) {
+            var texte = model.tag + ' - ' + gb(model.footprint_gb) + ' en memoire';
+            if (model.estimated) texte += ' (estimation)';
+            texte += ', ' + gb(model.download_gb) + ' a telecharger';
+            if (fits === false) texte = '✕ ' + texte;
+            return texte;
+        }
+
+        function updateModelSelector(data) {
+            try {
+                var select = document.getElementById('model-select');
+                if (!select) return;
+
+                var modeles = data.models || [];
+                if (modeles.length === 0) {
+                    // Aucune liste inventee : on dit que le catalogue manque.
+                    select.innerHTML = '<option value="">Catalogue indisponible</option>';
+                    select.disabled = true;
+                    return;
+                }
+                select.disabled = false;
+
+                var reco = data.recommendation || null;
+                var mesure = !!(reco && reco.measured);
+                var tiennent = (reco && reco.fits) ? reco.fits : [];
+
+                function option(model) {
+                    var fits = mesure ? (tiennent.indexOf(model.tag) !== -1) : null;
+                    var choisi = (model.tag === data.ollama_model) ? ' selected' : '';
+                    return '<option value="' + model.tag + '"' + choisi + '>'
+                        + modelLabel(model, fits) + '</option>';
+                }
+
+                if (!mesure) {
+                    select.innerHTML = '<optgroup label="Memoire non mesuree - aucun filtrage par capacite">'
+                        + modeles.map(option).join('') + '</optgroup>';
+                } else {
+                    var dedans = modeles.filter(function (m) { return tiennent.indexOf(m.tag) !== -1; });
+                    var dehors = modeles.filter(function (m) { return tiennent.indexOf(m.tag) === -1; });
+                    var html = '';
+                    if (dedans.length) {
+                        html += '<optgroup label="Tient dans ' + gb(reco.available_memory_gb) + ' mesures">'
+                            + dedans.map(option).join('') + '</optgroup>';
+                    }
+                    if (dehors.length) {
+                        html += '<optgroup label="Depasse la memoire mesuree">'
+                            + dehors.map(option).join('') + '</optgroup>';
+                    }
+                    select.innerHTML = html;
+                }
+                if (data.ollama_model) select.value = data.ollama_model;
+            } catch (e) {
+                console.error('Erreur updateModelSelector:', e);
+            }
+        }
+
+        function updateRecommendation(data) {
+            var el = document.getElementById('model-recommendation');
+            var dis = document.getElementById('model-disclaimer');
+            if (dis) dis.textContent = data.quality_disclaimer || '';
+            if (!el) return;
+
+            if (data.catalog_available === false) {
+                // Mode degrade VISIBLE : ni liste en dur, ni silence.
+                el.innerHTML = '⛔ <strong>Catalogue de modeles indisponible</strong> - aucun modele '
+                    + 'ne peut etre recommande ni propose.<br><span style="color:#888;">'
+                    + (data.catalog_error || 'motif inconnu') + '</span>';
+                el.style.color = '#ff6b35';
+                return;
+            }
+
+            var reco = data.recommendation || null;
+            if (!reco || !reco.measured) {
+                el.innerHTML = "❔ <strong>Memoire non mesuree</strong> - aucun modele n'est "
+                    + 'recommande. Choisir au hasard reviendrait a presenter un defaut cable '
+                    + 'comme une recommandation.';
+                el.style.color = '#ffa502';
+                return;
+            }
+
+            if (!reco.recommended) {
+                el.innerHTML = '⚠️ ' + reco.reason;
+                el.style.color = '#ffa502';
+                return;
+            }
+
+            var nature = reco.basis === 'official'
+                ? 'chiffre officiel de la fiche du modele'
+                : "estimation d'ingenierie, non mesuree sur cette machine";
+            var lignes = [];
+            lignes.push('✅ <strong>' + reco.recommended.tag + '</strong> recommande - '
+                + gb(reco.recommended.footprint_gb) + ' en memoire (' + nature + ')'
+                + (reco.margin_gb !== null ? ', marge ' + gb(reco.margin_gb) : ''));
+            if (reco.maximum && reco.maximum.tag !== reco.recommended.tag) {
+                lignes.push('⬆️ Choix maximal tenant dans la memoire mesuree : <strong>'
+                    + reco.maximum.tag + '</strong> (' + gb(reco.maximum.footprint_gb)
+                    + ', marge reduite)');
+            }
+            if (reco.unified) {
+                lignes.push('Memoire unifiee : ' + gb(reco.reserved_gb)
+                    + ' laisses au systeme et aux applications pour le choix par defaut.');
+            }
+            if (data.catalog_source) {
+                lignes.push('<span style="color:#777;">Source du catalogue : '
+                    + data.catalog_source.source + ', verifie le '
+                    + data.catalog_source.verified_on + '.</span>');
+            }
+            el.innerHTML = lignes.join('<br>');
+            el.style.color = '#aaa';
+        }
+
         async function onModelChange(model) {
             try {
                 const resp = await fetch('/api/action', {
@@ -1671,8 +1913,10 @@ HTML_TEMPLATE = """
         
         async function action(act) {
             try {
+                // Pas de tag de repli : si aucun modele n'est retenu, le
+                // serveur doit refuser l'action, pas en telecharger un autre.
                 const modelEl = document.getElementById('model-select');
-                const model = modelEl ? modelEl.value : 'qwen3:8b';
+                const model = (modelEl && modelEl.value) ? modelEl.value : null;
                 const resp = await fetch('/api/action', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -1717,7 +1961,7 @@ HTML_TEMPLATE = """
         
         async function forceGpu(gpuType) {
             if (!gpuType) {
-                action('detect_gpu');
+                action('detect_hardware');
                 return;
             }
             const resp = await fetch('/api/action', {
@@ -1792,7 +2036,7 @@ class LauncherHandler(SimpleHTTPRequestHandler):
             body = self.rfile.read(content_length).decode("utf-8")
             data = json.loads(body)
             action = data.get("action")
-            model = data.get("model", state.get("ollama_model", "qwen3:8b"))
+            model = data.get("model") or state.get("ollama_model")
             
             state["action_in_progress"] = True
             
@@ -1805,12 +2049,17 @@ class LauncherHandler(SimpleHTTPRequestHandler):
             elif action == "stop_promptforge":
                 threading.Thread(target=stop_promptforge).start()
             elif action == "pull_model":
-                threading.Thread(target=pull_model, args=(model,)).start()
+                if CORE.is_known_tag(model):
+                    threading.Thread(target=pull_model, args=(model,)).start()
+                else:
+                    # `ollama pull` recoit ici une chaine venue du reseau : la
+                    # confronter au catalogue est la seule liste blanche
+                    # disponible, et elle est deja la source unique.
+                    log(f"Telechargement refuse : {model!r} n'est pas au catalogue")
             elif action == "refresh":
                 refresh_status()
-            elif action == "detect_gpu":
-                detect_gpu()
-                select_recommended_model()
+            elif action == "detect_hardware":
+                detect_hardware()
                 select_docker_compose()
             elif action == "force_gpu":
                 gpu_type = data.get("gpu_type", "cpu")
@@ -1824,8 +2073,10 @@ class LauncherHandler(SimpleHTTPRequestHandler):
                 else:
                     state["gpu"] = "CPU (force manuellement)"
                     state["gfx_version"] = None
-                log(f"GPU force: {gpu_type}")
-                select_recommended_model()  # Mettre à jour le modèle
+                # Forcer la marque ne change PAS la recommandation : celle-ci
+                # depend de la memoire mesuree, pas du fabricant. Le seul effet
+                # est le choix des fichiers compose proposes.
+                log(f"GPU force: {gpu_type} (sans effet sur la recommandation de modele)")
                 select_docker_compose()  # Recalculer le docker-compose
             elif action == "select_compose":
                 compose_key = data.get("compose_key", "default")
@@ -1834,12 +2085,15 @@ class LauncherHandler(SimpleHTTPRequestHandler):
                     compose_info = DOCKER_COMPOSE_OPTIONS[compose_key]
                     log(f"Docker Compose change: {compose_info['label']}")
             elif action == "select_model":
-                new_model = data.get("model", "qwen3:8b")
-                state["ollama_model"] = new_model
-                # Vérifier si ce modèle est installé
-                installed = state.get("installed_models", [])
-                state["model_installed"] = is_model_installed(new_model, installed)
-                log(f"Modele selectionne: {new_model}" + (" ✓" if state["model_installed"] else " (non installe)"))
+                new_model = data.get("model")
+                if not CORE.is_known_tag(new_model):
+                    log(f"Modele refuse : {new_model!r} n'est pas au catalogue")
+                else:
+                    state["ollama_model"] = new_model
+                    installed = state.get("installed_models", [])
+                    state["model_installed"] = is_model_installed(new_model, installed)
+                    log(f"Modele selectionne: {new_model}"
+                        + (" ✓" if state["model_installed"] else " (non installe)"))
             elif action == "rebuild":
                 threading.Thread(target=rebuild_docker_images, args=(False,)).start()
             elif action == "rebuild_force":
@@ -1871,6 +2125,86 @@ class LauncherHandler(SimpleHTTPRequestHandler):
         pass  # Désactiver les logs HTTP
 
 
+# ---------------------------------------------------------------------------
+# Ecoute : boucle locale, et les DEUX familles d'adresses
+# ---------------------------------------------------------------------------
+# Le code faisait `HTTPServer(("0.0.0.0", LAUNCHER_PORT))`, ce qui cumulait
+# deux defauts :
+#
+#   D-037 - un serveur qui demarre des conteneurs et telecharge des modeles
+#           etait offert a tout le reseau local, sans aucune authentification
+#           et sans la moindre raison fonctionnelle ;
+#   D-062 - `0.0.0.0` n'ecoute qu'en IPv4, alors que `/etc/hosts` de macOS
+#           declare `localhost` en IPv4 ET en IPv6 et que `getaddrinfo` rend
+#           `::1` EN PREMIER. Mesure du 2026-09-07 :
+#               curl http://localhost:7850    -> HTTP 000
+#               curl http://127.0.0.1:7850    -> HTTP 200
+#           Le launcher imprimait pourtant « accessible sur
+#           http://localhost:7850 » : il promettait une adresse qu'il ne
+#           servait pas.
+#
+# Passer simplement a `127.0.0.1` fermerait D-037 et laisserait D-062 entiere.
+# Et `::` avec `IPV6_V6ONLY=0` donnerait bien la double pile, mais sur toutes
+# les interfaces, donc rouvrirait D-037. Aucune adresse unique ne satisfait les
+# deux : la seule cible correcte est DEUX sockets d'ecoute, une par famille,
+# toutes deux sur la boucle locale.
+LOOPBACK_HOSTS = ("127.0.0.1", "::1")
+
+
+class _HTTPServerV6(HTTPServer):
+    """`HTTPServer` en IPv6, avec `V6ONLY` force.
+
+    `V6ONLY` est explicite parce que son defaut varie selon les systemes :
+    a 0, le socket `::1` ne prendrait de toute facon pas les connexions vers
+    `127.0.0.1` (le mode double pile ne s'applique qu'a `::`), mais il pourrait
+    entrer en conflit avec l'autre socket sur certaines plateformes. On ne
+    laisse pas ce comportement au hasard.
+    """
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except (AttributeError, OSError):
+            pass
+        HTTPServer.server_bind(self)
+
+
+def serve_loopback(port, handler=None):
+    """Monte un serveur par famille d'adresses sur la boucle locale.
+
+    Rend `(serveurs, fils, hotes_servis)`. Un echec sur une famille est
+    journalise et n'empeche pas l'autre : une machine sans IPv6 doit rester
+    utilisable. Si aucune famille ne repond, l'exception de la derniere est
+    relancee, parce qu'un launcher qui n'ecoute nulle part doit le dire.
+    """
+    handler = handler or LauncherHandler
+    servers = []
+    threads = []
+    served = []
+    derniere_erreur = None
+
+    for host in LOOPBACK_HOSTS:
+        classe = _HTTPServerV6 if ":" in host else HTTPServer
+        try:
+            server = classe((host, port), handler)
+        except OSError as exc:
+            derniere_erreur = exc
+            log(f"Ecoute impossible sur {host}:{port} - {exc}")
+            continue
+        fil = threading.Thread(target=server.serve_forever, daemon=True)
+        fil.start()
+        servers.append(server)
+        threads.append(fil)
+        served.append(host)
+
+    if not servers:
+        raise derniere_erreur if derniere_erreur else OSError("aucune ecoute possible")
+
+    return servers, threads, served
+
+
 def main():
     """Point d'entrée principal."""
     print("=" * 50)
@@ -1878,17 +2212,21 @@ def main():
     print("=" * 50)
     print()
     
-    # Détection initiale
+    # Mesure initiale
     log("Demarrage du launcher...")
-    detect_gpu()
-    select_recommended_model()  # Choisir le modèle selon le GPU
+    detect_hardware()
     check_installations()
     select_docker_compose()
     refresh_status()
     
-    # Démarrer le serveur
-    server = HTTPServer(("0.0.0.0", LAUNCHER_PORT), LauncherHandler)
+    servers, threads, served = serve_loopback(LAUNCHER_PORT)
     log(f"Launcher accessible sur http://localhost:{LAUNCHER_PORT}")
+    log("Ecoute sur " + ", ".join(f"{h}:{LAUNCHER_PORT}" for h in served))
+    if "::1" not in served:
+        # A dire, pas a taire : sur un systeme qui resout `localhost` en IPv6
+        # d'abord, l'adresse imprimee ci-dessus ne repondrait pas.
+        log("IPv6 indisponible : utiliser http://127.0.0.1:%d si `localhost` ne repond pas"
+            % LAUNCHER_PORT)
     
     # Ouvrir le navigateur
     import webbrowser
@@ -1900,10 +2238,15 @@ def main():
     print()
     
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         print("\nArret du launcher...")
-        server.shutdown()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        for fil in threads:
+            fil.join(timeout=5)
 
 
 if __name__ == "__main__":
