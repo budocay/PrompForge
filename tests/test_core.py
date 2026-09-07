@@ -660,3 +660,170 @@ class TestModelPricingContract:
         for model, prompt in SYSTEM_PROMPTS.items():
             trouve = literal.findall(prompt)
             assert not trouve, f"{model}: fenêtre de contexte en dur {trouve}"
+
+
+class TestComparisonRanksOnTariffOnly:
+    """D-071 — la comparaison ne classe que sur ce qu'elle mesure.
+
+    `profiles._get_model_tier()` câblait « Premium / Performant / Économique »
+    par listes de membres. Deux contradictions mesurées avant correction :
+    Claude Sonnet 5 (2.00 / 10.00) sortait « Performant » pendant que GPT-5.6
+    Terra (2.00 / 12.00) sortait « Économique », alors que Sonnet 5 est moins
+    cher sur les deux axes ; et ce même Terra était séparé de Gemini 3.1 Pro,
+    qui porte pourtant exactement le même tarif.
+
+    Ce qui est sourçable ici, ce sont les tarifs : chaque entrée de
+    `MODEL_PRICING` porte son `source_url` et son `verified_on`. La puissance
+    ne l'est pas — aucun éditeur ne publie de mesure de suivi de format. Le
+    classement est donc l'ordre des coûts, et rien d'autre (DEC-006 appliqué
+    aux modèles distants).
+
+    Ces verrous portent sur la propriété qui rend ces deux contradictions
+    impossibles, jamais sur l'existence d'un libellé : un test qui vérifierait
+    qu'un palier existe ne verrouillerait rien.
+    """
+
+    def test_the_tier_computed_from_a_membership_list_is_gone(self):
+        """La fonction qui traduisait une identité en appréciation n'existe plus.
+
+        Son seul appelant était `compare_models()`, et la seule chose que ses
+        deux consommateurs en faisaient était de l'afficher. Rien à repointer :
+        on supprime, comme pour `get_recommendation()` et D-055.
+        """
+        import promptforge.profiles as profiles
+
+        assert not hasattr(profiles, "_get_model_tier")
+
+    def test_a_compared_row_carries_only_what_the_tariff_publishes(self):
+        """Le jeu de clés d'une ligne est fermé.
+
+        Verrou de mutation : réintroduire une clé `tier`, ou toute autre
+        appréciation posée à côté des tarifs, fait échouer ce test sans qu'il
+        ait à connaître le libellé choisi.
+        """
+        from promptforge.profiles import MODEL_PRICING, compare_models
+
+        attendu = {
+            "model",
+            "label",
+            "cost",
+            "cost_display",
+            "input_price",
+            "output_price",
+            "context",
+        }
+        lignes = compare_models()
+        assert len(lignes) == len(MODEL_PRICING)
+        for ligne in lignes:
+            assert set(ligne) == attendu, ligne["model"]
+
+    def test_no_compared_value_states_a_power_the_repo_never_measured(self):
+        """Le jugement ne revient pas non plus par une valeur.
+
+        Complément du verrou précédent : celui-là ferme les clés, celui-ci
+        ferme le vocabulaire. Restaurer l'ancien palier ferait échouer les deux.
+        """
+        from promptforge.profiles import compare_models
+
+        for ligne in compare_models():
+            rendu = " ".join(str(valeur) for valeur in ligne.values())
+            for mot in ("Premium", "Performant", "puissant", "Puissant"):
+                assert mot not in rendu, (ligne["model"], mot)
+
+    def test_two_models_on_the_same_tariff_are_described_identically(self):
+        """GPT-5.6 Terra et Gemini 3.1 Pro : même tarif, même description.
+
+        Les deux sont à 2.00 / 12.00 avec une fenêtre non confirmée. Le palier
+        retiré les séparait pourtant, « Économique » pour l'un, « Performant »
+        pour l'autre, sur la seule foi de deux listes écrites à la main. Plus
+        rien de ce que rend la comparaison ne peut les distinguer, hors leur
+        identité et le nom commercial que publie leur éditeur.
+        """
+        from promptforge.profiles import MODEL_PRICING, TargetModel, compare_models
+
+        terra = MODEL_PRICING[TargetModel.GPT_5_6_TERRA]
+        gemini = MODEL_PRICING[TargetModel.GEMINI_3_1_PRO]
+        assert (terra.input_price, terra.output_price) == (2.0, 12.0)
+        assert (gemini.input_price, gemini.output_price) == (2.0, 12.0)
+        assert terra.context_window == gemini.context_window
+
+        lignes = {ligne["model"]: ligne for ligne in compare_models()}
+
+        def description(identifiant):
+            return {
+                cle: valeur
+                for cle, valeur in lignes[identifiant].items()
+                if cle not in {"model", "label"}
+            }
+
+        assert description("gpt-5.6-terra") == description("gemini-3.1-pro-preview")
+
+    def test_sonnet_5_ranks_ahead_of_gpt_5_6_terra_as_its_tariff_demands(self):
+        """Le cas exact qui a révélé le défaut (D-071).
+
+        Sonnet 5 est à 2.00 / 10.00, Terra à 2.00 / 12.00 : même tarif
+        d'entrée, sortie moins chère. Sonnet 5 passe donc devant, quel que soit
+        le mélange de tokens. L'ancien palier affichait l'inverse.
+        """
+        from promptforge.profiles import MODEL_PRICING, TargetModel, compare_models
+
+        sonnet = MODEL_PRICING[TargetModel.CLAUDE_SONNET_5]
+        terra = MODEL_PRICING[TargetModel.GPT_5_6_TERRA]
+        assert (sonnet.input_price, sonnet.output_price) == (2.0, 10.0)
+        assert (terra.input_price, terra.output_price) == (2.0, 12.0)
+
+        for entree, sortie in ((1000, 500), (1, 1), (100_000, 10), (10, 100_000)):
+            ordre = [ligne["model"] for ligne in compare_models(entree, sortie)]
+            assert ordre.index("claude-sonnet-5") < ordre.index("gpt-5.6-terra"), (
+                entree,
+                sortie,
+            )
+
+    def test_no_model_cheaper_on_both_axes_is_ever_ranked_after_a_dearer_one(self):
+        """La propriété générale dont la paire Sonnet 5 / Terra n'est qu'un cas.
+
+        Elle tient par construction depuis que le classement est l'ordre des
+        coûts. Aucune table écrite à la main ne peut la garantir, et l'ancienne
+        la violait.
+        """
+        from promptforge.profiles import MODEL_PRICING, compare_models
+
+        rang = {ligne["model"]: i for i, ligne in enumerate(compare_models())}
+        for modele_a, tarif_a in MODEL_PRICING.items():
+            for modele_b, tarif_b in MODEL_PRICING.items():
+                jamais_plus_cher = (
+                    tarif_a.input_price <= tarif_b.input_price
+                    and tarif_a.output_price <= tarif_b.output_price
+                )
+                moins_cher_quelque_part = (
+                    tarif_a.input_price < tarif_b.input_price
+                    or tarif_a.output_price < tarif_b.output_price
+                )
+                if jamais_plus_cher and moins_cher_quelque_part:
+                    assert rang[modele_a.value] < rang[modele_b.value], (
+                        modele_a.value,
+                        modele_b.value,
+                    )
+
+    def test_the_ranking_follows_the_tariffs_when_two_of_them_are_swapped(self, monkeypatch):
+        """Verrou de mutation : le classement lit le tarif, pas l'identité.
+
+        On échange les tarifs du modèle le moins cher et du plus cher. Un
+        classement dérivé suit l'échange ; une table indexée par modèle ne le
+        suivrait pas, et c'est précisément ce qui produisait D-071.
+        """
+        import promptforge.profiles as profiles
+        from promptforge.profiles import TargetModel
+
+        avant = [ligne["model"] for ligne in profiles.compare_models()]
+        assert avant[0] == "gemini-3.6-flash"
+        assert avant[-1] == "gpt-5-pro"
+
+        echange = dict(profiles.MODEL_PRICING)
+        flash, pro = TargetModel.GEMINI_3_6_FLASH, TargetModel.GPT_5_PRO
+        echange[flash], echange[pro] = echange[pro], echange[flash]
+        monkeypatch.setattr(profiles, "MODEL_PRICING", echange)
+
+        apres = [ligne["model"] for ligne in profiles.compare_models()]
+        assert apres[0] == "gpt-5-pro"
+        assert apres[-1] == "gemini-3.6-flash"

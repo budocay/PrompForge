@@ -5,7 +5,8 @@ Identifiants, tarifs et fenêtres de contexte vérifiés le 2026-09-07 sur les
 pages officielles Anthropic, OpenAI et Google (cf. MEMORY/VEILLE.md, section
 « Modèles cibles du reformatage et tarifs »).
 
-Deux règles tiennent ce fichier (F-028) :
+Trois règles tiennent ce fichier (les deux premières de F-028, la troisième
+de D-071) :
 
 1. `TargetModel` ne porte que des identifiants d'API réels et actifs. Un modèle
    arrêté (`gemini-3-pro-preview`, arrêté le 2026-03-09) ou un identifiant sans
@@ -16,6 +17,18 @@ Deux règles tiennent ce fichier (F-028) :
    génération précédente. Trois fenêtres de contexte sont dans ce cas : les
    fiches modèles Google ont répondu 404 le 2026-09-07 et celle de
    `gpt-5.6-terra` n'a pas été rouverte.
+3. Une comparaison n'affiche aucune appréciation que les tarifs ne portent pas
+   (D-071). Le palier « Premium / Performant / Économique » a été retiré : il
+   était câblé par deux listes de modèles écrites à la main, et il mentait deux
+   fois. Claude Sonnet 5 (2.00 / 10.00) en sortait au-dessus de GPT-5.6 Terra
+   (2.00 / 12.00), alors qu'il est moins cher sur les deux axes ; et il séparait
+   ce même Terra de Gemini 3.1 Pro, qui porte pourtant le même tarif au dollar
+   près sur les deux axes. Le tarif est sourçable, et il l'est ci-dessous ligne
+   par ligne ; la puissance ne l'est pas — aucun éditeur ne publie de mesure de
+   suivi de format, et les benchmarks généralistes ne mesurent pas la tâche de
+   PromptForge. Le classement se fait donc sur le coût et sur rien d'autre,
+   comme DEC-006 l'a arrêté pour le catalogue local, et il se calcule à partir
+   des tarifs plutôt que d'être recopié à côté d'eux.
 """
 
 from dataclasses import dataclass
@@ -899,15 +912,20 @@ def list_profiles() -> list[str]:
 # ============================================
 
 def compare_models(input_tokens: int = 1000, output_tokens: int = 500) -> list[dict]:
-    """
-    Compare les modèles par prix et caractéristiques.
-    
+    """Compare les modèles cibles sur ce que leur éditeur publie.
+
+    Chaque ligne ne porte que des valeurs lisibles dans `MODEL_PRICING`, donc
+    rattachables à un `source_url` et à un `verified_on` : les deux tarifs, la
+    fenêtre de contexte, et le coût de la requête demandée. Aucune
+    appréciation ne s'y ajoute (D-071, voir l'en-tête du module).
+
     Args:
         input_tokens: Nombre de tokens en entrée pour le calcul
         output_tokens: Nombre de tokens en sortie pour le calcul
-    
+
     Returns:
-        Liste triée par coût (moins cher en premier)
+        Liste triée par coût croissant. L'ordre est la seule hiérarchie que
+        cette fonction établit, et il est entièrement déterminé par les tarifs.
     """
     comparisons = []
     
@@ -925,7 +943,6 @@ def compare_models(input_tokens: int = 1000, output_tokens: int = 500) -> list[d
             "input_price": f"${pricing.input_price}/M",
             "output_price": f"${pricing.output_price}/M",
             "context": _format_context(pricing.context_window),
-            "tier": _get_model_tier(model),
         })
     
     return sorted(comparisons, key=lambda x: x["cost"])
@@ -942,16 +959,3 @@ def _format_context(window: int | None) -> str:
     if window >= 1_000_000 and window % 1_000_000 == 0:
         return f"{window // 1_000_000}M"
     return f"{window // 1000}K"
-
-
-def _get_model_tier(model: TargetModel) -> str:
-    """Retourne le tier de performance du modèle."""
-    premium = [TargetModel.CLAUDE_OPUS_5, TargetModel.GPT_5_PRO, TargetModel.GPT_5_1]
-    mid = [TargetModel.CLAUDE_SONNET_5, TargetModel.GEMINI_3_1_PRO]
-    
-    if model in premium:
-        return "🔥 Premium"
-    elif model in mid:
-        return "⚡ Performant"
-    else:
-        return "💰 Économique"

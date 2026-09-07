@@ -11,9 +11,45 @@ Aucun chiffre n'est inventé. Voir RESEARCH_SOURCES.md pour les sources.
 """
 
 import re
+import unicodedata
+from functools import lru_cache
+
 from ..tokens import estimate_tokens
 from ..profiles import MODEL_PRICING, TargetModel
 from .template_helpers import TEMPLATE_INFO
+
+
+@lru_cache(maxsize=4096)
+def normalize_for_matching(text: str) -> str:
+    """Forme comparable d'un texte : minuscules, sans accent, sans trait d'union.
+
+    Motif mesuré (D-057) : les mots-clés de `detect_domain()` ne portaient que
+    `'mot-clé'` et `'mots-clés'`. Un utilisateur francophone qui écrit
+    « mots clés » avec une espace, ou « mots cles » sans accent, n'obtenait
+    **aucune correspondance, tous domaines confondus**, et retombait sur
+    `general` — donc sur aucune recommandation.
+
+    La correction normalise **avant** de comparer, des deux côtés, plutôt que
+    d'empiler les variantes clé par clé : la même lacune menaçait
+    `'longue traîne'`, `'cold email'`, `'référencement'` et toutes les clés
+    multi-mots ou accentuées des autres domaines, et les traiter une à une
+    aurait réintroduit le défaut ailleurs.
+
+    Ce qui est normalisé, et rien d'autre : la casse, les diacritiques, les
+    traits d'union et tirets bas ramenés à une espace, les espaces répétées
+    réduites à une. Les autres séparateurs (`/`, `.`, `<`, `` ` ``) sont
+    laissés intacts : ils portent du sens dans `'a/b test'`, `'robots.txt'`,
+    `'<context>'`.
+
+    Le cache est là parce que la fonction est appelée une fois par mot-clé et
+    par appel : l'ensemble des clés est fini et fixe, il sature au premier
+    appel.
+    """
+    lowered = text.lower()
+    decomposed = unicodedata.normalize("NFD", lowered)
+    without_accents = "".join(c for c in decomposed if not unicodedata.combining(c))
+    spaced = re.sub(r"[-_]+", " ", without_accents)
+    return re.sub(r"\s+", " ", spaced).strip()
 
 
 def analyze_prompt_quality(prompt: str) -> dict:
@@ -632,8 +668,13 @@ def detect_task_type(prompt: str) -> str:
 
 
 def detect_domain(prompt: str) -> str:
-    """Détecte le domaine du prompt pour une recommandation précise."""
-    prompt_lower = prompt.lower()
+    """Détecte le domaine du prompt pour une recommandation précise.
+
+    Prompt et mots-clés passent par `normalize_for_matching()` avant
+    comparaison : sans elle, « mots clés » et « mots cles » ne rencontraient
+    aucune clé d'aucun domaine (D-057).
+    """
+    prompt_lower = normalize_for_matching(prompt)
 
     domains = {
         # === DOMAINES TECHNIQUES ===
@@ -728,7 +769,9 @@ def detect_domain(prompt: str) -> str:
 
     scores = {}
     for domain, keywords in domains.items():
-        scores[domain] = sum(1 for k in keywords if k in prompt_lower)
+        scores[domain] = sum(
+            1 for k in keywords if normalize_for_matching(k) in prompt_lower
+        )
 
     # Protection des domaines spécialisés (ne pas écraser par 'code' si match fort)
     protected_domains = ['legal', 'medical', 'finance', 'math', 'image', 'document', 

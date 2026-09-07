@@ -5,12 +5,84 @@ Tests pour les fonctionnalités Game Changer de PromptForge.
 - Recommandations par domaine
 """
 
-import pytest
+import ast
+import re
 import sys
 from pathlib import Path
 
+import pytest
+
 # S'assurer que le package est importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+WEB_PACKAGE = Path(__file__).parent.parent / "promptforge" / "web"
+
+
+#: Les deux modules qui portent les données affichées à l'utilisateur. Le
+#: verrou d'absence de littéral s'y limite : `assets.py` contient du CSS et des
+#: SVG, où « 100% » est une unité de mise en page, pas un tarif ni une note.
+DATA_MODULES = ("recommendations.py", "profiles_ui.py")
+
+
+def _target_model_aliases(arbre: ast.Module) -> set:
+    """Noms locaux liés à `TargetModel` dans un module.
+
+    Le verrou ne peut pas se contenter de chercher le mot `TargetModel` :
+    `from ..profiles import TargetModel as _TM` remettrait la même table avec un
+    autre nom, et un contrôle littéral la laisserait passer. Mutant M7b, mesuré
+    survivant avant cette correction.
+    """
+    alias = set()
+    for node in ast.walk(arbre):
+        if isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name == "TargetModel":
+                    alias.add(a.asname or a.name)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.endswith("TargetModel"):
+                    alias.add(a.asname or a.name.split(".")[-1])
+    return alias
+
+
+def _module_level_value_nodes(package: Path = WEB_PACKAGE, noms=None):
+    """Rend (chemin, noeud) pour chaque valeur affectée au niveau module.
+
+    Les verrous d'absence de ce fichier lisent la **source**, pas seulement
+    l'espace de noms : un `assert not hasattr(...)` ne dit rien de ce qu'un
+    contributeur réinjecterait sous un autre nom. C'est la leçon de la
+    violation V1 du `CRAFT GATE` sur F-022 : un verrou qui vérifie la présence
+    d'une valeur composée mais jamais l'absence d'un littéral ne verrouille
+    rien.
+    """
+    for chemin in sorted(package.glob("*.py")):
+        if noms is not None and chemin.name not in noms:
+            continue
+        arbre = ast.parse(chemin.read_text(encoding="utf-8"), filename=str(chemin))
+        for node in arbre.body:
+            if isinstance(node, ast.Assign):
+                yield chemin, node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                yield chemin, node.value
+
+
+def _module_level_target_model_refs(package: Path = WEB_PACKAGE):
+    """Rend (chemin, nom) pour chaque référence à `TargetModel` hors fonction."""
+    for chemin in sorted(package.glob("*.py")):
+        arbre = ast.parse(chemin.read_text(encoding="utf-8"), filename=str(chemin))
+        alias = _target_model_aliases(arbre)
+        if not alias:
+            continue
+        for node in arbre.body:
+            if isinstance(node, ast.Assign):
+                valeur = node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                valeur = node.value
+            else:
+                continue
+            for interne in ast.walk(valeur):
+                if isinstance(interne, ast.Name) and interne.id in alias:
+                    yield chemin, interne.id
 
 
 class TestDomainDetection:
@@ -118,6 +190,55 @@ class TestDomainDetection:
         result = detect_domain("bonjour comment vas-tu")
         assert result == "general"
 
+    def test_detect_domain_ignores_hyphens_and_accents(self):
+        """D-057 : « mots clés », « mots cles » et « mots-clés » se valent.
+
+        Mesure avant correction : `detect_domain("trouve des mots cles pour mon
+        site e-commerce")` rendait `general` — zéro correspondance, tous
+        domaines confondus — parce que le dictionnaire ne portait que
+        `'mot-clé'` et `'mots-clés'`. L'utilisateur n'obtenait aucune
+        recommandation.
+        """
+        from promptforge.web.analysis import detect_domain
+
+        for variante in [
+            "trouve des mots-clés pour mon site e-commerce",
+            "trouve des mots clés pour mon site e-commerce",
+            "trouve des mots cles pour mon site e-commerce",
+            "TROUVE DES MOTS CLES POUR MON SITE",
+        ]:
+            assert detect_domain(variante) == "seo", variante
+
+    def test_other_multi_word_keys_survive_the_same_normalisation(self):
+        """La correction vaut pour toutes les clés, pas pour la seule qui était rouge.
+
+        Traiter `'mots-clés'` seul aurait laissé `'longue traîne'`,
+        `'cold email'` et `'fiche de poste'` avec le même défaut : c'est
+        précisément le travers que la normalisation évite.
+        """
+        from promptforge.web.analysis import detect_domain
+
+        attendus = {
+            "analyse la longue traine de mon site": "seo",
+            "rédige un cold email de prospection commerciale": "sales",
+            "rédige une fiche de poste pour un recrutement": "hr",
+        }
+        for prompt, domaine in attendus.items():
+            assert detect_domain(prompt) == domaine, prompt
+
+    def test_normalisation_leaves_meaningful_separators_alone(self):
+        """Seuls casse, accents et traits d'union sont normalisés.
+
+        `/`, `.` et `<` portent du sens dans `'a/b test'`, `'robots.txt'` et
+        `'<context>'` : les écraser élargirait le motif sans le dire.
+        """
+        from promptforge.web.analysis import normalize_for_matching
+
+        assert normalize_for_matching("Mots-Clés") == "mots cles"
+        assert normalize_for_matching("A/B  test") == "a/b test"
+        assert normalize_for_matching("robots.txt") == "robots.txt"
+        assert normalize_for_matching("<context>") == "<context>"
+
 
 class TestTemplateHelpers:
     """Tests pour les helpers de templates métiers."""
@@ -208,10 +329,9 @@ class TestTemplateHelpers:
 class TestDomainRecommendations:
     """Tests pour les recommandations par domaine."""
 
-    def test_import_domain_expertise(self):
-        """Vérifie que DOMAIN_EXPERTISE est importable."""
-        from promptforge.web.recommendations import DOMAIN_EXPERTISE, DOMAIN_LABELS
-        assert isinstance(DOMAIN_EXPERTISE, dict)
+    def test_domain_labels_still_exist(self):
+        """Les libellés de domaine restent : ce sont des noms, pas des notes."""
+        from promptforge.web.recommendations import DOMAIN_LABELS
         assert isinstance(DOMAIN_LABELS, dict)
 
     def test_new_domains_in_labels(self):
@@ -224,22 +344,25 @@ class TestDomainRecommendations:
             assert domain in DOMAIN_LABELS, f"Label manquant pour '{domain}'"
             assert DOMAIN_LABELS[domain], f"Label vide pour '{domain}'"
 
-    def test_new_domains_in_expertise(self):
-        """Vérifie que les nouveaux domaines ont des scores d'expertise."""
-        from promptforge.web.recommendations import DOMAIN_EXPERTISE
-        from promptforge.profiles import TargetModel
-        
-        new_domains = ['seo', 'marketing', 'hr', 'sales', 'product', 'support']
-        
-        # Vérifier pour Claude Opus (représentatif)
-        opus_expertise = DOMAIN_EXPERTISE.get(TargetModel.CLAUDE_OPUS_5, {})
-        
-        for domain in new_domains:
-            assert domain in opus_expertise, f"Expertise manquante pour '{domain}' (Opus)"
-            score, reason = opus_expertise[domain]
-            assert isinstance(score, int), f"Score devrait être int pour '{domain}'"
-            assert 0 <= score <= 100, f"Score hors range pour '{domain}': {score}"
-            assert isinstance(reason, str), f"Reason devrait être str pour '{domain}'"
+    def test_new_domains_are_rendered_without_any_expertise_score(self):
+        """Les domaines métiers restent rendus, sans note d'expertise.
+
+        `DOMAIN_EXPERTISE` attribuait dix-huit couples note/justification par
+        modèle cible, sans source ni méthodologie (D-021). Le rendu doit rester
+        utile pour ces domaines une fois les notes retirées : c'est le critère
+        d'acceptation 4 de F-021, « il affiche moins, mais rien de faux ».
+        """
+        from promptforge.web.recommendations import DOMAIN_LABELS, generate_recommendation
+
+        for domain in ['seo', 'marketing', 'hr', 'sales', 'product', 'support']:
+            rendu = generate_recommendation(
+                formatted_prompt="<task>Un travail à faire</task>",
+                task_type="general",
+                ollama_model=None,
+                domain_override=domain,
+            )
+            assert DOMAIN_LABELS[domain] in rendu, domain
+            assert "expertise" not in rendu.lower(), domain
 
     def test_domain_labels_count(self):
         """Vérifie le nombre total de labels de domaine."""
@@ -394,17 +517,23 @@ class TestProfilesUiDomainParity:
 
         assert set(PROFILE_DETAILS) == set(list_profiles())
 
-    def test_domain_expertise_covers_exactly_target_model(self):
-        """DOMAIN_EXPERTISE couvre exactement TargetModel, ni plus ni moins.
+    def test_no_module_level_structure_is_indexed_by_target_model(self):
+        """Critère 9 de F-021 : plus aucune table de module câblée sur l'énumération.
 
-        Un membre manquant provoque un KeyError au runtime dans
-        `generate_recommendation()` ; un membre en trop signale une
-        énumération désynchronisée du domaine.
+        `DOMAIN_EXPERTISE` câblait les neuf membres de `TargetModel` un par un,
+        dans un dictionnaire évalué à l'import. Conséquence mesurée par
+        l'`ARCHITECTURE GATE` : retirer un seul membre faisait passer la suite
+        de vingt-six à trente-trois rouges, parce que l'import du paquet web
+        entier échouait. Les scores auraient pu disparaître en laissant ce
+        couplage intact ; le critère porte donc sur la structure, pas sur les
+        valeurs.
         """
-        from promptforge.profiles import TargetModel
-        from promptforge.web.recommendations import DOMAIN_EXPERTISE
-
-        assert set(DOMAIN_EXPERTISE) == set(TargetModel)
+        trouve = list(_module_level_target_model_refs())
+        assert not trouve, (
+            f"structure de niveau module référençant l'énumération du domaine : "
+            f"{[(c.name, n) for c, n in trouve]} — un membre retiré casserait "
+            f"l'import du paquet web entier"
+        )
 
     def test_profile_choices_expose_a_label_and_the_profile_key(self):
         """Le menu propose un libellé lisible, et transmet toujours la clé.
@@ -598,3 +727,344 @@ class TestProfilesUiDomainParity:
             f"seuls {len(cites)} modèles sur {len(MODEL_PRICING)} apparaissent "
             f"dans le rendu : {cites}"
         )
+
+
+class TestUnsourcedFiguresAreGone:
+    """F-021 — plus aucune note maison, et la réinjection d'un littéral échoue.
+
+    Ces tests ne vérifient pas seulement que les notes ont disparu : ils
+    vérifient qu'on ne peut pas les remettre. `agent-craft` a imposé ce critère
+    de recette après la violation V1 de F-022, où tous les tests restaient
+    verts alors qu'un tarif faux avait été réinjecté dans une description.
+    """
+
+    # --- ce qui a été supprimé, et doit le rester ------------------------
+
+    def test_removed_symbols_are_gone(self):
+        """Les tables non sourcées ne sont pas renommées, elles sont supprimées."""
+        import promptforge.web.recommendations as reco
+
+        for nom in [
+            "OLLAMA_MODELS_INFO",  # quatorze notes de 68 à 99, sans source
+            "DOMAIN_EXPERTISE",  # dix-huit couples note/justification par modèle
+            "BENCHMARK_SOURCES",  # ne sourçait plus rien de ce qui reste affiché
+            "_context_of",  # n'avait plus d'appelant après le retrait des notes
+        ]:
+            assert not hasattr(reco, nom), nom
+
+    def test_module_level_data_holds_no_figure_nor_price(self):
+        """Verrou d'absence : aucun nombre ni tarif dans les données statiques.
+
+        C'est le verrou demandé : réinjecter `{'qwen3:32b': {'reformat_score':
+        98}}` ou une ligne `| Midjourney V7 | $10-60/mois |` dans une constante
+        de module fait tomber ce test, alors qu'aucun test de présence ne le
+        remarquerait.
+
+        Le contrôle porte sur les **littéraux numériques de l'AST**, pas sur
+        les chiffres écrits dans un texte : `« DEC-006 »` ou une date restent
+        licites dans une phrase, un `98` posé comme valeur ne l'est pas.
+        """
+        prix = re.compile(r"\$|\b\d+(?:[.,]\d+)?\s*%")
+        for chemin, valeur in _module_level_value_nodes(noms=DATA_MODULES):
+            for node in ast.walk(valeur):
+                if isinstance(node, ast.Constant):
+                    if isinstance(node.value, bool):
+                        continue
+                    assert not isinstance(node.value, (int, float)), (
+                        f"{chemin.name}: littéral numérique {node.value!r} dans une "
+                        f"donnée statique — une valeur affichée se compose depuis "
+                        f"une source, elle ne se saisit pas"
+                    )
+                    if isinstance(node.value, str):
+                        trouve = prix.findall(node.value)
+                        assert not trouve, (
+                            f"{chemin.name}: littéral de tarif ou de pourcentage "
+                            f"{trouve} dans {node.value[:60]!r}"
+                        )
+
+    # --- ce que le rendu doit, et ne doit pas, contenir ------------------
+
+    @staticmethod
+    def _rendu(domaine="code", modele=None):
+        from promptforge.web.recommendations import generate_recommendation
+
+        return generate_recommendation(
+            formatted_prompt="<task>Un travail à faire</task>",
+            task_type="general",
+            ollama_model=modele,
+            domain_override=domaine,
+        )
+
+    def test_rendered_recommendation_publishes_no_percentage(self):
+        """Aucun pourcentage : c'était la forme sous laquelle les notes sortaient.
+
+        `generate_recommendation()` publiait `🟢 98%` par modèle cible et
+        `🟡 75% (Suffisant)` pour le modèle local, avec des badges dérivés de
+        seuils à 90 et 75. Rien n'établissait ces nombres.
+        """
+        for domaine in ["code", "seo", "image", "document", "general"]:
+            rendu = self._rendu(domaine)
+            trouve = re.findall(r"\d+\s*%", rendu)
+            assert not trouve, f"{domaine}: pourcentage {trouve} dans le rendu"
+
+    def test_every_rendered_amount_is_computed_from_model_pricing(self):
+        """Chaque montant affiché se recalcule depuis `MODEL_PRICING`.
+
+        Verrou de composition, jumeau de celui de F-022 : réinjecter
+        `$10-60/mois` ou `Gratuit-$0.05` produit un montant que le domaine ne
+        sait pas recalculer, et le test tombe. Vérifier seulement la présence
+        d'un coût correct laisserait passer un second montant faux à côté.
+        """
+        from promptforge.profiles import MODEL_PRICING
+        from promptforge.tokens import estimate_tokens
+
+        prompt = "<task>Un travail à faire</task>"
+        entree = estimate_tokens(prompt)
+        sortie = int(entree * 1.5)
+        attendus = {"$0"} | {
+            f"${p.estimate_cost(entree, sortie):.4f}" for p in MODEL_PRICING.values()
+        }
+
+        for domaine in ["code", "image", "general"]:
+            rendu = self._rendu(domaine, modele="qwen3:8b")
+            for montant in re.findall(r"\$[\d.,]*\d|\$0\b", rendu):
+                assert montant in attendus, (
+                    f"{domaine}: montant {montant!r} absent de ce que "
+                    f"MODEL_PRICING permet de recalculer"
+                )
+
+    def test_image_domain_no_longer_prices_third_party_tools(self):
+        """D-034 : les tarifs d'outils d'image n'étaient ni sourcés ni composables.
+
+        `Midjourney V7 $10-60/mois` et `Flux.2 Gratuit-$0.05` s'affichaient dès
+        que le domaine détecté valait `image`, sans source, sans date, et sans
+        entrée correspondante dans `MODEL_PRICING` : impossible à composer,
+        donc supprimés (DEC-004 §1).
+        """
+        rendu = self._rendu("image")
+        for outil in ["Midjourney", "Flux.2", "Ideogram", "DALL-E"]:
+            assert outil not in rendu, outil
+
+    def test_recommendation_says_quality_is_not_measured(self):
+        """Critère 6 : la limite du classement est écrite, pas enfouie."""
+        rendu = self._rendu("code", modele="qwen3:8b")
+        assert "pas mesuree a ce jour" in rendu
+        assert "pas mesuree" in rendu
+        assert "empreinte memoire" in rendu
+
+    # --- l'ordre, et sur quoi il repose ----------------------------------
+
+    def test_local_models_are_ordered_by_memory_footprint(self):
+        """DEC-006 : l'ordre affiché est celui du catalogue, pas un ordre maison.
+
+        L'assertion porte sur l'ordre **rendu**, et non sur un appel supposé :
+        un tri réintroduit dans l'interface passerait un test qui se
+        contenterait de vérifier que le catalogue est importé.
+        """
+        from promptforge.models_catalog import group_by_memory_tier
+
+        rendu = self._rendu("code")
+        attendu = [
+            m.tag
+            for models in group_by_memory_tier().values()
+            for m in models
+        ]
+        positions = [rendu.index(f"`{tag}`") for tag in attendu]
+        assert positions == sorted(positions), (
+            "les modèles locaux ne sont pas rendus dans l'ordre du catalogue"
+        )
+
+    def test_cloud_models_are_ordered_by_cost(self):
+        """Le seul critère de tri restant est le coût, et il est sourcé."""
+        from promptforge.profiles import MODEL_PRICING
+        from promptforge.tokens import estimate_tokens
+
+        prompt = "<task>Un travail à faire</task>"
+        entree = estimate_tokens(prompt)
+        sortie = int(entree * 1.5)
+        attendu = [
+            p.display_name
+            for p in sorted(
+                MODEL_PRICING.values(),
+                key=lambda p: (p.estimate_cost(entree, sortie), p.display_name),
+            )
+        ]
+
+        rendu = self._rendu("code")
+        positions = [rendu.index(f"**{nom}**") for nom in attendu]
+        assert positions == sorted(positions), attendu
+
+    def test_unknown_ollama_tag_is_declared_unknown(self):
+        """Critère 7 : un tag hors catalogue n'est ni coercé ni deviné.
+
+        L'ancien appariement partiel faisait
+        `model_lower.split(':')[0] == key.split(':')[0]` : qui demandait
+        `qwen3:1.7b` recevait les données de `qwen3:32b` sans le savoir. Servir
+        silencieusement l'entrée d'un voisin est ce qui rend ce genre de défaut
+        indétectable.
+        """
+        from promptforge.web.recommendations import get_ollama_model_info
+
+        assert get_ollama_model_info(None) is None
+        assert get_ollama_model_info("") is None
+
+        connu = get_ollama_model_info("qwen3:8b")
+        assert connu["known"] is True
+        assert "Go" in connu["memory"]
+        assert connu["source_url"].startswith("https://")
+
+        inconnu = get_ollama_model_info("qwen3:1.7b")
+        assert inconnu["known"] is False
+        assert set(inconnu) == {"name", "known"}, (
+            "un tag inconnu ne doit porter aucune valeur estimée à sa place"
+        )
+
+        rendu = self._rendu("code", modele="modele-inexistant:1b")
+        assert "pas au catalogue" in rendu
+
+    # --- D-070 : ce qui est étiqueté est ce qui est mesuré ---------------
+
+    def test_calculate_costs_labels_a_price_not_a_power(self):
+        """D-070 : « Le plus puissant » désignait le modèle le plus cher.
+
+        Le tri porte sur le coût ; la puissance n'est ni mesurée ni sourcée
+        nulle part dans le dépôt. Étiqueter le dernier de la liste « le plus
+        puissant » affirmait une équivalence prix égale puissance que rien
+        n'établit — même famille que les `reformat_score` supprimés.
+        """
+        from promptforge.profiles import MODEL_PRICING
+        from promptforge.web.recommendations import calculate_costs
+
+        rendu = calculate_costs(1000, 500)
+        assert "puissant" not in rendu.lower()
+        assert "Le plus cher" in rendu
+        assert "Le moins cher" in rendu
+
+        cher = max(MODEL_PRICING.values(), key=lambda p: p.estimate_cost(1000, 500))
+        bon_marche = min(MODEL_PRICING.values(), key=lambda p: p.estimate_cost(1000, 500))
+        assert rendu.index(bon_marche.display_name) < rendu.index("Le plus cher")
+        assert cher.display_name in rendu.split("Le plus cher")[1]
+
+    def test_comparison_tables_render_no_quality_tier(self):
+        """Le libellé de « tier » est un jugement, il n'est plus affiché.
+
+        `profiles._get_model_tier()` câblait `🔥 Premium`, `⚡ Performant` et
+        `💰 Économique` par liste de membres, sans mesure ni source (D-071). La
+        fonction a été supprimée côté domaine ; ce verrou garde l'affichage,
+        pour que les libellés ne reviennent pas par une autre porte.
+        """
+        from promptforge.web.recommendations import calculate_costs, get_comparison_table
+
+        for rendu in [get_comparison_table(), calculate_costs(1000, 500)]:
+            for libelle in ["Premium", "Performant"]:
+                assert libelle not in rendu, libelle
+
+
+class TestProfilesUiClaimsNoUnmeasuredAptitude:
+    """D-071, volet interface — aucune aptitude annoncée sans de quoi la fonder.
+
+    Le fichier affirmait des capacités que le dépôt ne connaît pas. Ces verrous
+    sont mécaniques : chacun rattache une famille d'affirmation à la donnée
+    sourcée qui pourrait la fonder, et échoue si l'affirmation revient sans
+    elle.
+    """
+
+    @staticmethod
+    def _textes_statiques():
+        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS, PROFILE_DETAILS
+
+        for nom, description in PROFILE_DESCRIPTIONS.items():
+            yield nom, description
+        for nom, details in PROFILE_DETAILS.items():
+            yield nom, details["title"]
+            for puce in details["bullets"]:
+                yield nom, puce
+
+    def test_no_long_context_claim_without_a_confirmed_window(self):
+        """« Documents longs, codebases entières » supposait une fenêtre connue.
+
+        Mesure du 2026-09-07 : `MODEL_PRICING[GEMINI_3_1_PRO].context_window`
+        vaut `None`, et `MEMORY/VEILLE.md` écrit que la fiche modèle Google
+        était inaccessible (404). Le produit affirmait donc une aptitude fondée
+        sur une capacité qu'il ne connaît pas.
+        """
+        from promptforge.profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
+
+        revendications = [
+            "documents longs",
+            "documents entiers",
+            "codebases",
+            "long contexte",
+            "gros volumes",
+        ]
+        for nom, texte in self._textes_statiques():
+            cible = PRESET_PROFILES[nom].target_model
+            fenetre = (
+                None
+                if cible is TargetModel.UNIVERSAL
+                else MODEL_PRICING[cible].context_window
+            )
+            for mot in revendications:
+                if mot in texte.lower():
+                    assert fenetre is not None, (
+                        f"{nom}: {mot!r} annoncé alors que la fenêtre de contexte "
+                        f"n'est pas confirmée par une source"
+                    )
+
+    def test_no_economy_claim_unless_actually_the_cheapest(self):
+        """« Économique » / « Budget » se vérifie dans `MODEL_PRICING`.
+
+        GPT-5.6 Terra était annoncé « Économique » et « Budget, volume élevé »
+        alors qu'il coûte $2/$12 contre $1.25/$10 pour GPT-5.1 : le produit
+        contredisait sa propre table de tarifs.
+        """
+        from promptforge.profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
+
+        moins_cher = min(p.input_price for p in MODEL_PRICING.values())
+        for nom, texte in self._textes_statiques():
+            minuscule = texte.lower()
+            if not any(m in minuscule for m in ["économique", "budget", "bon marché"]):
+                continue
+            cible = PRESET_PROFILES[nom].target_model
+            assert cible is not TargetModel.UNIVERSAL, nom
+            assert MODEL_PRICING[cible].input_price == moins_cher, (
+                f"{nom}: annonce un tarif avantageux sans être le moins cher "
+                f"de MODEL_PRICING"
+            )
+
+    def test_no_unmeasured_superlative_in_static_text(self):
+        """Un vocabulaire de jugement que rien ne mesure, banni du texte statique.
+
+        « Meilleur pour: », « Ultra-rapide », « Instruction following
+        chirurgical », « Deep thinking », « Idéal » : le dépôt ne mesure ni
+        vitesse, ni suivi d'instruction, ni qualité de raisonnement, et aucune
+        documentation d'éditeur consultée n'en publie de mesure comparative.
+        """
+        interdits = [
+            "meilleur",
+            "excellent",
+            "chirurgical",
+            "ultra-rapide",
+            "le plus puissant",
+            "idéal",
+            "premium",
+            "deep thinking",
+            "deep reasoning",
+        ]
+        for nom, texte in self._textes_statiques():
+            minuscule = texte.lower()
+            for mot in interdits:
+                assert mot not in minuscule, f"{nom}: {mot!r} dans {texte[:60]!r}"
+
+    def test_format_recommendation_still_cites_its_source(self):
+        """Ce qui est sourcé reste : Anthropic recommande bien les balises XML.
+
+        Le ménage ci-dessus ne doit pas emporter les affirmations qui, elles,
+        ont une source. `MEMORY/VEILLE.md` établit qu'Anthropic recommande le
+        balisage XML (recommandation éditoriale qualitative, citée comme telle)
+        et que Google traite XML et Markdown comme interchangeables.
+        """
+        from promptforge.web.profiles_ui import PROFILE_DETAILS
+
+        for nom in ["claude_opus_5", "claude_sonnet_5", "claude_haiku_4.5"]:
+            assert "recommandé par Anthropic" in PROFILE_DETAILS[nom]["title"], nom

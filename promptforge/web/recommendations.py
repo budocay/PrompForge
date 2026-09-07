@@ -1,296 +1,72 @@
 """
-Model recommendations and benchmarks for PromptForge web interface.
-Generates recommendations based on domain detection and model capabilities.
+Recommandations de modeles pour l'interface web de PromptForge.
+
+**Aucune note de qualite n'est produite ni affichee par ce module.** Ni pour les
+modeles locaux, ni pour les modeles cibles. Motif (D-021, DEC-004 §1) : les
+`reformat_score` d'`OLLAMA_MODELS_INFO` — quatorze notes de 68 a 99 — et les
+dix-huit couples note/justification par modele de `DOMAIN_EXPERTISE` n'avaient
+aucune source, aucune mesure et aucune methodologie dans le depot.
+`agent-veille` a confirme deux fois, a quatre jours d'ecart, qu'aucune source
+officielle ne publie de score de suivi de format, pour aucun modele : ces notes
+ne pouvaient donc pas etre sourcees, elles sont supprimees sans attendre leur
+remplacant. Le banc de mesure (DEC-004 §2) reintroduira des chiffres mesures.
+
+Ce que ce module classe, et sur quoi (DEC-006) :
+
+- Les **modeles locaux** sont ordonnes sur leur empreinte memoire d'inference,
+  lue dans `promptforge.models_catalog`, seule source du depot pour ce fait.
+  Rien n'est recalcule ici : `by_memory_footprint()` et `group_by_memory_tier()`
+  font le classement, l'interface le met en forme.
+- Les **modeles cibles** sont ordonnes sur leur cout estime, compose depuis
+  `MODEL_PRICING`, qui porte l'URL de sa source et sa date de verification.
+
+Ni l'un ni l'autre n'est un classement de qualite, et l'interface le dit
+explicitement a chaque rendu plutot que de laisser croire que le premier de la
+liste est « le meilleur ».
 """
 
+from ..models_catalog import (
+    CATALOG,
+    LICENSE_OSI_APPROVED,
+    LICENSE_OSI_UNDETERMINED,
+    LocalModel,
+    get_memory_tier,
+    group_by_memory_tier,
+)
+from ..profiles import MODEL_PRICING, compare_models
 from ..tokens import estimate_tokens
-from ..profiles import MODEL_PRICING, TargetModel, compare_models
-from .analysis import detect_domain, detect_task_type
+from .analysis import detect_domain
 from .profiles_ui import format_context_window
 
 # =============================================================================
-# BENCHMARK SOURCES (December 2025)
-# =============================================================================
-BENCHMARK_SOURCES = {
-    'anthropic': {
-        'url': 'https://www.anthropic.com/news/claude-opus-4-5',
-        'name': 'Anthropic - Claude Opus 4.5 Announcement (Nov 2025)',
-    },
-    'openai': {
-        'url': 'https://openai.com/index/introducing-gpt-5/',
-        'name': 'OpenAI - Introducing GPT-5 (Aug 2025)',
-    },
-    'google': {
-        'url': 'https://blog.google/products/gemini/gemini-3/',
-        'name': 'Google - Gemini 3 Announcement (Nov 2025)',
-    },
-    'swe_bench': {
-        'url': 'https://www.swebench.com/',
-        'name': 'SWE-bench Verified - Real-world Software Engineering',
-    },
-    'gpqa_diamond': {
-        'url': 'https://arxiv.org/abs/2311.12022',
-        'name': 'GPQA Diamond - Graduate-level Science Questions',
-    },
-    'healthbench_hard': {
-        'url': 'https://arxiv.org/abs/2505.08775',
-        'name': 'HealthBench Hard - Medical AI Evaluation',
-    },
-    'aime_2025': {
-        'url': 'https://artofproblemsolving.com/wiki/index.php/AIME',
-        'name': 'AIME 2025 - American Invitational Mathematics Exam',
-    },
-    'image_generation': {
-        'url': 'https://skywork.ai/blog/comparison/',
-        'name': 'AI Image Generation Comparison 2025',
-    },
-    'midjourney': {
-        'url': 'https://docs.midjourney.com/',
-        'name': 'Midjourney V7',
-        'source_review': 'https://www.tomsguide.com/ai/midjourney-version-7',
-    },
-    'flux': {
-        'url': 'https://bfl.ai/',
-        'name': 'FLUX.2 (Black Forest Labs)',
-        'source_review': 'https://venturebeat.com/ai/black-forest-labs-launches-flux-2/',
-    },
-    'ideogram': {
-        'url': 'https://ideogram.ai/',
-        'name': 'Ideogram 3.0',
-        'source_review': 'https://tech-now.io/en/blogs/ideogram-3-0-review-2025/',
-    },
-}
-
-# Ollama models info for local reformatting
-OLLAMA_MODELS_INFO = {
-    # Premium (20GB+ VRAM)
-    'qwen3:32b': {'size': '32B', 'reformat_score': 98, 'tier': 'premium', 'note': 'Excellent suivi XML'},
-    'qwen3:30b-a3b': {'size': '30B MoE', 'reformat_score': 97, 'tier': 'premium', 'note': 'MoE optimal'},
-    'deepseek-r1:32b': {'size': '32B', 'reformat_score': 97, 'tier': 'premium', 'note': 'Excellent raisonnement'},
-    'llama3.1:70b': {'size': '70B', 'reformat_score': 99, 'tier': 'premium', 'note': 'Parfait'},
-
-    # Optimal (12GB+ VRAM)
-    'qwen3:14b': {'size': '14B', 'reformat_score': 92, 'tier': 'optimal', 'note': 'Recommandé pour qualité XML'},
-    'qwen2.5:14b': {'size': '14B', 'reformat_score': 90, 'tier': 'optimal', 'note': 'Stable et fiable'},
-    'deepseek-r1:14b': {'size': '14B', 'reformat_score': 91, 'tier': 'optimal', 'note': 'Bon raisonnement'},
-
-    # Light (8GB VRAM)
-    'qwen3:8b': {'size': '8B', 'reformat_score': 85, 'tier': 'recommended', 'note': 'RECOMMANDÉ - Meilleur raisonnement ⭐'},
-    'llama3.1:8b': {'size': '8B', 'reformat_score': 88, 'tier': 'light', 'note': 'Bon format natif'},
-    'mistral:7b': {'size': '7B', 'reformat_score': 80, 'tier': 'light', 'note': 'Alternative légère'},
-
-    # CPU (4-8GB RAM)
-    'phi4-mini': {'size': '3.8B', 'reformat_score': 75, 'tier': 'cpu', 'note': 'Microsoft - excellent sur CPU'},
-    'phi3:mini': {'size': '3.8B', 'reformat_score': 72, 'tier': 'cpu', 'note': 'Microsoft - léger'},
-    'gemma3n:e4b': {'size': '4B', 'reformat_score': 70, 'tier': 'cpu', 'note': 'Google - edge/mobile'},
-    'qwen3:4b': {'size': '4B', 'reformat_score': 68, 'tier': 'cpu', 'note': 'Qwen - suivi XML limité'},
-}
-
-
-def _context_of(model: TargetModel) -> str:
-    """Fenêtre de contexte lisible, composée depuis MODEL_PRICING.
-
-    Délègue à l'unique formateur de fenêtre du paquet web
-    (`profiles_ui.format_context_window`) : la convention d'affichage a une
-    seule raison de changer, donc un seul endroit où la changer (CRAFT V3).
-
-    Rend une chaîne vide quand la fenêtre n'est pas confirmée. Un appelant qui
-    compose une phrase autour de cette valeur doit donc s'abstenir de le faire
-    pour les modèles concernés plutôt que d'afficher un trou (F-028).
-    """
-    return format_context_window(MODEL_PRICING[model])
-
-
-# Domain expertise scores by model
+# Ce que les classements ne disent pas, ecrit noir sur blanc.
 #
-# Les scores restent non sources (D-021, retrait prevu hors F-028). Ce que
-# F-028 a traite ici : plus aucune colonne « pourquoi » ne reattribue a un
-# modele la mesure d'un autre. Les chiffres de Claude Opus 4.5 ne sont pas
-# ceux d'Opus 5, ceux de Gemini 3 Pro ne sont pas ceux de Gemini 3.1 Pro, et
-# les fenetres de contexte de Gemini ne sont pas confirmees : elles ne sont
-# donc plus composees ici.
-DOMAIN_EXPERTISE = {
-    TargetModel.CLAUDE_OPUS_5: {
-        'code': (98, "Code complexe, agents, architecture"),
-        'legal': (92, f"{_context_of(TargetModel.CLAUDE_OPUS_5)} contexte"),
-        'finance': (90, "Analyse structurée"),
-        'medical': (75, "Prudent"),
-        'creative': (82, "Style structuré"),
-        'research': (88, f"{_context_of(TargetModel.CLAUDE_OPUS_5)} contexte"),
-        'data': (85, "Analyse structurée"),
-        'math': (85, "Raisonnement long"),
-        'image': (60, "Prompts seulement"),
-        'document': (92, f"{_context_of(TargetModel.CLAUDE_OPUS_5)} tokens"),
-        'general': (88, "Polyvalent"),
-        # Nouveaux domaines métiers
-        'seo': (85, "Analyse structurée, recommandations précises"),
-        'marketing': (82, "Campagnes bien structurées"),
-        'hr': (88, "Fiches de poste professionnelles"),
-        'sales': (80, "Emails et pitchs structurés"),
-        'product': (92, "PRD et specs excellentes"),
-        'support': (85, "Réponses empathiques et complètes"),
-    },
-    TargetModel.CLAUDE_SONNET_5: {
-        'code': (95, "Coding au quotidien"),
-        'legal': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_5)} contexte"),
-        'finance': (86, "Bon ratio Q/P"),
-        'medical': (72, "Correct"),
-        'creative': (80, "Style structuré"),
-        'research': (85, "Suivi d'instructions long"),
-        'data': (82, "Solide"),
-        'math': (83, "Raisonnement solide"),
-        'image': (58, "Prompts seulement"),
-        'document': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_5)} tokens"),
-        'general': (85, "Meilleur Q/P Claude"),
-        # Nouveaux domaines métiers
-        'seo': (82, "Bon équilibre qualité/coût"),
-        'marketing': (80, "Recommandé pour volume"),
-        'hr': (85, "Bon pour recrutement"),
-        'sales': (78, "Scripts et emails"),
-        'product': (88, "Bon pour specs"),
-        'support': (82, "Réponses rapides"),
-    },
-    TargetModel.CLAUDE_HAIKU_4_5: {
-        'code': (70, "Prototypage rapide"),
-        'legal': (65, "Résumés basiques"),
-        'finance': (63, "Simple"),
-        'medical': (55, "Non recommandé"),
-        'creative': (68, "Basique"),
-        'research': (60, "Superficielle"),
-        'data': (65, "Extraction"),
-        'math': (62, "Calculs simples"),
-        'image': (50, "Basique"),
-        'document': (65, "Courts uniquement"),
-        'general': (68, "Ultra-rapide"),
-        # Nouveaux domaines métiers
-        'seo': (65, "Tâches simples uniquement"),
-        'marketing': (68, "Volume élevé, qualité basique"),
-        'hr': (62, "Templates simples"),
-        'sales': (65, "Emails courts"),
-        'product': (60, "User stories simples"),
-        'support': (72, "Réponses rapides FAQ"),
-    },
-    TargetModel.GPT_5_1: {
-        'code': (92, "SWE-bench 76.3%"),
-        'legal': (85, "Bon"),
-        'finance': (88, "-45% hallucinations"),
-        'medical': (95, "HealthBench 46.2% SOTA"),
-        'creative': (94, "Ton naturel"),
-        'research': (90, "Deep Research"),
-        'data': (88, "Multimodal"),
-        'math': (96, "AIME 94.6%"),
-        'image': (95, "DALL-E 3 intégré!"),
-        'document': (82, f"{_context_of(TargetModel.GPT_5_1)} tokens"),
-        'general': (93, "Polyvalent"),
-        # Nouveaux domaines métiers
-        'seo': (90, "Excellent pour keyword research"),
-        'marketing': (94, "Top pour copywriting et ads"),
-        'hr': (85, "Fiches de poste engageantes"),
-        'sales': (92, "Excellent pour pitch et objections"),
-        'product': (88, "Bon pour PRD"),
-        'support': (90, "Ton naturel et empathique"),
-    },
-    TargetModel.GPT_5_6_TERRA: {
-        'code': (75, "Simple"),
-        'legal': (68, "Basique"),
-        'finance': (70, "Simple"),
-        'medical': (72, "Questions simples"),
-        'creative': (76, "Standard"),
-        'research': (70, "Rapide"),
-        'data': (72, "Simples"),
-        'math': (78, "Intermédiaires"),
-        'image': (70, "Prompts d'image"),
-        'document': (70, "Courts"),
-        'general': (75, "Excellent Q/P"),
-        # Nouveaux domaines métiers
-        'seo': (72, "Basique"),
-        'marketing': (78, "Bon rapport Q/P"),
-        'hr': (70, "Templates basiques"),
-        'sales': (75, "Emails simples"),
-        'product': (70, "User stories"),
-        'support': (78, "Réponses courtes"),
-    },
-    TargetModel.GPT_5_PRO: {
-        'code': (90, "Extended thinking"),
-        'legal': (88, "Raisonnement approfondi"),
-        'finance': (92, "Modélisation complexe"),
-        'medical': (96, "HealthBench SOTA++"),
-        'creative': (85, "Créatif mais lent"),
-        'research': (93, "Deep research"),
-        'data': (90, "Multi-étapes"),
-        'math': (100, "AIME 100% (tools)"),
-        'image': (90, "DALL-E 3++"),
-        'document': (85, f"{_context_of(TargetModel.GPT_5_PRO)} approfondi"),
-        'general': (91, "Premium"),
-        # Nouveaux domaines métiers
-        'seo': (88, "Analyse approfondie"),
-        'marketing': (85, "Stratégies complexes"),
-        'hr': (90, "Process RH complets"),
-        'sales': (88, "Négociations complexes"),
-        'product': (92, "Roadmaps et stratégie"),
-        'support': (85, "Cas complexes"),
-    },
-    TargetModel.GEMINI_3_1_PRO: {
-        'code': (88, "Bon sur le code"),
-        'legal': (92, "Dossiers volumineux"),
-        'finance': (85, "Analyse de séries longues"),
-        'medical': (78, "Bon"),
-        'creative': (83, "Interfaces créatives"),
-        'research': (96, "Analyse approfondie"),
-        'data': (94, "Gros volumes"),
-        'math': (95, "Raisonnement mathématique"),
-        'image': (75, "Génération via API"),
-        'document': (98, "🏆 Documents entiers"),
-        'general': (89, "Long contexte"),
-        # Nouveaux domaines métiers
-        'seo': (85, "Analyse de grands sites"),
-        'marketing': (82, "Analyse de campagnes"),
-        'hr': (80, "Bon"),
-        'sales': (78, "Standard"),
-        'product': (85, "Contexte produit long"),
-        'support': (80, "KB volumineuse"),
-    },
-    TargetModel.GEMINI_3_6_FLASH: {
-        'code': (68, "Prototypage"),
-        'legal': (65, "Résumés"),
-        'finance': (63, "Basique"),
-        'medical': (58, "Non recommandé"),
-        'creative': (72, "Rapide"),
-        'research': (70, "Rapide"),
-        'data': (75, "Extraction rapide"),
-        'math': (70, "Basiques"),
-        'image': (65, "Génération via API"),
-        'document': (85, "Documents longs, rapide"),
-        'general': (70, "Économique"),
-        # Nouveaux domaines métiers
-        'seo': (68, "Tâches rapides"),
-        'marketing': (70, "Volume"),
-        'hr': (65, "Basique"),
-        'sales': (65, "Emails courts"),
-        'product': (68, "User stories simples"),
-        'support': (72, "FAQ rapides"),
-    },
-    TargetModel.UNIVERSAL: {
-        'code': (60, "Compatible tous"),
-        'legal': (55, "Basique"),
-        'finance': (55, "Basique"),
-        'medical': (50, "Non recommandé"),
-        'creative': (60, "Standard"),
-        'research': (55, "Standard"),
-        'data': (55, "Standard"),
-        'math': (55, "Standard"),
-        'image': (40, "Utiliser outils dédiés"),
-        'document': (55, "Dépend du LLM"),
-        'general': (58, "Fallback"),
-        # Nouveaux domaines métiers
-        'seo': (55, "Basique"),
-        'marketing': (58, "Standard"),
-        'hr': (55, "Standard"),
-        'sales': (55, "Standard"),
-        'product': (55, "Standard"),
-        'support': (58, "Standard"),
-    },
-}
+# Ces phrases ne sont pas decoratives : sans elles, un ordre reste un jugement
+# implicite. Un ordre provisoire annonce comme tel n'est pas une affirmation non
+# fondee ; un ordre silencieux en serait une (F-021).
+# =============================================================================
+
+#: Rappel affiche partout ou des modeles locaux sont ordonnes.
+LOCAL_ORDER_DISCLAIMER = (
+    "Classement par empreinte memoire, pas par qualite. La qualite de "
+    "reformatage de ces modeles n'est **pas mesuree a ce jour** dans ce depot : "
+    "le premier de la liste est le plus lourd, pas le meilleur."
+)
+
+#: Rappel affiche partout ou des modeles cibles sont ordonnes.
+CLOUD_ORDER_DISCLAIMER = (
+    "Classement par cout estime, seule grandeur sourcee ici. La pertinence de "
+    "chaque modele pour ce domaine n'est **pas mesuree** : le depot ne contient "
+    "ni banc d'evaluation, ni note publiee par un editeur."
+)
+
+#: Affiche quand un tag Ollama n'est pas au catalogue. Aucune valeur n'est
+#: devinee a la place : servir silencieusement l'entree d'un modele voisin est
+#: precisement ce que faisait l'ancien appariement partiel.
+UNKNOWN_MODEL_NOTICE = (
+    "Ce tag n'est pas au catalogue source : ni empreinte memoire, ni licence, "
+    "ni fenetre de contexte connues. Rien n'est estime a sa place."
+)
 
 DOMAIN_LABELS = {
     'code': '💻 Code/Dev',
@@ -306,7 +82,7 @@ DOMAIN_LABELS = {
     'general': '🔧 Général',
     'analysis': '📊 Analyse',
     'chat': '💬 Chat',
-    # Nouveaux domaines métiers
+    # Domaines métiers
     'seo': '🔍 SEO/Référencement',
     'marketing': '📢 Marketing Digital',
     'hr': '👥 RH/Recrutement',
@@ -316,49 +92,105 @@ DOMAIN_LABELS = {
 }
 
 
-def get_ollama_model_info(ollama_model: str) -> dict:
-    """Get info about an Ollama model for reformatting."""
+# =============================================================================
+# Mise en forme des faits du catalogue
+#
+# Ces helpers ne decident rien : ils rendent lisible ce que `models_catalog`
+# porte deja. Aucun seuil, aucun palier et aucun ordre n'est recree ici.
+# =============================================================================
+
+
+def _gb(value: float) -> str:
+    """Nombre de Go sans zero decimal inutile : 6.0 -> « 6 », 10.5 -> « 10,5 »."""
+    return f"{value:g}".replace(".", ",")
+
+
+def format_memory_footprint(model: LocalModel) -> str:
+    """Empreinte memoire lisible, avec la nature du chiffre.
+
+    La fourchette est celle du catalogue, transcrite telle quelle. « estimée »
+    et « publiée » ne sont pas un detail de style : `memory_footprint_basis`
+    distingue un chiffre publie par la fiche officielle d'une estimation
+    d'ingenierie de la veille, et l'utilisateur a droit a la difference.
+    """
+    if model.memory_footprint_low_bytes == model.memory_footprint_bytes:
+        span = f"{_gb(model.memory_footprint_gb)} Go"
+    else:
+        span = f"{_gb(model.memory_footprint_low_gb)}–{_gb(model.memory_footprint_gb)} Go"
+    nature = "estimée" if model.memory_footprint_is_estimated else "publiée"
+    return f"{span} ({nature})"
+
+
+def format_license(model: LocalModel) -> str:
+    """Licence annoncee, avec sa qualification OSI.
+
+    Les trois etats du catalogue sont rendus distinctement : un « non
+    determine » n'est pas presente comme un feu vert.
+    """
+    if model.license_osi_status == LICENSE_OSI_APPROVED:
+        return f"{model.license_name} (OSI)"
+    if model.license_osi_status == LICENSE_OSI_UNDETERMINED:
+        return f"{model.license_name} (OSI non déterminé)"
+    return f"{model.license_name} (hors définition OSI)"
+
+
+def get_ollama_model_info(ollama_model: str) -> dict | None:
+    """Faits connus sur un tag Ollama, ou l'aveu qu'il est inconnu.
+
+    Aucun appariement partiel : l'ancien code faisait
+    `model_lower.split(':')[0] == key.split(':')[0]`, ce qui servait les
+    donnees de `qwen3:32b` a qui demandait `qwen3:1.7b`. Un tag absent du
+    catalogue rend `known=False` et rien d'autre — pas d'empreinte devinee, pas
+    de note, pas de `KeyError` non plus, l'appelant etant une interface.
+
+    Returns:
+        dict | None: ``None`` si aucun modele n'est passe. Sinon un dict portant
+        toujours `name` et `known`, et les faits du catalogue si `known`.
+    """
     if not ollama_model:
         return None
 
-    model_lower = ollama_model.lower()
-
-    # Exact match
-    if model_lower in OLLAMA_MODELS_INFO:
-        info = OLLAMA_MODELS_INFO[model_lower].copy()
-        info['name'] = ollama_model
-        return info
-
-    # Partial match
-    sorted_keys = sorted(OLLAMA_MODELS_INFO.keys(), key=len, reverse=True)
-    for key in sorted_keys:
-        if key in model_lower or model_lower.split(':')[0] == key.split(':')[0]:
-            info = OLLAMA_MODELS_INFO[key].copy()
-            info['name'] = ollama_model
-            return info
-
-    # Estimate from name
-    import re
-    size_match = re.search(r'(\d+)b', model_lower)
-    if size_match:
-        size = int(size_match.group(1))
-        if size >= 30:
-            score, tier, note = 95, 'premium', 'Grand modèle'
-        elif size >= 7:
-            score, tier, note = 85, 'optimal', 'Taille idéale'
-        else:
-            score, tier, note = 70, 'minimal', 'Petit modèle'
-    else:
-        size = 0
-        score, tier, note = 75, 'unknown', 'Non référencé'
+    model = CATALOG.get(ollama_model.strip())
+    if model is None:
+        return {'name': ollama_model, 'known': False}
 
     return {
-        'name': ollama_model,
-        'size': f"{size}B" if size else '?',
-        'reformat_score': score,
-        'tier': tier,
-        'note': note
+        'name': model.tag,
+        'known': True,
+        'memory': format_memory_footprint(model),
+        'tier_label': model.memory_tier_label,
+        'license': format_license(model),
+        'source_url': model.source_url,
+        'verified_on': model.verified_on,
     }
+
+
+def _local_catalog_lines() -> list[str]:
+    """Le catalogue local, du plus lourd au plus leger, par palier memoire.
+
+    Le decoupage et l'ordre viennent de `group_by_memory_tier()` : les
+    reconstituer ici recreerait la seconde verite que le catalogue supprime
+    (D-022). Les paliers vides ne sont pas rendus, ils n'apprennent rien.
+    """
+    lines = [
+        "\n---",
+        "### 🧩 Modèles locaux du catalogue, du plus lourd au plus léger\n",
+        f"> {LOCAL_ORDER_DISCLAIMER}\n",
+    ]
+    grouped = group_by_memory_tier()
+    for tier_id, models in grouped.items():
+        if not models:
+            continue
+        lines.append(f"**{get_memory_tier(tier_id).label}**\n")
+        lines.append("| Modèle | Empreinte mémoire | Licence |")
+        lines.append("|--------|-------------------|---------|")
+        for model in models:
+            lines.append(
+                f"| `{model.tag}` | {format_memory_footprint(model)} "
+                f"| {format_license(model)} |"
+            )
+        lines.append("")
+    return lines
 
 
 def generate_recommendation(
@@ -367,19 +199,18 @@ def generate_recommendation(
     ollama_model: str = None,
     domain_override: str = None
 ) -> str:
-    """
-    Generate model recommendation based on domain detection.
+    """Compose le panneau de recommandation affiche apres un reformatage.
 
     Args:
-        formatted_prompt: The reformatted prompt
-        task_type: Detected task type
-        ollama_model: Ollama model used for reformatting
-        domain_override: Force specific domain
+        formatted_prompt: Le prompt reformate.
+        task_type: Type de tache detecte.
+        ollama_model: Tag du modele Ollama ayant servi au reformatage.
+        domain_override: Force un domaine au lieu de le detecter.
 
     Returns:
-        Markdown recommendation text
+        str: texte Markdown. Aucune note de qualite n'y figure ; les deux
+        classements rendus portent leur critere et sa limite.
     """
-    # Estimate tokens
     input_tokens = estimate_tokens(formatted_prompt)
     output_multiplier = {
         'code': 2.5, 'legal': 1.5, 'medical': 1.2, 'finance': 1.5,
@@ -389,166 +220,115 @@ def generate_recommendation(
     }
     output_tokens = int(input_tokens * output_multiplier.get(task_type, 1.5))
 
-    # Detect domain
     domain = domain_override if domain_override else detect_domain(formatted_prompt)
     domain_display = DOMAIN_LABELS.get(domain, '🔧 Général')
 
-    # Get Ollama model info
     ollama_info = get_ollama_model_info(ollama_model)
 
-    # Calculate scores for all models
-    all_models = []
-    # Itère sur MODEL_PRICING, pas sur TargetModel : un adapter d'interface
-    # n'énumère pas exhaustivement une énumération du domaine (F-022 bloc 2).
-    for model, pricing in MODEL_PRICING.items():
-        cost = pricing.estimate_cost(input_tokens, output_tokens)
-
-        expertise = DOMAIN_EXPERTISE[model]
-        score, reason = expertise.get(domain, expertise['general'])
-
-        value_score = score / (cost * 100 + 0.001)
-
-        all_models.append({
-            'model': model,
-            # Nom commercial publie par l'editeur, pas l'identifiant d'API :
-            # cette table est lue par un humain (F-028).
-            'name': pricing.display_name or model.value,
-            'cost': cost,
-            'score': score,
-            'reason': reason,
-            'value': value_score,
-            'context': format_context_window(pricing)
-        })
-
-    all_models.sort(key=lambda x: x['score'], reverse=True)
-
-    # Build recommendation
     lines = [
-        f"### 🎯 Analyse pour ce prompt",
+        "### 🎯 Analyse pour ce prompt",
         f"**Domaine détecté:** {domain_display} | "
         f"**Tokens:** ~{input_tokens:,} input → ~{output_tokens:,} output\n",
     ]
 
-    # Ollama section
+    # --- Modèle local ayant servi au reformatage -----------------------------
     if ollama_info:
         lines.append("---")
         lines.append("### 🔧 Modèle de reformatage (local)\n")
 
-        score = ollama_info['reformat_score']
-        if score >= 85:
-            score_icon, verdict = "🟢", "Excellent"
-        elif score >= 70:
-            score_icon, verdict = "🟡", "Suffisant"
+        if ollama_info['known']:
+            lines.append("| Modèle | Empreinte mémoire | Palier | Licence | Coût |")
+            lines.append("|--------|-------------------|--------|---------|------|")
+            lines.append(
+                f"| **{ollama_info['name']}** | {ollama_info['memory']} "
+                f"| {ollama_info['tier_label']} | {ollama_info['license']} | **$0** |"
+            )
+            lines.append(
+                f"\n📚 Source : {ollama_info['source_url']} "
+                f"(vérifié le {ollama_info['verified_on']})"
+            )
         else:
-            score_icon, verdict = "🟠", "Limite"
+            lines.append(f"**{ollama_info['name']}** — ⚠️ {UNKNOWN_MODEL_NOTICE}")
 
-        tier_labels = {
-            'premium': '🔥 Premium',
-            'optimal': '✅ Optimal',
-            'recommended': '⭐ Recommandé',
-            'light': '💡 Léger',
-            'cpu': '🖥️ CPU',
-            'minimal': '⚠️ Minimal',
-            'unknown': '❓ Inconnu'
-        }
+        lines.append(f"\n⚠️ {LOCAL_ORDER_DISCLAIMER}")
 
-        lines.append(f"| Modèle | Taille | Pertinence | Tier | Coût |")
-        lines.append(f"|--------|--------|------------|------|------|")
-        lines.append(f"| **{ollama_info['name']}** | {ollama_info['size']} | {score_icon} {score}% ({verdict}) | {tier_labels.get(ollama_info['tier'], '❓')} | **$0** |")
-        lines.append(f"\n📝 *{ollama_info['note']}*")
+    lines.extend(_local_catalog_lines())
 
-        # Référence cloud : tarif lu dans le domaine, jamais recopié ici
-        # (F-022 bloc 2).
-        cloud_cost = MODEL_PRICING[TargetModel.CLAUDE_SONNET_5].estimate_cost(
-            input_tokens, output_tokens
-        )
-        lines.append(f"\n💰 **Économie vs Cloud:** ${cloud_cost * 1000:.2f} économisés sur 1000 reformatages")
+    # --- Modèles cibles, ordonnés sur le coût --------------------------------
+    #
+    # Itère sur MODEL_PRICING, jamais sur TargetModel : un adapter d'interface
+    # n'énumère pas exhaustivement une énumération du domaine (F-022 bloc 2,
+    # critère 10 de F-021).
+    all_models = []
+    for model, pricing in MODEL_PRICING.items():
+        all_models.append({
+            'model': model,
+            # Nom commercial publié par l'éditeur, pas l'identifiant d'API :
+            # cette table est lue par un humain (F-028).
+            'name': pricing.display_name or model.value,
+            'cost': pricing.estimate_cost(input_tokens, output_tokens),
+            'context': format_context_window(pricing) or "non confirmé",
+            'source_url': pricing.source_url,
+        })
 
-    # Cloud models section
+    all_models.sort(key=lambda m: (m['cost'], m['name']))
+
     lines.append("\n---")
-    lines.append(f"### 🏆 Modèle recommandé pour EXÉCUTER ce prompt ({domain_display})\n")
-    lines.append("| # | Modèle | Pertinence | Coût | Valeur | Pourquoi |")
-    lines.append("|---|--------|------------|------|--------|----------|")
-
-    for i, m in enumerate(all_models[:5], 1):
-        if m['score'] >= 90:
-            score_icon = "🟢"
-        elif m['score'] >= 75:
-            score_icon = "🟡"
-        else:
-            score_icon = "🟠"
-
-        badge = " 👑" if i == 1 else ""
-        reason_short = m['reason'][:40] + "..." if len(m['reason']) > 40 else m['reason']
-
+    lines.append(f"### 💵 Coût estimé pour exécuter ce prompt ({domain_display})\n")
+    lines.append(f"> {CLOUD_ORDER_DISCLAIMER}\n")
+    lines.append("| # | Modèle | Coût estimé | Contexte |")
+    lines.append("|---|--------|-------------|----------|")
+    for i, m in enumerate(all_models, 1):
         lines.append(
-            f"| {i} | **{m['name']}**{badge} | {score_icon} {m['score']}% | ${m['cost']:.4f} | {m['value']:.0f} | {reason_short} |"
+            f"| {i} | **{m['name']}** | ${m['cost']:.4f} | {m['context']} |"
         )
 
-    best_value = max(all_models, key=lambda x: x['value'])
-    best_domain = all_models[0]
+    cheapest = all_models[0]
+    lines.append(
+        f"\n💰 **Le moins cher pour ce prompt :** {cheapest['name']} "
+        f"(${cheapest['cost']:.4f})"
+    )
 
-    lines.append(f"\n👑 = Meilleur pour {domain_display}")
-
-    # Sources
-    lines.append("\n---")
-    lines.append("### 📚 Sources\n")
-    lines.append(f"- [Anthropic]({BENCHMARK_SOURCES['anthropic']['url']})")
-    lines.append(f"- [OpenAI]({BENCHMARK_SOURCES['openai']['url']})")
-    lines.append(f"- [Google]({BENCHMARK_SOURCES['google']['url']})")
-
-    # Image generation section
-    if domain == 'image':
+    # --- Sources des tarifs affichés -----------------------------------------
+    #
+    # Les URL viennent de MODEL_PRICING, donc de la table réellement affichée.
+    # L'ancienne liste `BENCHMARK_SOURCES` renvoyait vers des annonces de
+    # générations révolues (Claude Opus 4.5, GPT-5) et ne sourçait plus rien de
+    # ce qui restait à l'écran : elle est supprimée (DEC-004 §1).
+    sources = sorted({m['source_url'] for m in all_models if m['source_url']})
+    if sources:
         lines.append("\n---")
-        lines.append("### 🎨 Outils de Génération d'Images 2025\n")
-        lines.append("| Outil | Meilleur pour | Prix |")
-        lines.append("|-------|---------------|------|")
-        lines.append("| **Midjourney V7** | Art, concept | $10-60/mois |")
-        lines.append("| **DALL-E 3** | Marketing, texte | ChatGPT+ |")
-        lines.append("| **Flux.2** | Photoréalisme | Gratuit-$0.05 |")
-        lines.append("| **Ideogram 3** | Logos, typo | Freemium |")
+        lines.append("### 📚 Sources des tarifs\n")
+        lines.extend(f"- {url}" for url in sources)
 
-    # Final recommendation
+    # --- Ce que rien ne dit --------------------------------------------------
     lines.append("\n---")
-    lines.append("### 💡 Recommandation\n")
-
-    if ollama_info:
-        lines.append(f"1. ✅ **Reformatage:** {ollama_info['name']} (gratuit)")
-        lines.append(f"2. 🚀 **Exécution:** {best_domain['name']} ({best_domain['score']}%)")
-    else:
-        lines.append(f"🥇 **Recommandé:** {best_domain['name']} ({best_domain['score']}%)")
-
-    if best_value['model'] != best_domain['model']:
-        lines.append(f"💰 **Meilleur Q/P:** {best_value['name']} (${best_value['cost']:.4f})")
-
-    # Domain tips
-    domain_tips = {
-        'code': "💡 Pour du code complexe, Claude Opus 5 vaut le coup.",
-        'legal': "💡 Gemini 3.1 Pro peut analyser des dossiers complets.",
-        'medical': "💡 GPT-5.1 a le moins d'hallucinations (-45%).",
-        'finance': "💡 Claude structure bien les analyses financières.",
-        'research': "💡 Gemini 3.1 Pro excelle sur les questions de recherche.",
-        'math': "💡 GPT-5 Pro atteint 100% sur AIME 2025.",
-        'image': "🎨 GPT-5.1 avec DALL-E intégré génère directement.",
-        'document': (
-            f"📄 Claude Opus 5 ({_context_of(TargetModel.CLAUDE_OPUS_5)}) et "
-            f"GPT-5.1 ({_context_of(TargetModel.GPT_5_1)}) portent les plus "
-            f"grandes fenêtres confirmées."
-        ),
-        'general': "💡 GPT-5.1 offre le meilleur équilibre.",
-    }
-    lines.append(f"\n{domain_tips.get(domain, domain_tips['general'])}")
+    lines.append("### 💡 Ce que ces deux classements ne disent pas\n")
+    lines.append(
+        "Aucun modèle n'est **recommandé** sur la qualité de sortie : ni ce "
+        "dépôt, ni aucune documentation d'éditeur consultée ne publie de mesure "
+        "de suivi de format par modèle. Les notes maison qui figuraient ici "
+        "n'avaient pas de source et ont été retirées."
+    )
 
     return "\n".join(lines)
 
 
 def get_comparison_table() -> str:
-    """Generate model comparison table."""
+    """Table de comparaison des modèles cibles, ordonnée par coût croissant.
+
+    La colonne « Tier » (`🔥 Premium`, `⚡ Performant`, `💰 Économique`) n'est
+    plus rendue. Elle venait de `profiles._get_model_tier()`, qui câblait les
+    paliers par liste de membres, sans mesure ni source : deux modèles au tarif
+    identique au dollar près en sortaient dans deux paliers différents. La
+    fonction a depuis été **supprimée** (D-071), et non remplacée par un palier
+    dérivé du tarif : la valeur serait sourçable, les bornes ne le seraient pas.
+    """
     comparisons = compare_models(1000, 500)
 
     lines = [
-        "| Modèle | Input/M | Output/M | Contexte | Tier | Coût 1K+500 |",
-        "|--------|---------|----------|----------|------|-------------|"
+        "| Modèle | Input/M | Output/M | Contexte | Coût 1K+500 |",
+        "|--------|---------|----------|----------|-------------|"
     ]
 
     # `label` et non `model` : le tableau s'adresse a l'utilisateur, pas a un
@@ -556,35 +336,42 @@ def get_comparison_table() -> str:
     for c in comparisons:
         lines.append(
             f"| {c['label']} | {c['input_price']} | {c['output_price']} | "
-            f"{c['context']} | {c['tier']} | {c['cost_display']} |"
+            f"{c['context']} | {c['cost_display']} |"
         )
 
     return "\n".join(lines)
 
 
 def calculate_costs(input_tokens: int, output_tokens: int) -> str:
-    """Calculate costs for all models."""
+    """Coût de chaque modèle cible pour un volume de tokens donné.
+
+    Le modèle le plus cher était étiqueté « 🔥 Le plus puissant » (D-070). Le
+    tri porte sur le coût ; la puissance n'est ni mesurée ni sourcée nulle part
+    dans le dépôt. L'étiquette dit donc ce qui est réellement mesuré : un prix.
+    """
     if not input_tokens or not output_tokens:
         return "⚠️ Entre le nombre de tokens"
 
     comparisons = compare_models(int(input_tokens), int(output_tokens))
 
     lines = [
-        f"### 💵 Coût estimé pour {int(input_tokens):,} input + {int(output_tokens):,} output tokens\n",
-        "| Modèle | Coût | Tier |",
-        "|--------|------|------|"
+        f"### 💵 Coût estimé pour {int(input_tokens):,} input + "
+        f"{int(output_tokens):,} output tokens\n",
+        "| Modèle | Coût |",
+        "|--------|------|"
     ]
 
     for c in comparisons:
-        lines.append(f"| {c['label']} | **{c['cost_display']}** | {c['tier']} |")
+        lines.append(f"| {c['label']} | **{c['cost_display']}** |")
 
     cheapest = comparisons[0]
     most_expensive = comparisons[-1]
 
     lines.append(f"\n**💰 Le moins cher:** {cheapest['label']} ({cheapest['cost_display']})")
     lines.append(
-        f"\n**🔥 Le plus puissant:** {most_expensive['label']} "
+        f"\n**💸 Le plus cher:** {most_expensive['label']} "
         f"({most_expensive['cost_display']})"
     )
+    lines.append(f"\n> {CLOUD_ORDER_DISCLAIMER}")
 
     return "\n".join(lines)
