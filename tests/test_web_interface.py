@@ -1,0 +1,357 @@
+"""
+Couture d'assemblage de l'interface web — sonde de construction (D-068).
+
+Ce fichier ne teste aucune logique metier : il construit reellement
+`create_interface()` et inspecte le graphe d'assemblage produit par Gradio.
+
+Motivation (D-068) : les deux seuls tests existants sur cette couture etaient
+un `import` et un `assert callable(...)`. Aucun test ne construisait
+l'application. C'est pourquoi D-063 — dix-neuf composants interactifs cables a
+rien, dont l'integralite de l'onglet « Assistant Guide » — a pu vivre des mois
+sans etre vu, alors que la construction coute 0,12 s sans Ollama et sans
+donnees.
+
+Trois verrous :
+  1. la construction reussit hors ligne, dans un `base_path` temporaire ;
+  2. aucun composant interactif n'est orphelin, hors exemptions **nommees** ;
+  3. les nombres de blocs et de gestionnaires sont figes.
+"""
+
+import time
+from pathlib import Path
+
+import pytest
+
+gr = pytest.importorskip("gradio", reason="Gradio est un extra optionnel ([web])")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BASELINE MESUREE — a mettre a jour sciemment, dans le meme commit que la
+# modification d'interface qui la deplace, jamais « pour faire passer ».
+# Mesure du 2026-09-07, gradio 6.26.0, sur `create_interface()`.
+# ═══════════════════════════════════════════════════════════════════════════
+
+EXPECTED_BLOCK_COUNT = 188
+EXPECTED_HANDLER_COUNT = 27
+EXPECTED_INTERACTIVE_COUNT = 59
+
+# Plafond de temps de construction. La mesure de reference est 0,12 s ; le
+# plafond est volontairement large (facteur ~15) car il ne surveille pas la
+# performance mais la **nature** de la construction : un appel reseau, un scan
+# disque ou une lecture de modele Ollama introduits au moment de l'assemblage
+# feraient exploser ce budget au lieu de passer inapercus.
+BUILD_TIME_BUDGET_SECONDS = 2.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# D-063 — COMPOSANTS INTERACTIFS CABLES A RIEN, EXEMPTION NOMMEE
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Chaque entree est un composant qui existe a l'ecran mais n'est ni
+# declencheur, ni entree, ni sortie d'un gestionnaire : l'utilisateur le voit,
+# le manipule, et rien ne se produit.
+#
+# Cette liste EST la dette D-063, ecrite en clair. Elle doit **decroitre**.
+# Le bloc 2 (DEC-012, cablage de l'assistant guide) en retire dix-sept ; le
+# couple « Prompt a copier » / « Copier le prompt » de l'onglet « Generer
+# config » ferme les deux derniers.
+#
+# Le test echoue dans les DEUX sens : un orphelin nouveau est une regression,
+# une exemption devenue caduque est un progres a acter ici meme.
+
+KNOWN_UNWIRED_D063 = {
+    # --- Onglet « Assistant Guide » : dix-sept composants, la totalite de
+    # l'onglet. `interface.py` porte l'aveu en clair :
+    # « # Logique complete du wizard serait ici ».
+    # L'utilisateur choisit son metier, « Demarrer l'assistant » apparait, il
+    # clique, et rien ne se produit. `web/onboarding.py` (huit metiers, cent
+    # vingt-trois questions, vingt tests) n'est jamais atteint — c'est D-064.
+    "🚀 Assistant Guidé | State | {}",  # reponses accumulees, jamais lues
+    "🚀 Assistant Guidé | State | 0",  # index d'etape, jamais avance
+    "🚀 Assistant Guidé | State | ''",  # metier retenu, jamais consomme
+    "🚀 Assistant Guidé | Textbox | Q1",
+    "🚀 Assistant Guidé | Textbox | Q2",
+    "🚀 Assistant Guidé | Textbox | QTA",
+    "🚀 Assistant Guidé | Dropdown | QS1",
+    "🚀 Assistant Guidé | Dropdown | QS2",
+    "🚀 Assistant Guidé | Dropdown | QMS",
+    "🚀 Assistant Guidé | Number | QN",
+    "🚀 Assistant Guidé | Slider | QSL",
+    "🚀 Assistant Guidé | Button | '⬅️ Précédent'",
+    "🚀 Assistant Guidé | Button | 'Suivant ➡️'",
+    "🚀 Assistant Guidé | Textbox | Configuration générée",
+    "🚀 Assistant Guidé | Textbox | Nom du projet",
+    "🚀 Assistant Guidé | Button | '💾 Sauvegarder le projet'",
+    "🚀 Assistant Guidé | Button | '🔄 Recommencer'",
+    # --- Onglet « Generer config » : le champ de sortie et son bouton de copie
+    # ne sont relies a aucun gestionnaire.
+    "🎯 Générer config | Textbox | 📋 Prompt à copier",
+    "🎯 Générer config | Button | '📋 Copier le prompt'",
+}
+
+# Repartition declaree, pour que le compte reste lisible dans le rapport.
+EXPECTED_EXEMPTIONS_BY_TAB = {
+    "🚀 Assistant Guidé": 17,
+    "🎯 Générer config": 2,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INSTRUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _describe(block) -> str:
+    """Identifiant lisible et stable d'un composant.
+
+    N'utilise **pas** `block._id` : ce compteur est global au processus Gradio,
+    donc decale des qu'un autre test construit un composant avant celui-ci.
+    On se rabat sur (onglet, type, libelle), qui survit a l'ordre des tests.
+    """
+    label = getattr(block, "label", None)
+    if label is None:
+        # Les boutons portent leur texte dans `value`, pas dans `label`.
+        label = repr(getattr(block, "value", None))
+    return f"{_enclosing_tab(block)} | {type(block).__name__} | {label}"
+
+
+def _enclosing_tab(block) -> str:
+    """Remonte les parents jusqu'a l'onglet contenant, pour lever les homonymes."""
+    current = getattr(block, "parent", None)
+    for _ in range(50):  # garde-fou : jamais de remontee infinie
+        if current is None:
+            break
+        if isinstance(current, gr.Tab):
+            return current.label
+        current = getattr(current, "parent", None)
+    return "<hors onglet>"
+
+
+def _handlers(app):
+    """Gestionnaires de l'application, quel que soit le conteneur Gradio."""
+    fns = app.fns
+    return list(fns.values()) if isinstance(fns, dict) else list(fns)
+
+
+def _block_id(reference):
+    """Un identifiant de bloc, qu'il arrive brut ou porte par un composant.
+
+    Rend `None` pour une reference vide : un `.load()` porte par l'application
+    elle-meme n'a pas de bloc declencheur, ce n'est pas un composant.
+    """
+    if reference is None:
+        return None
+    return reference if isinstance(reference, int) else reference._id
+
+
+def _wired_block_ids(app) -> set:
+    """Identifiants des blocs atteints par au moins un gestionnaire.
+
+    Un bloc est cable s'il est declencheur (`targets`), entree (`inputs`) ou
+    sortie (`outputs`) d'un gestionnaire — les trois seules facons pour un
+    composant Gradio de participer a quoi que ce soit.
+    """
+    wired = set()
+    for handler in _handlers(app):
+        for target in handler.targets or []:
+            wired.add(_block_id(target[0] if isinstance(target, tuple) else target))
+        for component in list(handler.inputs or []) + list(handler.outputs or []):
+            wired.add(_block_id(component))
+    wired.discard(None)
+    return wired
+
+
+def _interactive_components(app) -> list:
+    """Composants avec lesquels l'utilisateur interagit ou qui portent un etat.
+
+    Exclut `Markdown` et `HTML`, purement decoratifs : leur absence de cablage
+    est legitime. Tout le reste — champs, menus, boutons, curseurs, fichiers et
+    `State` — doit servir a quelque chose.
+    """
+    return [
+        block
+        for block in app.blocks.values()
+        if isinstance(block, gr.components.Component)
+        and not isinstance(block, (gr.Markdown, gr.HTML))
+    ]
+
+
+class BuiltApp:
+    """Resultat d'une construction instrumentee."""
+
+    def __init__(self, app, seconds, base_path):
+        self.app = app
+        self.seconds = seconds
+        self.base_path = base_path
+
+
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    """Construit l'application hors ligne, dans un `base_path` jetable.
+
+    Deux isolations, toutes deux restaurees en sortie :
+      - le singleton `get_forge()` pointe sur un repertoire temporaire, donc
+        rien n'est ecrit dans `data/`, qui contient les donnees reelles du dev ;
+      - `OllamaProvider` est neutralise, donc aucune socket n'est ouverte et le
+        resultat ne depend pas de la presence d'un serveur ni d'un modele.
+    """
+    from promptforge import providers
+    from promptforge.web import ollama_helpers
+
+    base_path = tmp_path_factory.mktemp("promptforge_web_seam")
+
+    saved = (
+        providers.OllamaProvider.is_available,
+        providers.OllamaProvider.list_models,
+        ollama_helpers._base_path,
+        ollama_helpers._forge,
+    )
+    providers.OllamaProvider.is_available = lambda self: False
+    providers.OllamaProvider.list_models = lambda self: []
+    try:
+        ollama_helpers.set_base_path(str(base_path))
+        from promptforge.web.interface import create_interface
+
+        started = time.perf_counter()
+        app = create_interface()
+        elapsed = time.perf_counter() - started
+        yield BuiltApp(app, elapsed, base_path)
+    finally:
+        (
+            providers.OllamaProvider.is_available,
+            providers.OllamaProvider.list_models,
+            ollama_helpers._base_path,
+            ollama_helpers._forge,
+        ) = saved
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. LA CONSTRUCTION EST POSSIBLE, HORS LIGNE ET SANS DONNEES
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestInterfaceBuilds:
+    def test_create_interface_returns_blocks(self, built):
+        assert isinstance(built.app, gr.Blocks)
+
+    def test_nothing_is_written_outside_the_temporary_base_path(self, built):
+        """La construction ne doit toucher ni `data/`, ni le repertoire courant."""
+        from promptforge.web.ollama_helpers import get_forge
+
+        forge = get_forge()
+        for path in (forge.base_path, forge.db_path, forge.history_path, forge.projects_path):
+            assert Path(path).resolve().is_relative_to(built.base_path.resolve()), (
+                f"{path} sort du base_path temporaire : la construction ecrit hors "
+                f"du bac a sable, donc potentiellement dans les donnees reelles du dev."
+            )
+
+    def test_build_needs_no_ollama_and_stays_cheap(self, built):
+        """Budget de construction : garde-fou contre un appel externe a l'assemblage."""
+        assert built.seconds < BUILD_TIME_BUDGET_SECONDS, (
+            f"Construction en {built.seconds:.2f}s, budget "
+            f"{BUILD_TIME_BUDGET_SECONDS}s (reference mesuree : 0,12s). "
+            f"Un appel reseau ou disque a-t-il ete introduit au moment de "
+            f"l'assemblage plutot que dans un gestionnaire ?"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. LE COEUR : AUCUN COMPOSANT INTERACTIF ORPHELIN HORS EXEMPTION NOMMEE
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestNoUnwiredComponent:
+    def test_every_interactive_component_is_wired_or_named_in_d063(self, built):
+        """Un composant interactif est declencheur, entree, sortie — ou une dette nommee."""
+        wired = _wired_block_ids(built.app)
+        orphans = {
+            _describe(block)
+            for block in _interactive_components(built.app)
+            if block._id not in wired
+        }
+
+        regressions = sorted(orphans - KNOWN_UNWIRED_D063)
+        assert not regressions, (
+            "Composant(s) interactif(s) cable(s) a rien, hors exemption D-063 :\n  "
+            + "\n  ".join(regressions)
+            + "\n\nUn composant qui n'est ni declencheur, ni entree, ni sortie ne "
+            "fait rien quand l'utilisateur le manipule. Cablez-le, retirez-le, "
+            "ou inscrivez-le dans KNOWN_UNWIRED_D063 avec sa justification."
+        )
+
+    def test_exemption_list_holds_no_stale_entry(self, built):
+        """Une exemption devenue caduque doit etre retiree : la dette D-063 se vide."""
+        wired = _wired_block_ids(built.app)
+        orphans = {
+            _describe(block)
+            for block in _interactive_components(built.app)
+            if block._id not in wired
+        }
+
+        resolved = sorted(KNOWN_UNWIRED_D063 - orphans)
+        assert not resolved, (
+            "Exemption(s) D-063 sans objet — le composant est desormais cable, "
+            "ou il a disparu :\n  "
+            + "\n  ".join(resolved)
+            + "\n\nRetirez ces entrees de KNOWN_UNWIRED_D063 dans le meme commit : "
+            "la liste ne doit jamais etre plus longue que la dette reelle."
+        )
+
+    def test_exemptions_are_unambiguous(self, built):
+        """Une exemption ne doit pas couvrir deux composants homonymes.
+
+        Sans ce controle, exempter un libelle duplique masquerait le jour ou le
+        second composant du meme nom, lui, se decablerait.
+        """
+        from collections import Counter
+
+        counts = Counter(_describe(block) for block in _interactive_components(built.app))
+        ambiguous = sorted(name for name in KNOWN_UNWIRED_D063 if counts[name] > 1)
+        assert not ambiguous, (
+            "Exemption(s) D-063 correspondant a plusieurs composants : "
+            f"{ambiguous}. Renommez le libelle ou affinez l'identifiant, "
+            "sinon l'exemption masque plus qu'elle ne declare."
+        )
+
+    def test_debt_inventory_is_declared_not_hidden(self, built):
+        """Le compte de la dette est ecrit noir sur blanc, onglet par onglet.
+
+        Dix-neuf exemptions sur cinquante-neuf composants interactifs, soit
+        32 %. Ce test tombe des que le bloc 2 cable l'assistant : c'est voulu.
+        """
+        from collections import Counter
+
+        by_tab = Counter(name.split(" | ")[0] for name in KNOWN_UNWIRED_D063)
+        assert dict(by_tab) == EXPECTED_EXEMPTIONS_BY_TAB
+        assert len(KNOWN_UNWIRED_D063) == 19
+        assert len(_interactive_components(built.app)) == EXPECTED_INTERACTIVE_COUNT
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. VERROUS DE STRUCTURE : UNE SUPPRESSION ACCIDENTELLE SE VOIT
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAssemblyIsLocked:
+    def test_block_count_is_locked(self, built):
+        assert len(built.app.blocks) == EXPECTED_BLOCK_COUNT, (
+            f"L'application compte {len(built.app.blocks)} blocs au lieu de "
+            f"{EXPECTED_BLOCK_COUNT}. Si le changement est voulu, mettez a jour "
+            f"EXPECTED_BLOCK_COUNT dans le meme commit et dites pourquoi."
+        )
+
+    def test_handler_count_is_locked(self, built):
+        handlers = _handlers(built.app)
+        assert len(handlers) == EXPECTED_HANDLER_COUNT, (
+            f"L'application compte {len(handlers)} gestionnaires au lieu de "
+            f"{EXPECTED_HANDLER_COUNT}. Une suppression accidentelle rend "
+            f"silencieusement des boutons inertes."
+        )
+
+    def test_every_handler_has_a_trigger(self, built):
+        """Un gestionnaire sans declencheur est du code que rien n'appelle."""
+        orphan_handlers = [handler for handler in _handlers(built.app) if not handler.targets]
+        assert not orphan_handlers, (
+            f"{len(orphan_handlers)} gestionnaire(s) sans declencheur : "
+            f"la fonction existe, rien ne la declenche."
+        )
