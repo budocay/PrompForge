@@ -9,7 +9,7 @@ un `import` et un `assert callable(...)`. Aucun test ne construisait
 l'application. C'est pourquoi D-063 — dix-neuf composants interactifs cables a
 rien, dont l'integralite de l'onglet « Assistant Guide » — a pu vivre des mois
 sans etre vu, alors que la construction coute 0,12 s sans Ollama et sans
-donnees.
+donnees. Le bloc 2 (DEC-012) en a resorbe dix-sept ; il en reste deux.
 
 Trois verrous :
   1. la construction reussit hors ligne, dans un `base_path` temporaire ;
@@ -29,11 +29,20 @@ gr = pytest.importorskip("gradio", reason="Gradio est un extra optionnel ([web])
 # BASELINE MESUREE — a mettre a jour sciemment, dans le meme commit que la
 # modification d'interface qui la deplace, jamais « pour faire passer ».
 # Mesure du 2026-09-07, gradio 6.26.0, sur `create_interface()`.
+#
+# Deplacement assume par le bloc 2 (DEC-012, cablage de l'assistant guide) :
+#   blocs        188 -> 211  (-8 champs generiques, +30 champs du pool
+#                             positionnel de `web/wizard.py`, +1 Markdown
+#                             d'erreur `wizard_error`)
+#   gestionnaires 27 -> 33   (+demarrer, +suivant, +precedent, +etat de
+#                             chargement de la sauvegarde, +sauvegarder,
+#                             +recommencer)
+#   interactifs   59 -> 81   (-8 champs generiques, +30 champs du pool)
 # ═══════════════════════════════════════════════════════════════════════════
 
-EXPECTED_BLOCK_COUNT = 188
-EXPECTED_HANDLER_COUNT = 27
-EXPECTED_INTERACTIVE_COUNT = 59
+EXPECTED_BLOCK_COUNT = 211
+EXPECTED_HANDLER_COUNT = 33
+EXPECTED_INTERACTIVE_COUNT = 81
 
 # Plafond de temps de construction. La mesure de reference est 0,12 s ; le
 # plafond est volontairement large (facteur ~15) car il ne surveille pas la
@@ -60,29 +69,6 @@ BUILD_TIME_BUDGET_SECONDS = 2.0
 # une exemption devenue caduque est un progres a acter ici meme.
 
 KNOWN_UNWIRED_D063 = {
-    # --- Onglet « Assistant Guide » : dix-sept composants, la totalite de
-    # l'onglet. `interface.py` porte l'aveu en clair :
-    # « # Logique complete du wizard serait ici ».
-    # L'utilisateur choisit son metier, « Demarrer l'assistant » apparait, il
-    # clique, et rien ne se produit. `web/onboarding.py` (huit metiers, cent
-    # vingt-trois questions, vingt tests) n'est jamais atteint — c'est D-064.
-    "🚀 Assistant Guidé | State | {}",  # reponses accumulees, jamais lues
-    "🚀 Assistant Guidé | State | 0",  # index d'etape, jamais avance
-    "🚀 Assistant Guidé | State | ''",  # metier retenu, jamais consomme
-    "🚀 Assistant Guidé | Textbox | Q1",
-    "🚀 Assistant Guidé | Textbox | Q2",
-    "🚀 Assistant Guidé | Textbox | QTA",
-    "🚀 Assistant Guidé | Dropdown | QS1",
-    "🚀 Assistant Guidé | Dropdown | QS2",
-    "🚀 Assistant Guidé | Dropdown | QMS",
-    "🚀 Assistant Guidé | Number | QN",
-    "🚀 Assistant Guidé | Slider | QSL",
-    "🚀 Assistant Guidé | Button | '⬅️ Précédent'",
-    "🚀 Assistant Guidé | Button | 'Suivant ➡️'",
-    "🚀 Assistant Guidé | Textbox | Configuration générée",
-    "🚀 Assistant Guidé | Textbox | Nom du projet",
-    "🚀 Assistant Guidé | Button | '💾 Sauvegarder le projet'",
-    "🚀 Assistant Guidé | Button | '🔄 Recommencer'",
     # --- Onglet « Generer config » : le champ de sortie et son bouton de copie
     # ne sont relies a aucun gestionnaire.
     "🎯 Générer config | Textbox | 📋 Prompt à copier",
@@ -91,7 +77,6 @@ KNOWN_UNWIRED_D063 = {
 
 # Repartition declaree, pour que le compte reste lisible dans le rapport.
 EXPECTED_EXEMPTIONS_BY_TAB = {
-    "🚀 Assistant Guidé": 17,
     "🎯 Générer config": 2,
 }
 
@@ -297,6 +282,30 @@ class TestNoUnwiredComponent:
             "la liste ne doit jamais etre plus longue que la dette reelle."
         )
 
+    def test_every_button_actually_triggers_something(self, built):
+        """Un bouton qui n'est que `outputs` passe pour cable, et ne fait rien.
+
+        Trou constate par mutation au bloc 2 : supprimer
+        `wizard_start_btn.click(...)` laissait le test d'orphelins vert, parce
+        que le bouton restait sortie d'un autre gestionnaire. Un bouton se juge
+        sur ce qu'il **declenche**, pas sur ce qu'on lui pousse.
+        """
+        triggers = set()
+        for handler in _handlers(built.app):
+            for target in handler.targets or []:
+                triggers.add(_block_id(target[0] if isinstance(target, tuple) else target))
+
+        inert = {
+            _describe(block)
+            for block in built.app.blocks.values()
+            if isinstance(block, gr.Button) and block._id not in triggers
+        }
+        assert not sorted(inert - KNOWN_UNWIRED_D063), (
+            "Bouton(s) qui ne declenchent aucun gestionnaire :\n  "
+            + "\n  ".join(sorted(inert - KNOWN_UNWIRED_D063))
+            + "\n\nL'utilisateur clique, rien ne se produit."
+        )
+
     def test_exemptions_are_unambiguous(self, built):
         """Une exemption ne doit pas couvrir deux composants homonymes.
 
@@ -316,14 +325,16 @@ class TestNoUnwiredComponent:
     def test_debt_inventory_is_declared_not_hidden(self, built):
         """Le compte de la dette est ecrit noir sur blanc, onglet par onglet.
 
-        Dix-neuf exemptions sur cinquante-neuf composants interactifs, soit
-        32 %. Ce test tombe des que le bloc 2 cable l'assistant : c'est voulu.
+        Le bloc 2 (DEC-012) a ramene la dette de dix-neuf exemptions a deux :
+        les dix-sept composants de l'assistant guide sont desormais cables.
+        Restent le champ « Prompt a copier » et son bouton, cible du bloc
+        suivant.
         """
         from collections import Counter
 
         by_tab = Counter(name.split(" | ")[0] for name in KNOWN_UNWIRED_D063)
         assert dict(by_tab) == EXPECTED_EXEMPTIONS_BY_TAB
-        assert len(KNOWN_UNWIRED_D063) == 19
+        assert len(KNOWN_UNWIRED_D063) == 2
         assert len(_interactive_components(built.app)) == EXPECTED_INTERACTIVE_COUNT
 
 

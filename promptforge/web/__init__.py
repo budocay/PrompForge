@@ -10,7 +10,8 @@ This package is modularized for maintainability:
 - recommendations: Model recommendations and benchmarks
 - profiles_ui: Profile selection UI helpers
 - template_helpers: Template loading utilities
-- onboarding: Wizard for creating projects
+- onboarding: Questionnaires metiers (donnee) et generation de contexte
+- wizard: Parcours de l'assistant guide (plan, navigation, sauvegarde)
 - interface: Main Gradio interface
 """
 

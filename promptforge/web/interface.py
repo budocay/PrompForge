@@ -38,7 +38,12 @@ from .scanner_helpers import (
 )
 from .template_helpers import get_template_choices, get_template_content
 from .profiles_ui import get_profile_choices, get_profile_info
-from .onboarding import ONBOARDING_FLOWS, generate_context_from_answers, QuestionType
+from .onboarding import ONBOARDING_FLOWS, QuestionType
+from .wizard import (
+    SLOT_TYPE_ORDER, WIZARD_SLOT_COUNT, SAVE_PENDING_MESSAGE,
+    on_profession_selected, start_wizard, go_next, go_prev,
+    restart_wizard, save_wizard_project
+)
 from .analysis import compare_prompts
 from .recommendations import generate_recommendation, get_comparison_table, calculate_costs
 
@@ -541,19 +546,34 @@ def create_interface() -> gr.Blocks:
                         
                         # Questions
                         with gr.Group(visible=False) as wizard_questions_group:
-                            wizard_progress = gr.Markdown("**Étape 1/5**")
-                            wizard_step_title = gr.Markdown("### 📝 Questions")
-                            
-                            # Champs de questions (génériques)
-                            wq_text_1 = gr.Textbox(label="Q1", visible=False, interactive=True)
-                            wq_text_2 = gr.Textbox(label="Q2", visible=False, interactive=True)
-                            wq_textarea = gr.Textbox(label="QTA", visible=False, lines=4, interactive=True)
-                            wq_select_1 = gr.Dropdown(label="QS1", visible=False, interactive=True, allow_custom_value=True)
-                            wq_select_2 = gr.Dropdown(label="QS2", visible=False, interactive=True, allow_custom_value=True)
-                            wq_multiselect = gr.Dropdown(label="QMS", visible=False, multiselect=True, interactive=True, allow_custom_value=True)
-                            wq_number = gr.Number(label="QN", visible=False, interactive=True)
-                            wq_slider = gr.Slider(label="QSL", visible=False, minimum=0, maximum=100, interactive=True)
-                            
+                            wizard_progress = gr.Markdown("")
+                            wizard_step_title = gr.Markdown("")
+
+                            # Pool positionnel de champs (voir web/wizard.py).
+                            # La question i d'une etape occupe le bloc i ; seul
+                            # le champ de son type y est visible. La capacite est
+                            # derivee de la donnee, donc aucune question ne peut
+                            # etre tronquee en silence.
+                            wizard_fields = []
+                            for _slot in range(WIZARD_SLOT_COUNT):
+                                for _qtype in SLOT_TYPE_ORDER:
+                                    _tag = f"Q{_slot + 1}·{_qtype.value}"
+                                    if _qtype is QuestionType.TEXT:
+                                        _field = gr.Textbox(label=_tag, visible=False, interactive=True)
+                                    elif _qtype is QuestionType.TEXTAREA:
+                                        _field = gr.Textbox(label=_tag, visible=False, lines=4, interactive=True)
+                                    elif _qtype is QuestionType.SELECT:
+                                        _field = gr.Dropdown(label=_tag, visible=False, interactive=True, allow_custom_value=True)
+                                    elif _qtype is QuestionType.MULTISELECT:
+                                        _field = gr.Dropdown(label=_tag, visible=False, multiselect=True, interactive=True, allow_custom_value=True)
+                                    elif _qtype is QuestionType.NUMBER:
+                                        _field = gr.Number(label=_tag, visible=False, interactive=True)
+                                    else:
+                                        _field = gr.Slider(label=_tag, visible=False, minimum=0, maximum=100, step=1, interactive=True)
+                                    wizard_fields.append(_field)
+
+                            wizard_error = gr.Markdown("")
+
                             with gr.Row():
                                 wizard_prev_btn = gr.Button("⬅️ Précédent", variant="secondary")
                                 wizard_next_btn = gr.Button("Suivant ➡️", variant="primary")
@@ -1082,47 +1102,63 @@ ollama pull qwen3:8b
             outputs=[cost_result]
         )
         
-        # --- Wizard (Templates Métiers) ---
-        def on_profession_selected(profession_name):
-            """Quand un métier est sélectionné, affiche le message de bienvenue."""
-            if not profession_name:
-                return "", gr.update(visible=False)
+        # --- Wizard « Assistant Guidé » (DEC-012) ---
+        # Toute la logique vit dans web/wizard.py ; ici on ne fait que
+        # brancher. L'ordre des `outputs` suit WIZARD_NAV_OUTPUT_NAMES.
+        wizard_nav_outputs = [
+            wizard_profession, wizard_step, wizard_answers,
+            wizard_start_group, wizard_questions_group, wizard_result_group,
+            wizard_progress, wizard_step_title, wizard_error,
+            wizard_prev_btn, wizard_next_btn, wizard_result,
+        ] + wizard_fields
 
-            # Trouver la clé du flow
-            flow_key = None
-            for key, flow in ONBOARDING_FLOWS.items():
-                if flow["name"] == profession_name:
-                    flow_key = key
-                    break
+        wizard_nav_inputs = [wizard_profession, wizard_step, wizard_answers] + wizard_fields
 
-            if not flow_key:
-                return "", gr.update(visible=False)
-
-            flow = ONBOARDING_FLOWS[flow_key]
-
-            # Compter le total de questions dans tous les steps
-            total_questions = sum(len(step.questions) for step in flow.get('steps', []))
-            num_steps = len(flow.get('steps', []))
-
-            welcome = f"""
-### 👋 Bienvenue, {flow['name']}!
-
-{flow.get('welcome', 'Nous allons créer ensemble ta configuration personnalisée.')}
-
-**{num_steps} étapes, ~{total_questions} questions** pour générer un profil adapté à ton métier.
-            """
-
-            return welcome, gr.update(visible=True)
-        
         wizard_profession_dropdown.change(
             fn=on_profession_selected,
             inputs=[wizard_profession_dropdown],
             outputs=[wizard_welcome_msg, wizard_start_btn]
         )
-        
-        # Logique complète du wizard serait ici (similaire à interface.py)
-        # Pour simplifier, on garde la logique existante
-        
+
+        wizard_start_btn.click(
+            fn=start_wizard,
+            inputs=[wizard_profession_dropdown],
+            outputs=wizard_nav_outputs
+        )
+
+        wizard_next_btn.click(
+            fn=go_next,
+            inputs=wizard_nav_inputs,
+            outputs=wizard_nav_outputs
+        )
+
+        wizard_prev_btn.click(
+            fn=go_prev,
+            inputs=wizard_nav_inputs,
+            outputs=wizard_nav_outputs
+        )
+
+        # Etat de chargement explicite : l'ecriture disque et l'enregistrement
+        # en base sont les seules operations non instantanees du parcours.
+        wizard_save_btn.click(
+            fn=lambda: SAVE_PENDING_MESSAGE,
+            outputs=[wizard_save_status]
+        ).then(
+            fn=save_wizard_project,
+            inputs=[wizard_project_name, wizard_result],
+            outputs=[wizard_save_status, project_select, projects_list_dropdown]
+        )
+
+        wizard_restart_btn.click(
+            fn=restart_wizard,
+            outputs=[
+                wizard_profession, wizard_step, wizard_answers,
+                wizard_start_group, wizard_questions_group, wizard_result_group,
+                wizard_profession_dropdown, wizard_welcome_msg, wizard_start_btn,
+                wizard_result, wizard_project_name, wizard_save_status,
+            ]
+        )
+
         logger.info("Interface v4 created successfully")
     
     return interface
