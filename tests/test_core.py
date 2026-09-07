@@ -338,11 +338,68 @@ class TestModelPricingContract:
     créé un jour.
     """
 
-    def test_pricing_table_covers_exactly_target_model(self):
-        """Parité stricte : une entrée de tarif par modèle cible, ni plus ni moins."""
+    def test_pricing_table_covers_exactly_the_real_models(self):
+        """Une entrée de tarif par modèle réel, aucune pour le synthétique.
+
+        `TargetModel.UNIVERSAL` ne désigne aucun modèle : lui attribuer un
+        tarif reviendrait à afficher le prix d'un produit qui n'existe pas
+        (DEC-004 §1, résorption de D-032 par F-028).
+        """
         from promptforge.profiles import MODEL_PRICING, TargetModel
 
-        assert set(MODEL_PRICING) == set(TargetModel)
+        assert set(MODEL_PRICING) == set(TargetModel) - {TargetModel.UNIVERSAL}
+        assert TargetModel.UNIVERSAL not in MODEL_PRICING
+
+    def test_target_model_holds_no_retired_or_fictional_identifier(self):
+        """Aucun identifiant arrêté ou sans existence connue ne subsiste.
+
+        Les trois valeurs listées ci-dessous ont été mesurées le 2026-09-07 :
+        `gemini-3-pro` arrêté le 2026-03-09, `gemini-3-flash` déprécié, et
+        `gpt-5.1-mini` répondant 404 sur sa fiche modèle pour la deuxième fois
+        indépendante. Proposer une cible inatteignable est aussi faux
+        qu'afficher un tarif inventé.
+        """
+        from promptforge.profiles import TargetModel
+
+        interdits = {"gemini-3-pro", "gemini-3-flash", "gpt-5.1-mini"}
+        valeurs = {model.value for model in TargetModel}
+        assert not (valeurs & interdits), sorted(valeurs & interdits)
+
+    def test_unconfirmed_context_windows_are_none_not_a_stale_number(self):
+        """Une fenêtre non reconfirmée vaut None, pas le chiffre d'avant.
+
+        Les fiches modèles de `gemini-3.1-pro-preview`, `gemini-3.6-flash` et
+        `gpt-5.6-terra` n'ont pas pu être ouvertes le 2026-09-07. Recopier la
+        fenêtre de la génération précédente afficherait une mesure que
+        personne n'a faite sur ces modèles.
+        """
+        from promptforge.profiles import MODEL_PRICING, TargetModel
+
+        non_confirmes = {
+            TargetModel.GEMINI_3_1_PRO,
+            TargetModel.GEMINI_3_6_FLASH,
+            TargetModel.GPT_5_6_TERRA,
+        }
+        for model in non_confirmes:
+            assert MODEL_PRICING[model].context_window is None, model
+
+    def test_every_pricing_entry_carries_an_official_source(self):
+        """Plus aucune entrée sans source : celles qui n'en avaient pas sont parties.
+
+        Avant F-028, quatre entrées portaient un `source_url` vide et
+        restaient affichées à l'utilisateur (D-032).
+        """
+        from promptforge.profiles import MODEL_PRICING
+
+        for model, pricing in MODEL_PRICING.items():
+            assert pricing.source_url, model
+            assert pricing.verified_on == "2026-09-07", model
+
+    def test_universal_profile_carries_no_pricing(self):
+        """Le profil universel n'expose aucun tarif, même par défaut."""
+        from promptforge.profiles import PRESET_PROFILES
+
+        assert PRESET_PROFILES["universel"].pricing is None
 
     def test_every_pricing_entry_is_a_model_pricing(self):
         """Chaque valeur est bien une ModelPricing exploitable."""
@@ -352,7 +409,8 @@ class TestModelPricingContract:
             assert isinstance(pricing, ModelPricing), model
             assert pricing.input_price > 0, model
             assert pricing.output_price > 0, model
-            assert pricing.context_window > 0, model
+            # None = fenêtre non confirmée par une source ; jamais 0 ni négatif.
+            assert pricing.context_window is None or pricing.context_window > 0, model
 
     def test_cached_input_is_never_zero(self):
         """Un cache absent vaut None, jamais 0.0 : zéro facturerait un cache gratuit."""
@@ -407,7 +465,12 @@ class TestModelPricingContract:
         assert MODEL_PRICING[TargetModel.GPT_5_PRO].cached_input is None
 
     def test_corrected_values_match_the_official_sources(self):
-        """Les quatre corrections de F-022, vérifiées le 2026-09-03."""
+        """Valeurs relevées sur les pages officielles, F-022 puis F-028.
+
+        Les quatre corrections de F-022 tiennent toujours pour les modèles
+        qu'elle visait et qui restent ciblés ; s'y ajoutent les valeurs des
+        trois modèles introduits par F-028, relevées le 2026-09-07.
+        """
         from promptforge.profiles import MODEL_PRICING, TargetModel
 
         haiku = MODEL_PRICING[TargetModel.CLAUDE_HAIKU_4_5]
@@ -418,10 +481,182 @@ class TestModelPricingContract:
         assert gpt5pro.context_window == 400_000
 
         assert MODEL_PRICING[TargetModel.GPT_5_1].context_window == 400_000
-        assert MODEL_PRICING[TargetModel.CLAUDE_SONNET_4_5].context_window == 200_000
+
+        # F-028 : Sonnet 5 remplace Sonnet 4.5 et coûte moins cher, avec la
+        # fenêtre 1M réservée à Claude 4.6+.
+        sonnet = MODEL_PRICING[TargetModel.CLAUDE_SONNET_5]
+        assert (sonnet.input_price, sonnet.output_price) == (2.0, 10.0)
+        assert sonnet.context_window == 1_000_000
+
+        opus = MODEL_PRICING[TargetModel.CLAUDE_OPUS_5]
+        assert (opus.input_price, opus.output_price) == (5.0, 25.0)
+        assert opus.context_window == 1_000_000
+
+        terra = MODEL_PRICING[TargetModel.GPT_5_6_TERRA]
+        assert (terra.input_price, terra.output_price) == (2.0, 12.0)
+
+        # Palier « jusqu'à 200K tokens d'entrée » pour Gemini 3.1 Pro.
+        gemini_pro = MODEL_PRICING[TargetModel.GEMINI_3_1_PRO]
+        assert (gemini_pro.input_price, gemini_pro.output_price) == (2.0, 12.0)
+
+        # Tarif d'introduction Gemini 3.6 Flash, valable jusqu'au 2026-12-31.
+        gemini_flash = MODEL_PRICING[TargetModel.GEMINI_3_6_FLASH]
+        assert (gemini_flash.input_price, gemini_flash.output_price) == (0.75, 3.75)
 
     def test_model_pricing_has_no_dead_member(self):
         """avg_price_per_1k est supprimée : aucun appelant, contrat nettoyé."""
         from promptforge.profiles import ModelPricing
 
         assert not hasattr(ModelPricing, "avg_price_per_1k")
+
+    def test_profiles_module_holds_no_dead_helper(self):
+        """Quatre fonctions sans aucun appelant sont supprimées (F-028).
+
+        Elles n'étaient ni exportées par `promptforge/__init__.py`, ni citées
+        par `CLAUDE.md`, ni appelées par `promptforge/` ou `tests/`. Les
+        repointer vers les nouveaux modèles aurait entretenu une abstraction
+        de vitrine ; `compare_models()`, elle, a deux appelants vivants et
+        reste en place.
+        """
+        import promptforge.profiles as profiles
+
+        for nom in (
+            "get_recommendation",
+            "get_pricing",
+            "format_comparison_table",
+            "get_model_optimization_tips",
+        ):
+            assert not hasattr(profiles, nom), nom
+
+        assert hasattr(profiles, "compare_models")
+
+    def test_target_model_values_are_the_exact_published_identifiers(self):
+        """Les huit identifiants sont ceux publiés, à la lettre.
+
+        `claude-haiku-4-5-20251001` détonne à côté de `claude-opus-5` et
+        `claude-sonnet-5`, et reste pourtant tel quel : la page officielle du
+        2026-09-07 ne publie que cette forme datée, Anthropic n'ayant cessé de
+        dater ses identifiants qu'à partir de Claude 4.6. Raccourcir en
+        `claude-haiku-4-5` par souci d'homogénéité fabriquerait un alias
+        qu'aucune source ne documente. La lisibilité est le rôle de
+        `display_name`, pas celui de l'identifiant.
+        """
+        from promptforge.profiles import TargetModel
+
+        assert {model.value for model in TargetModel} == {
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+            "gpt-5.1",
+            "gpt-5.6-terra",
+            "gpt-5-pro",
+            "gemini-3.1-pro-preview",
+            "gemini-3.6-flash",
+            "universal",
+        }
+
+    def test_every_pricing_entry_carries_a_readable_display_name(self):
+        """Chaque modèle porte le nom commercial publié par son éditeur.
+
+        Sans lui, les surfaces destinées à l'utilisateur affichent
+        `claude-haiku-4-5-20251001` ou `gpt-5-pro` : exact, sourcé, illisible.
+        """
+        from promptforge.profiles import MODEL_PRICING, TargetModel
+
+        attendus = {
+            TargetModel.CLAUDE_OPUS_5: "Claude Opus 5",
+            TargetModel.CLAUDE_SONNET_5: "Claude Sonnet 5",
+            TargetModel.CLAUDE_HAIKU_4_5: "Claude Haiku 4.5",
+            TargetModel.GPT_5_1: "GPT-5.1",
+            TargetModel.GPT_5_6_TERRA: "GPT-5.6 Terra",
+            TargetModel.GPT_5_PRO: "GPT-5 Pro",
+            TargetModel.GEMINI_3_1_PRO: "Gemini 3.1 Pro",
+            TargetModel.GEMINI_3_6_FLASH: "Gemini 3.6 Flash",
+        }
+        assert {m: p.display_name for m, p in MODEL_PRICING.items()} == attendus
+
+    def test_compare_models_exposes_both_identifier_and_label(self):
+        """La comparaison porte l'identifiant ET le nom lisible, pas l'un ou l'autre."""
+        from promptforge.profiles import MODEL_PRICING, compare_models
+
+        rows = compare_models(1000, 500)
+        assert len(rows) == len(MODEL_PRICING)
+        identifiants = {p.display_name: m.value for m, p in MODEL_PRICING.items()}
+        for row in rows:
+            assert row["label"] in identifiants
+            assert row["model"] == identifiants[row["label"]]
+
+    def test_universal_prompt_imposes_no_syntax_and_cites_its_source(self):
+        """DEC-008 : le profil universel exige la cohérence, pas une syntaxe.
+
+        Il ne vise aucun modèle et ne peut donc citer aucune documentation
+        d'éditeur à l'appui d'un « XML UNIQUEMENT ». Il demande des
+        délimiteurs clairs — balises XML ou titres Markdown — et une seule
+        convention sur tout le prompt, seule règle réellement commune aux trois
+        éditeurs, que Google documente explicitement.
+        """
+        from promptforge.profiles import SYSTEM_PROMPT_UNIVERSAL
+
+        assert "XML UNIQUEMENT" not in SYSTEM_PROMPT_UNIVERSAL
+        assert "PAS DE MARKDOWN" not in SYSTEM_PROMPT_UNIVERSAL
+        assert "ai.google.dev/gemini-api/docs/prompting-strategies" in SYSTEM_PROMPT_UNIVERSAL
+        assert "2026-06-10" in SYSTEM_PROMPT_UNIVERSAL
+        # Les deux conventions sont proposées, pas une seule imposée.
+        assert "Markdown" in SYSTEM_PROMPT_UNIVERSAL
+        assert "<context>" in SYSTEM_PROMPT_UNIVERSAL
+
+    def test_gemini_prompts_no_longer_claim_an_absolute_google_never_wrote(self):
+        """DEC-007 volet 2 : plus d'« XML UNIQUEMENT » sur les profils Gemini.
+
+        La source Google, mise à jour le 2026-06-10, documente balises XML et
+        titres Markdown comme deux délimiteurs efficaces au choix ; la seule
+        exigence est la cohérence interne. Le produit continue de retenir XML
+        pour que sa sortie reste prévisible, mais le dit comme une convention
+        de produit et cite la source, au lieu de présenter un absolu que
+        l'éditeur n'a jamais écrit.
+        """
+        from promptforge.profiles import (
+            SYSTEM_PROMPT_GEMINI_3_1_PRO,
+            SYSTEM_PROMPT_GEMINI_3_6_FLASH,
+        )
+
+        for prompt in (SYSTEM_PROMPT_GEMINI_3_1_PRO, SYSTEM_PROMPT_GEMINI_3_6_FLASH):
+            assert "XML UNIQUEMENT" not in prompt
+            assert "PAS DE MARKDOWN" not in prompt
+            assert "ai.google.dev/gemini-api/docs/prompting-strategies" in prompt
+            assert "2026-06-10" in prompt
+            # La convention retenue reste XML, et elle est annoncée comme telle.
+            assert "<balise>contenu</balise>" in prompt
+
+    def test_no_system_prompt_imposes_xml_as_an_absolute_without_a_source(self):
+        """Aucun profil n'écrit « XML UNIQUEMENT » sans source à l'appui.
+
+        Anthropic recommande réellement les balises XML : les profils Claude
+        gardent donc leur consigne. Personne ne documente cet absolu pour
+        Gemini ni pour un profil qui ne cible aucun modèle.
+        """
+        from promptforge.profiles import SYSTEM_PROMPTS, TargetModel
+
+        sans_source = set(TargetModel) - {
+            TargetModel.CLAUDE_OPUS_5,
+            TargetModel.CLAUDE_SONNET_5,
+            TargetModel.CLAUDE_HAIKU_4_5,
+        }
+        for model in sans_source:
+            assert "XML UNIQUEMENT" not in SYSTEM_PROMPTS[model], model
+
+    def test_static_system_prompts_hold_no_context_literal(self):
+        """Aucun prompt système n'annonce une fenêtre que MODEL_PRICING dément.
+
+        Verrou demandé par D-053 : `SYSTEM_PROMPT_GPT_5_1` annonçait « Contexte
+        272K tokens » pendant que la table du domaine portait 400 000, dans le
+        même fichier. Un prompt système ne recopie plus de fenêtre du tout.
+        """
+        import re
+
+        from promptforge.profiles import SYSTEM_PROMPTS
+
+        literal = re.compile(r"[Cc]ontexte[^\n]*?\b\d+(?:[.,]\d+)?\s*[KM]\b")
+        for model, prompt in SYSTEM_PROMPTS.items():
+            trouve = literal.findall(prompt)
+            assert not trouve, f"{model}: fenêtre de contexte en dur {trouve}"

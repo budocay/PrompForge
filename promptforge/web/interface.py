@@ -695,15 +695,8 @@ Plus tu donnes de détails à l'IA, meilleure sera ta configuration! N'hésite p
                 
                 gr.Markdown("""
 ---
-### 💡 Recommandations par cas d'usage
-
-| Tâche | 🏆 Meilleur | ⚡ Équilibré | 💰 Budget |
-|-------|------------|-------------|-----------|
-| **Code complexe** | Claude Opus 4.5 | Claude Sonnet 4.5 | GPT-4o Mini |
-| **Chat / Assistant** | GPT-4o | Gemini 2 Flash | Claude Haiku |
-| **Analyse longue** | Gemini 2 Pro (1M!) | Claude Sonnet 4.5 | GPT-4o Mini |
-| **Créativité** | GPT-4o | Claude Sonnet 4.5 | Gemini 2 Flash |
-| **Volume élevé** | GPT-4o Mini | Claude Haiku | Gemini 2 Flash |
+La recommandation propre à un prompt est calculée dans l'onglet
+**✨ Reformater**, à partir du prompt reformaté et des tarifs officiels.
                 """)
             
             # ═══════════════════════════════════════════════════════════
@@ -733,10 +726,10 @@ Plus tu donnes de détails à l'IA, meilleure sera ta configuration! N'hésite p
 
 | Profil | LLM cible | Format |
 |--------|-----------|--------|
-| **⚪ Universel** | Tous | Mixte compatible |
-| **🟣 Claude** | Claude 4.x | XML structuré |
-| **🟢 GPT** | GPT-4/4o | Markdown enrichi |
-| **🔵 Gemini** | Gemini 2 | XML adapté |
+| **⚪ Universel** | Aucun modèle précis | XML structuré |
+| **🟣 Claude** | Opus 5, Sonnet 5, Haiku 4.5 | XML structuré |
+| **🟢 GPT** | GPT-5.1, GPT-5.6 Terra, GPT-5 Pro | Markdown enrichi |
+| **🔵 Gemini** | Gemini 3.1 Pro, Gemini 3.6 Flash | XML adapté |
 
 ---
 

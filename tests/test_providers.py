@@ -196,3 +196,26 @@ class TestFormatPromptWithOllama:
         # Vérifie que le prompt contient des mots-clés attendus
         prompt_lower = REFORMAT_SYSTEM_PROMPT.lower()
         assert "xml" in prompt_lower or "prompt" in prompt_lower or "réécris" in prompt_lower
+
+
+class TestDeadCodeRemoved:
+    """`ensure_xml_format()` est supprimée : aucun appelant (D-055, F-028).
+
+    Septième fonction morte du dépôt, découverte après la rédaction de la
+    roadmap qui n'en dénombrait que six. Elle n'était appelée ni par
+    `promptforge/`, ni par `tests/`, et n'apparaissait ni dans `__all__` ni
+    dans `CLAUDE.md`. Les deux fonctions dont elle n'était qu'un aiguillage,
+    `is_markdown_format()` et `convert_markdown_to_xml()`, restent vivantes :
+    `format_prompt_with_ollama()` les appelle directement.
+    """
+
+    def test_ensure_xml_format_is_gone(self):
+        import promptforge.providers as providers
+
+        assert not hasattr(providers, "ensure_xml_format")
+
+    def test_the_two_live_helpers_it_wrapped_are_still_there(self):
+        import promptforge.providers as providers
+
+        assert hasattr(providers, "is_markdown_format")
+        assert hasattr(providers, "convert_markdown_to_xml")

@@ -143,7 +143,7 @@ class TestRealPromptGeneration:
             raw_prompt="Explain dependency injection",
             project_context="Python FastAPI project",
             provider=ollama_provider,
-            profile_name="claude_sonnet_4.5"
+            profile_name="claude_sonnet_5"
         )
 
         assert result is not None

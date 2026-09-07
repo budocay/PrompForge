@@ -359,22 +359,6 @@ def convert_markdown_to_xml(text: str, profile_name: Optional[str] = None) -> st
     return '\n\n'.join(xml_parts)
 
 
-def ensure_xml_format(text: str, profile_name: Optional[str] = None) -> str:
-    """
-    S'assure que la sortie est au format XML.
-    Si du Markdown est détecté, le convertit automatiquement.
-    """
-    if not text:
-        return text
-    
-    # Si c'est déjà du XML, retourner tel quel
-    if not is_markdown_format(text):
-        return text
-    
-    # Convertir le Markdown en XML
-    return convert_markdown_to_xml(text, profile_name)
-
-
 REFORMAT_SYSTEM_PROMPT = """Tu transformes des demandes utilisateur en prompts XML ultra-structurés.
 
 ⚠️ CONTEXTE: Outil de DÉVELOPPEMENT LOGICIEL (PromptForge).
@@ -450,7 +434,7 @@ def format_prompt_with_ollama(
         raw_prompt: Le prompt brut de l'utilisateur
         project_context: Le contenu du fichier de configuration projet
         provider: Instance OllamaProvider (créée si non fournie)
-        profile_name: Nom du profil de reformatage (claude_technique, chatgpt_standard, etc.)
+        profile_name: Clé de `PRESET_PROFILES` (claude_opus_5, gpt_5.1, universel, etc.)
         return_conversion_info: Si True, retourne un tuple (result, was_converted_from_markdown)
     
     Returns:

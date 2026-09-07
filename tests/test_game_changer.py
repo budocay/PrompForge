@@ -232,7 +232,7 @@ class TestDomainRecommendations:
         new_domains = ['seo', 'marketing', 'hr', 'sales', 'product', 'support']
         
         # Vérifier pour Claude Opus (représentatif)
-        opus_expertise = DOMAIN_EXPERTISE.get(TargetModel.CLAUDE_OPUS_4_5, {})
+        opus_expertise = DOMAIN_EXPERTISE.get(TargetModel.CLAUDE_OPUS_5, {})
         
         for domain in new_domains:
             assert domain in opus_expertise, f"Expertise manquante pour '{domain}' (Opus)"
@@ -272,7 +272,7 @@ class TestNoBullshitRule:
         """Vérifie que les system prompts incluent la règle."""
         from promptforge.profiles import get_system_prompt, TargetModel
         
-        prompt = get_system_prompt(TargetModel.CLAUDE_OPUS_4_5)
+        prompt = get_system_prompt(TargetModel.CLAUDE_OPUS_5)
         
         # Le system prompt devrait inclure la règle anti-bullshit
         assert "INTERDIT" in prompt or len(prompt) > 2000
@@ -406,23 +406,57 @@ class TestProfilesUiDomainParity:
 
         assert set(DOMAIN_EXPERTISE) == set(TargetModel)
 
+    def test_profile_choices_expose_a_label_and_the_profile_key(self):
+        """Le menu propose un libellé lisible, et transmet toujours la clé.
+
+        Avant F-028 il affichait la clé brute (`claude_opus_5`,
+        `gemini_3.1_pro`) : un identifiant technique à la place d'un nom de
+        produit. Les couples (libellé, clé) de Gradio corrigent l'affichage
+        sans changer ce que reçoivent les gestionnaires.
+        """
+        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS, get_profile_choices
+
+        choices = get_profile_choices()
+        assert [key for _, key in choices] == list(PROFILE_DESCRIPTIONS)
+        for label, key in choices:
+            assert label != key, key
+            assert PROFILE_DESCRIPTIONS[key] in label, key
+
     def test_profile_label_price_comes_from_model_pricing(self):
         """Le tarif du libellé est composé depuis MODEL_PRICING, pas recopié."""
         from promptforge.profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
-        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS, get_profile_label
+        from promptforge.web.profiles_ui import get_profile_choices
 
-        for name in PROFILE_DESCRIPTIONS:
+        for label, name in get_profile_choices():
             target = PRESET_PROFILES[name].target_model
             if target is TargetModel.UNIVERSAL:
-                # Moyenne synthétique : aucun tarif affiché (D-032).
+                # Ne désigne aucun modèle réel : aucun tarif affiché (D-032).
+                assert "$" not in label
                 continue
             pricing = MODEL_PRICING[target]
-            label = get_profile_label(name)
             expected = f"(${pricing.input_price:g}/${pricing.output_price:g})"
             assert label.endswith(expected), f"{name}: {label!r} n'expose pas {expected!r}"
 
+    def test_dead_profile_label_helper_is_gone(self):
+        """`get_profile_label()` est supprimée : elle n'avait aucun appelant.
+
+        Sixième fonction morte de la liste du gate (R-009). Sa logique n'est
+        pas perdue pour autant : elle est branchée sur le menu déroulant par
+        `get_profile_choices()`, sans quoi `PROFILE_DESCRIPTIONS` serait resté
+        une table dont seules les clés servaient.
+        """
+        import promptforge.web.profiles_ui as profiles_ui
+
+        assert not hasattr(profiles_ui, "get_profile_label")
+
     def test_profile_info_context_window_comes_from_model_pricing(self):
-        """La fenêtre de contexte affichée est celle du domaine."""
+        """La fenêtre de contexte affichée est celle du domaine.
+
+        Une fenêtre non confirmée par une source ne s'affiche pas comme un
+        chiffre : elle est annoncée comme non confirmée (F-028). Un « 0K » ou
+        la reprise du chiffre de la génération précédente serait une valeur
+        que personne n'a mesurée sur ce modèle.
+        """
         from promptforge.profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
         from promptforge.web.profiles_ui import PROFILE_DETAILS, get_profile_info
 
@@ -431,11 +465,51 @@ class TestProfilesUiDomainParity:
             if target is TargetModel.UNIVERSAL:
                 continue
             window = MODEL_PRICING[target].context_window
-            if window >= 1_000_000 and window % 1_000_000 == 0:
+            if window is None:
+                expected = "- Contexte: non confirmé par une source officielle"
+            elif window >= 1_000_000 and window % 1_000_000 == 0:
                 expected = f"- Contexte: {window // 1_000_000}M tokens"
             else:
                 expected = f"- Contexte: {window // 1_000}K tokens"
             assert expected in get_profile_info(name), f"{name}: attendu {expected!r}"
+
+    def test_no_profile_advertises_a_retired_or_fictional_model(self):
+        """Aucun libellé ni panneau ne nomme un modèle retiré du domaine.
+
+        Mesuré le 2026-09-07 : `gemini-3-pro` est arrêté depuis le 2026-03-09,
+        `gemini-3-flash` est déprécié, `gpt-5.1-mini` n'a jamais existé. Le
+        domaine ne les porte plus ; l'adapter d'interface non plus, sans quoi
+        l'utilisateur choisirait une cible inatteignable.
+        """
+        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS, PROFILE_DETAILS
+
+        morts = ["Gemini 3 Pro —", "Gemini 3 Flash —", "Gemini 2.5 Flash", "GPT-5.1 Mini"]
+        for name, description in PROFILE_DESCRIPTIONS.items():
+            for mort in morts:
+                assert mort not in description, f"{name}: {mort!r}"
+        for name, details in PROFILE_DETAILS.items():
+            assert not any(mort in details["title"] for mort in morts), name
+
+    def test_gpt_profiles_announce_the_format_they_produce(self):
+        """Les libellés GPT annonçaient XML alors que le prompt exige Markdown.
+
+        `SYSTEM_PROMPT_GPT_5_1`, `_GPT_5_6_TERRA` et `_GPT_5_PRO` demandent
+        tous du Markdown. Annoncer `[XML]` dans le menu revenait à décrire au
+        client autre chose que ce que la machine produit.
+        """
+        from promptforge.profiles import PRESET_PROFILES, SYSTEM_PROMPTS, TargetModel
+        from promptforge.web.profiles_ui import PROFILE_DESCRIPTIONS
+
+        for name, description in PROFILE_DESCRIPTIONS.items():
+            target = PRESET_PROFILES[name].target_model
+            prompt = SYSTEM_PROMPTS[target]
+            if target is TargetModel.UNIVERSAL:
+                # DEC-008 : il ne vise aucun modèle, il n'impose aucune syntaxe.
+                assert "[XML ou Markdown]" in description, name
+            elif "prompts Markdown" in prompt:
+                assert "[Markdown]" in description, name
+            else:
+                assert "[XML]" in description, name
 
     def test_profile_info_reports_pricing_provenance(self):
         """Une valeur sans source officielle est signalée comme telle."""
@@ -454,9 +528,9 @@ class TestProfilesUiDomainParity:
 
     def test_unknown_profile_label_and_info_do_not_invent_a_price(self):
         """Profil inconnu : aucun tarif inventé, aucune exception."""
-        from promptforge.web.profiles_ui import get_profile_info, get_profile_label
+        from promptforge.web.profiles_ui import _compose_label, get_profile_info
 
-        assert get_profile_label("profil-inexistant") == "profil-inexistant"
+        assert _compose_label("profil-inexistant") == "profil-inexistant"
         info = get_profile_info("profil-inexistant")
         assert "$" not in info
 
@@ -512,7 +586,14 @@ class TestProfilesUiDomainParity:
         # compte les modèles du domaine réellement cités par le rendu. Une
         # itération tronquée (`list(...)[:1]`) tombe ici, alors qu'un
         # `len(MODEL_PRICING) >= 5` resterait vrai (CRAFT V2).
-        cites = [model.value for model in MODEL_PRICING if model.value in rendered]
+        # Depuis F-028, le rendu cite le nom commercial et non l'identifiant
+        # d'API : c'est ce nom-la qu'on compte, sans quoi le test mesurerait
+        # une chaine que l'utilisateur ne voit plus.
+        cites = [
+            pricing.display_name
+            for pricing in MODEL_PRICING.values()
+            if pricing.display_name in rendered
+        ]
         assert len(cites) >= 5, (
             f"seuls {len(cites)} modèles sur {len(MODEL_PRICING)} apparaissent "
             f"dans le rendu : {cites}"

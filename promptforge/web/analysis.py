@@ -451,7 +451,7 @@ def compare_prompts(raw_prompt: str, formatted_prompt: str) -> str:
     extra_tokens = formatted_analysis['token_count'] - raw_analysis['token_count']
     if extra_tokens > 0:
         # Tarif lu dans le domaine, jamais recopié ici (F-022 bloc 2).
-        sonnet_input_price = MODEL_PRICING[TargetModel.CLAUDE_SONNET_4_5].input_price
+        sonnet_input_price = MODEL_PRICING[TargetModel.CLAUDE_SONNET_5].input_price
         extra_cost = extra_tokens * sonnet_input_price / 1_000_000
         lines.append(f"\n**Tokens supplémentaires:** +{extra_tokens} (~${extra_cost:.6f} par requête avec Sonnet)")
 

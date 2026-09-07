@@ -93,23 +93,34 @@ def _context_of(model: TargetModel) -> str:
     Délègue à l'unique formateur de fenêtre du paquet web
     (`profiles_ui.format_context_window`) : la convention d'affichage a une
     seule raison de changer, donc un seul endroit où la changer (CRAFT V3).
+
+    Rend une chaîne vide quand la fenêtre n'est pas confirmée. Un appelant qui
+    compose une phrase autour de cette valeur doit donc s'abstenir de le faire
+    pour les modèles concernés plutôt que d'afficher un trou (F-028).
     """
     return format_context_window(MODEL_PRICING[model])
 
 
 # Domain expertise scores by model
+#
+# Les scores restent non sources (D-021, retrait prevu hors F-028). Ce que
+# F-028 a traite ici : plus aucune colonne « pourquoi » ne reattribue a un
+# modele la mesure d'un autre. Les chiffres de Claude Opus 4.5 ne sont pas
+# ceux d'Opus 5, ceux de Gemini 3 Pro ne sont pas ceux de Gemini 3.1 Pro, et
+# les fenetres de contexte de Gemini ne sont pas confirmees : elles ne sont
+# donc plus composees ici.
 DOMAIN_EXPERTISE = {
-    TargetModel.CLAUDE_OPUS_4_5: {
-        'code': (98, "SWE-bench 80.9% (leader)"),
-        'legal': (92, f"ASL-3 safety + {_context_of(TargetModel.CLAUDE_OPUS_4_5)} contexte"),
-        'finance': (90, "ASL-3 safety filters"),
-        'medical': (75, "Prudent, HealthBench < GPT-5"),
+    TargetModel.CLAUDE_OPUS_5: {
+        'code': (98, "Code complexe, agents, architecture"),
+        'legal': (92, f"{_context_of(TargetModel.CLAUDE_OPUS_5)} contexte"),
+        'finance': (90, "Analyse structurée"),
+        'medical': (75, "Prudent"),
         'creative': (82, "Style structuré"),
-        'research': (88, f"{_context_of(TargetModel.CLAUDE_OPUS_4_5)} contexte"),
+        'research': (88, f"{_context_of(TargetModel.CLAUDE_OPUS_5)} contexte"),
         'data': (85, "Analyse structurée"),
-        'math': (85, "AIME ~85%"),
+        'math': (85, "Raisonnement long"),
         'image': (60, "Prompts seulement"),
-        'document': (92, f"{_context_of(TargetModel.CLAUDE_OPUS_4_5)} tokens"),
+        'document': (92, f"{_context_of(TargetModel.CLAUDE_OPUS_5)} tokens"),
         'general': (88, "Polyvalent"),
         # Nouveaux domaines métiers
         'seo': (85, "Analyse structurée, recommandations précises"),
@@ -119,17 +130,17 @@ DOMAIN_EXPERTISE = {
         'product': (92, "PRD et specs excellentes"),
         'support': (85, "Réponses empathiques et complètes"),
     },
-    TargetModel.CLAUDE_SONNET_4_5: {
-        'code': (95, "SWE-bench 77.2%"),
-        'legal': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_4_5)} contexte"),
+    TargetModel.CLAUDE_SONNET_5: {
+        'code': (95, "Coding au quotidien"),
+        'legal': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_5)} contexte"),
         'finance': (86, "Bon ratio Q/P"),
         'medical': (72, "Correct"),
         'creative': (80, "Style structuré"),
-        'research': (85, "30h+ autonomie"),
+        'research': (85, "Suivi d'instructions long"),
         'data': (82, "Solide"),
-        'math': (83, "AIME 87%"),
+        'math': (83, "Raisonnement solide"),
         'image': (58, "Prompts seulement"),
-        'document': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_4_5)} tokens"),
+        'document': (88, f"{_context_of(TargetModel.CLAUDE_SONNET_5)} tokens"),
         'general': (85, "Meilleur Q/P Claude"),
         # Nouveaux domaines métiers
         'seo': (82, "Bon équilibre qualité/coût"),
@@ -179,7 +190,7 @@ DOMAIN_EXPERTISE = {
         'product': (88, "Bon pour PRD"),
         'support': (90, "Ton naturel et empathique"),
     },
-    TargetModel.GPT_5_1_MINI: {
+    TargetModel.GPT_5_6_TERRA: {
         'code': (75, "Simple"),
         'legal': (68, "Basique"),
         'finance': (70, "Simple"),
@@ -188,7 +199,7 @@ DOMAIN_EXPERTISE = {
         'research': (70, "Rapide"),
         'data': (72, "Simples"),
         'math': (78, "Intermédiaires"),
-        'image': (70, "DALL-E disponible"),
+        'image': (70, "Prompts d'image"),
         'document': (70, "Courts"),
         'general': (75, "Excellent Q/P"),
         # Nouveaux domaines métiers
@@ -219,17 +230,17 @@ DOMAIN_EXPERTISE = {
         'product': (92, "Roadmaps et stratégie"),
         'support': (85, "Cas complexes"),
     },
-    TargetModel.GEMINI_3_PRO: {
-        'code': (88, "SWE-bench 76.2%"),
-        'legal': (92, f"{_context_of(TargetModel.GEMINI_3_PRO)} tokens!"),
-        'finance': (85, f"{_context_of(TargetModel.GEMINI_3_PRO)} contexte"),
+    TargetModel.GEMINI_3_1_PRO: {
+        'code': (88, "Bon sur le code"),
+        'legal': (92, "Dossiers volumineux"),
+        'finance': (85, "Analyse de séries longues"),
         'medical': (78, "Bon"),
         'creative': (83, "Interfaces créatives"),
-        'research': (96, "GPQA 91.9% leader!"),
-        'data': (94, f"{_context_of(TargetModel.GEMINI_3_PRO)} tokens"),
-        'math': (95, "AIME 95-100%"),
-        'image': (75, "Imagen 3 via API"),
-        'document': (98, f"🏆 {_context_of(TargetModel.GEMINI_3_PRO)} tokens!"),
+        'research': (96, "Analyse approfondie"),
+        'data': (94, "Gros volumes"),
+        'math': (95, "Raisonnement mathématique"),
+        'image': (75, "Génération via API"),
+        'document': (98, "🏆 Documents entiers"),
         'general': (89, "Long contexte"),
         # Nouveaux domaines métiers
         'seo': (85, "Analyse de grands sites"),
@@ -239,17 +250,17 @@ DOMAIN_EXPERTISE = {
         'product': (85, "Contexte produit long"),
         'support': (80, "KB volumineuse"),
     },
-    TargetModel.GEMINI_3_FLASH: {
+    TargetModel.GEMINI_3_6_FLASH: {
         'code': (68, "Prototypage"),
-        'legal': (65, f"{_context_of(TargetModel.GEMINI_3_FLASH)} ctx"),
+        'legal': (65, "Résumés"),
         'finance': (63, "Basique"),
         'medical': (58, "Non recommandé"),
         'creative': (72, "Rapide"),
-        'research': (70, "Grand ctx"),
-        'data': (75, f"{_context_of(TargetModel.GEMINI_3_FLASH)} tokens"),
+        'research': (70, "Rapide"),
+        'data': (75, "Extraction rapide"),
         'math': (70, "Basiques"),
-        'image': (65, "Imagen via API"),
-        'document': (85, f"{_context_of(TargetModel.GEMINI_3_FLASH)} rapide"),
+        'image': (65, "Génération via API"),
+        'document': (85, "Documents longs, rapide"),
         'general': (70, "Économique"),
         # Nouveaux domaines métiers
         'seo': (68, "Tâches rapides"),
@@ -399,7 +410,9 @@ def generate_recommendation(
 
         all_models.append({
             'model': model,
-            'name': model.value,
+            # Nom commercial publie par l'editeur, pas l'identifiant d'API :
+            # cette table est lue par un humain (F-028).
+            'name': pricing.display_name or model.value,
             'cost': cost,
             'score': score,
             'reason': reason,
@@ -446,7 +459,7 @@ def generate_recommendation(
 
         # Référence cloud : tarif lu dans le domaine, jamais recopié ici
         # (F-022 bloc 2).
-        cloud_cost = MODEL_PRICING[TargetModel.CLAUDE_SONNET_4_5].estimate_cost(
+        cloud_cost = MODEL_PRICING[TargetModel.CLAUDE_SONNET_5].estimate_cost(
             input_tokens, output_tokens
         )
         lines.append(f"\n💰 **Économie vs Cloud:** ${cloud_cost * 1000:.2f} économisés sur 1000 reformatages")
@@ -510,20 +523,17 @@ def generate_recommendation(
 
     # Domain tips
     domain_tips = {
-        'code': "💡 Pour du code complexe, Opus 4.5 vaut le coup.",
-        'legal': (
-            f"💡 Gemini 3 Pro peut analyser des dossiers complets "
-            f"({_context_of(TargetModel.GEMINI_3_PRO)} tokens)."
-        ),
-        'medical': "💡 GPT-5 a le moins d'hallucinations (-45%).",
-        'finance': "💡 Claude a des safety filters ASL-3.",
-        'research': "💡 Gemini 3 Pro (GPQA 91.9%) excelle en PhD-level.",
+        'code': "💡 Pour du code complexe, Claude Opus 5 vaut le coup.",
+        'legal': "💡 Gemini 3.1 Pro peut analyser des dossiers complets.",
+        'medical': "💡 GPT-5.1 a le moins d'hallucinations (-45%).",
+        'finance': "💡 Claude structure bien les analyses financières.",
+        'research': "💡 Gemini 3.1 Pro excelle sur les questions de recherche.",
         'math': "💡 GPT-5 Pro atteint 100% sur AIME 2025.",
-        'image': "🎨 GPT-5 avec DALL-E intégré génère directement.",
+        'image': "🎨 GPT-5.1 avec DALL-E intégré génère directement.",
         'document': (
-            f"📄 Gemini 3 Pro ({_context_of(TargetModel.GEMINI_3_PRO)}) > "
-            f"Claude ({_context_of(TargetModel.CLAUDE_OPUS_4_5)}) > "
-            f"GPT ({_context_of(TargetModel.GPT_5_1)})."
+            f"📄 Claude Opus 5 ({_context_of(TargetModel.CLAUDE_OPUS_5)}) et "
+            f"GPT-5.1 ({_context_of(TargetModel.GPT_5_1)}) portent les plus "
+            f"grandes fenêtres confirmées."
         ),
         'general': "💡 GPT-5.1 offre le meilleur équilibre.",
     }
@@ -541,9 +551,11 @@ def get_comparison_table() -> str:
         "|--------|---------|----------|----------|------|-------------|"
     ]
 
+    # `label` et non `model` : le tableau s'adresse a l'utilisateur, pas a un
+    # appel d'API. L'identifiant exact reste disponible dans `c['model']`.
     for c in comparisons:
         lines.append(
-            f"| {c['model']} | {c['input_price']} | {c['output_price']} | "
+            f"| {c['label']} | {c['input_price']} | {c['output_price']} | "
             f"{c['context']} | {c['tier']} | {c['cost_display']} |"
         )
 
@@ -564,12 +576,15 @@ def calculate_costs(input_tokens: int, output_tokens: int) -> str:
     ]
 
     for c in comparisons:
-        lines.append(f"| {c['model']} | **{c['cost_display']}** | {c['tier']} |")
+        lines.append(f"| {c['label']} | **{c['cost_display']}** | {c['tier']} |")
 
     cheapest = comparisons[0]
     most_expensive = comparisons[-1]
 
-    lines.append(f"\n**💰 Le moins cher:** {cheapest['model']} ({cheapest['cost_display']})")
-    lines.append(f"\n**🔥 Le plus puissant:** {most_expensive['model']} ({most_expensive['cost_display']})")
+    lines.append(f"\n**💰 Le moins cher:** {cheapest['label']} ({cheapest['cost_display']})")
+    lines.append(
+        f"\n**🔥 Le plus puissant:** {most_expensive['label']} "
+        f"({most_expensive['cost_display']})"
+    )
 
     return "\n".join(lines)

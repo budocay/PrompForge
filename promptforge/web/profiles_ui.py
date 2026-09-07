@@ -10,116 +10,127 @@ Motif : avant F-022, trois tarifs et une fenetre de contexte divergeaient entre
 le domaine et l'affichage, et un libelle avait ete corrige a la main sans que la
 source le soit. Une valeur affichee ne se recopie plus, elle se compose.
 
-IMPORTANT: Tous les profils utilisent le format XML dans les libelles ci-dessous.
-La verification de cette affirmation profil par profil releve de F-029.
+Le format annonce dans chaque libelle est celui que produit reellement le
+prompt systeme du profil, verifie profil par profil le 2026-09-07 : XML pour
+Claude et Gemini, Markdown pour les trois profils GPT, XML ou Markdown au choix
+pour le profil universel. Les libelles annoncaient `[XML]` pour GPT alors que
+`SYSTEM_PROMPT_GPT_*` demande du Markdown, et `[XML]` pour le profil universel
+alors que DEC-008 lui interdit d'imposer une syntaxe (F-028).
+
+Les modeles cibles sont ceux de la gamme reellement disponible au 2026-09-07 :
+`gemini-3-pro` (arrete), `gemini-3-flash` (deprecie) et `gpt-5.1-mini` (jamais
+existe) ont ete retires du domaine par F-028, leurs libelles avec.
 """
 
 from ..profiles import MODEL_PRICING, PRESET_PROFILES, TargetModel
 
 # Description courte de chaque profil, SANS tarif ni fenetre de contexte :
-# ces deux valeurs sont ajoutees au rendu par `get_profile_label()`.
+# ces deux valeurs sont ajoutees au rendu par `_compose_label()`.
 # Les cles doivent rester alignees sur celles de `PRESET_PROFILES`
 # (verrou : tests/test_game_changer.py::TestProfilesUiDomainParity).
 PROFILE_DESCRIPTIONS = {
-    # Claude (Anthropic) - XML natif
-    "claude_opus_4.5": "🟣 Claude Opus 4.5 — Code/Agents complexes [XML]",
-    "claude_sonnet_4.5": "🟣 Claude Sonnet 4.5 — Best coding model [XML]",
+    # Claude (Anthropic) - XML, recommandé par Anthropic
+    "claude_opus_5": "🟣 Claude Opus 5 — Code/Agents complexes [XML]",
+    "claude_sonnet_5": "🟣 Claude Sonnet 5 — Équilibre qualité/coût [XML]",
     "claude_haiku_4.5": "🟣 Claude Haiku 4.5 — Rapide [XML]",
 
-    # GPT (OpenAI) - XML recommandé depuis 2025!
-    "gpt_5.1": "🟢 GPT-5.1 — Flagship steerable [XML]",
-    "gpt_5.1_mini": "🟢 GPT-5.1 Mini — Économique [XML]",
-    "gpt_5_pro": "🟢 GPT-5/o3 — Deep reasoning [XML]",
+    # GPT (OpenAI) - Markdown, c'est ce que produisent SYSTEM_PROMPT_GPT_*
+    "gpt_5.1": "🟢 GPT-5.1 — Flagship steerable [Markdown]",
+    "gpt_5.6_terra": "🟢 GPT-5.6 Terra — Économique [Markdown]",
+    "gpt_5_pro": "🟢 GPT-5 Pro — Deep reasoning [Markdown]",
 
-    # Gemini (Google) - XML/tags
-    "gemini_3_pro": "🔵 Gemini 3 Pro — Documents longs [XML]",
-    "gemini_3_flash": "🔵 Gemini 2.5 Flash — Rapide [XML]",
+    # Gemini (Google) - XML par convention de produit ; Google documente XML
+    # et Markdown comme equivalents, la seule exigence etant la coherence
+    # (DEC-007 volet 2)
+    "gemini_3.1_pro": "🔵 Gemini 3.1 Pro — Documents longs [XML]",
+    "gemini_3.6_flash": "🔵 Gemini 3.6 Flash — Rapide [XML]",
 
-    # Universal
-    "universel": "⚪ Universel — Compatible tous modèles [XML]",
+    # Universel - ne cible aucun modele, n'impose donc aucune syntaxe (DEC-008)
+    "universel": "⚪ Universel — Aucun modèle ciblé, compatible tous [XML ou Markdown]",
 }
 
 
 # Contenu statique du panneau de detail : ni tarif, ni fenetre de contexte.
-# Ces deux lignes sont ajoutees au rendu depuis MODEL_PRICING.
+# Ces lignes sont ajoutees au rendu depuis MODEL_PRICING.
+# Aucune puce ne reprend une mesure attachee a un modele different de celui
+# qu'elle decrit : les chiffres de Claude Opus 4.5 ne sont pas ceux d'Opus 5,
+# ceux de Gemini 3 Pro ne sont pas ceux de Gemini 3.1 Pro (F-028).
 PROFILE_DETAILS = {
-    "claude_opus_4.5": {
-        "title": "**🟣 Claude Opus 4.5** — Format: XML natif (Nov 2025)",
+    "claude_opus_5": {
+        "title": "**🟣 Claude Opus 5** — Format: XML (recommandé par Anthropic)",
         "bullets": [
             "Meilleur pour: Code complexe, agents, architecture, tâches long-horizon",
-            "SWE-bench Multilingual: Leader sur 7/8 langages",
-            'Paramètre "effort" (low/medium/high) pour contrôler tokens',
+            "Remplace Claude Opus 4.5, dont le plancher de retrait était le plus proche",
             "Balises: <task>, <context>, <thinking>, <instructions>, <constraints>, <output_format>",
         ],
     },
-    "claude_sonnet_4.5": {
-        "title": "**🟣 Claude Sonnet 4.5** — Format: XML natif (Sep 2025)",
+    "claude_sonnet_5": {
+        "title": "**🟣 Claude Sonnet 5** — Format: XML (recommandé par Anthropic)",
         "bullets": [
-            "Meilleur pour: Coding au quotidien, best coding model",
-            "SWE-bench Verified: 72.7% (state-of-the-art)",
-            "OSWorld computer use: 61.4% (leader)",
+            "Meilleur pour: Coding au quotidien",
+            "Remplace Claude Sonnet 4.5, et coûte moins cher que lui",
             "Balises: <task>, <context>, <instructions>, <constraints>, <output_format>",
         ],
     },
     "claude_haiku_4.5": {
-        "title": "**🟣 Claude Haiku 4.5** — Format: XML natif",
+        "title": "**🟣 Claude Haiku 4.5** — Format: XML (recommandé par Anthropic)",
         "bullets": [
             "Meilleur pour: Tâches rapides, volume élevé",
-            "Performance proche de Sonnet 4 à prix réduit",
             "Ultra-rapide, prompt court recommandé",
+            "Aucun successeur publié à ce jour : modèle à surveiller",
             "Balises: <task>, <context>, <instructions>, <output_format>",
         ],
     },
     "gpt_5.1": {
-        "title": "**🟢 GPT-5.1** — Format: XML (recommandé par OpenAI!)",
+        "title": "**🟢 GPT-5.1** — Format: Markdown (point de départ recommandé par OpenAI)",
         "bullets": [
             "Meilleur pour: Usage général, steerable",
-            "-45% hallucinations vs GPT-4",
             "Instruction following chirurgical",
-            "Balises: <task>, <context>, <instructions>, <constraints>, <output_format>",
+            "Sections: Contexte, Objectif, Exigences, Contraintes, Format de sortie",
         ],
     },
-    "gpt_5.1_mini": {
-        "title": "**🟢 GPT-5.1 Mini** — Format: XML",
+    "gpt_5.6_terra": {
+        "title": "**🟢 GPT-5.6 Terra** — Format: Markdown",
         "bullets": [
             "Meilleur pour: Budget, volume élevé",
-            "Rapide et très économique",
-            "Aussi steerable que GPT-5.1",
-            "Balises courtes: <task>, <context>, <instructions>, <output_format>",
+            "Remplaçant officiellement désigné par OpenAI pour `gpt-5-mini`",
+            "Sections courtes: Objectif, Exigences, Format de sortie",
         ],
     },
     "gpt_5_pro": {
-        "title": "**🟢 GPT-5 / o3** — Format: XML avec <thinking>",
+        "title": "**🟢 GPT-5 Pro** — Format: Markdown détaillé",
         "bullets": [
             "Meilleur pour: Raisonnement complexe, math, architecture",
             "Deep thinking pour problèmes multi-étapes",
-            "Modèle de reasoning (série o)",
-            "Balises: <task>, <context>, <thinking>, <instructions>, <constraints>, <output_format>",
+            "Retrait annoncé au 11 déc. 2026 : modèle à surveiller",
+            "Sections: Définition du problème, Contexte, Analyse requise, Contraintes",
         ],
     },
-    "gemini_3_pro": {
-        "title": "**🔵 Gemini 3 Pro** — Format: XML/tags (Preview)",
+    "gemini_3.1_pro": {
+        "title": "**🔵 Gemini 3.1 Pro** — Format: XML retenu par le produit (Preview)",
         "bullets": [
-            "Meilleur pour: Documents longs, codebases entières, vibe-coding",
-            "Le plus puissant de Google pour multimodal",
+            "Meilleur pour: Documents longs, codebases entières",
+            "Remplaçant officiel de Gemini 3 Pro, arrêté le 9 mars 2026",
             "Balises: <task>, <context>, <instructions>, <constraints>, <output_format>",
         ],
     },
-    "gemini_3_flash": {
-        "title": "**🔵 Gemini 2.5 Flash** — Format: XML/tags",
+    "gemini_3.6_flash": {
+        "title": "**🔵 Gemini 3.6 Flash** — Format: XML retenu par le produit",
         "bullets": [
-            "Meilleur pour: Tâches rapides avec grand contexte",
-            "Hybrid reasoning avec thinking budgets",
+            "Meilleur pour: Tâches rapides",
+            "Remplaçant officiel de Gemini 3 Flash, déprécié",
+            "Tarif d'introduction jusqu'au 31 décembre 2026, plus élevé ensuite",
             "Balises courtes: <task>, <context>, <instructions>, <output_format>",
         ],
     },
     "universel": {
-        "title": "**⚪ Universel** — Format: XML standard",
+        "title": "**⚪ Universel** — Format: balises XML ou titres Markdown, au choix",
         "bullets": [
+            "Ne désigne aucun modèle réel : aucun tarif ne peut lui être attribué",
+            "N'impose aucune syntaxe : il ne vise aucun éditeur, il ne peut en citer aucun",
+            "Exige une seule convention tenue d'un bout à l'autre du prompt",
             "Compatible avec tous les LLM modernes (Claude, GPT, Gemini, Mistral, Llama)",
-            "Balises universelles: <task>, <context>, <instructions>, <constraints>, <output_format>",
             "Idéal si vous ne savez pas encore quel modèle utiliser",
-            "Fonctionne partout!",
         ],
     },
 }
@@ -141,8 +152,10 @@ def get_pricing_for_profile(profile_name: str):
 def _shows_pricing(profile_name: str) -> bool:
     """Le profil universel ne désigne aucun modèle réel : pas de tarif affiché.
 
-    Son entrée de `MODEL_PRICING` est une moyenne synthétique (D-032) ;
-    l'afficher reviendrait à annoncer le tarif d'un modèle qui n'existe pas.
+    Depuis F-028, il n'a plus d'entrée du tout dans `MODEL_PRICING` : sa moyenne
+    synthétique a été supprimée du domaine (D-032, DEC-004 §1). Ce garde reste
+    en place comme second verrou, pour que le jour où quelqu'un recrée une
+    entrée « universelle » elle ne s'affiche pas pour autant.
     """
     profile = PRESET_PROFILES.get(profile_name)
     return profile is not None and profile.target_model is not TargetModel.UNIVERSAL
@@ -161,8 +174,13 @@ def format_price_short(pricing) -> str:
 
 
 def format_context_window(pricing) -> str:
-    """Fenêtre de contexte lisible (« 200K », « 1M ») composée depuis le domaine."""
-    if pricing is None:
+    """Fenêtre de contexte lisible (« 200K », « 1M ») composée depuis le domaine.
+
+    Rend une chaîne vide quand la fenêtre n'est pas confirmée par une source :
+    trois modèles cibles sont dans ce cas depuis F-028. Un « 0K » ou la reprise
+    du chiffre de la génération précédente serait une valeur inventée.
+    """
+    if pricing is None or pricing.context_window is None:
         return ""
     window = pricing.context_window
     if window >= 1_000_000 and window % 1_000_000 == 0:
@@ -185,13 +203,16 @@ def format_pricing_source(pricing) -> str:
     return f"Source: {pricing.source_url}"
 
 
-def get_profile_choices() -> list[str]:
-    """Return list of profiles for dropdown."""
-    return list(PROFILE_DESCRIPTIONS.keys())
+def _compose_label(profile_name: str) -> str:
+    """Libellé affiché d'un profil : description statique + tarif composé.
 
-
-def get_profile_label(profile_name: str) -> str:
-    """Return label for a profile, tarif composé depuis MODEL_PRICING."""
+    Remplace `get_profile_label()`, qui portait la même logique sans avoir le
+    moindre appelant (R-009). Elle n'est pas repointée, elle est branchée :
+    `get_profile_choices()` la consomme désormais, ce qui rend enfin visibles
+    les descriptions de `PROFILE_DESCRIPTIONS`. Sans cela, supprimer la
+    fonction aurait laissé le dictionnaire entier en donnée morte, dont seules
+    les clés servaient encore.
+    """
     description = PROFILE_DESCRIPTIONS.get(profile_name)
     if description is None:
         return profile_name
@@ -199,6 +220,17 @@ def get_profile_label(profile_name: str) -> str:
         return description
     price = format_price_short(get_pricing_for_profile(profile_name))
     return f"{description} ({price})" if price else description
+
+
+def get_profile_choices() -> list[tuple[str, str]]:
+    """Choix du menu déroulant, sous la forme (libellé affiché, clé de profil).
+
+    Le menu affichait la clé brute (`claude_opus_5`, `gemini_3.1_pro`) : un
+    identifiant technique là où l'utilisateur attend un nom de produit. Gradio
+    accepte des couples et ne transmet que le second membre aux gestionnaires,
+    donc `get_profile_info()` et le reformatage continuent de recevoir la clé.
+    """
+    return [(_compose_label(name), name) for name in PROFILE_DESCRIPTIONS]
 
 
 def get_profile_info(profile_name: str) -> str:
@@ -216,7 +248,11 @@ def get_profile_info(profile_name: str) -> str:
 
     pricing = get_pricing_for_profile(profile_name)
     if pricing is not None and _shows_pricing(profile_name):
-        lines.append(f"- Contexte: {format_context_window(pricing)} tokens")
+        window = format_context_window(pricing)
+        if window:
+            lines.append(f"- Contexte: {window} tokens")
+        else:
+            lines.append("- Contexte: non confirmé par une source officielle")
         lines.append(
             f"- Prix: ${_money(pricing.input_price)}/M input, "
             f"${_money(pricing.output_price)}/M output"

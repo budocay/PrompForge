@@ -1,10 +1,21 @@
 """
 Profils de reformatage optimisés pour différents modèles LLM.
 
-Tarifs et fenêtres de contexte vérifiés le 2026-09-03 sur les pages officielles
-de tarification Anthropic et OpenAI (cf. MEMORY/VEILLE.md). Chaque entrée de
-MODEL_PRICING porte sa source et sa date ; une source vide signale une valeur
-qu'aucune source officielle ne confirme.
+Identifiants, tarifs et fenêtres de contexte vérifiés le 2026-09-07 sur les
+pages officielles Anthropic, OpenAI et Google (cf. MEMORY/VEILLE.md, section
+« Modèles cibles du reformatage et tarifs »).
+
+Deux règles tiennent ce fichier (F-028) :
+
+1. `TargetModel` ne porte que des identifiants d'API réels et actifs. Un modèle
+   arrêté (`gemini-3-pro-preview`, arrêté le 2026-03-09) ou un identifiant sans
+   existence connue (`gpt-5.1-mini`, 404 confirmé le 2026-09-03 puis le
+   2026-09-07) proposerait à l'utilisateur une cible qu'il ne peut pas
+   atteindre.
+2. Une valeur non confirmée vaut `None`, jamais la reprise du chiffre de la
+   génération précédente. Trois fenêtres de contexte sont dans ce cas : les
+   fiches modèles Google ont répondu 404 le 2026-09-07 et celle de
+   `gpt-5.6-terra` n'a pas été rouverte.
 """
 
 from dataclasses import dataclass
@@ -13,22 +24,36 @@ from typing import Optional
 
 
 class TargetModel(Enum):
-    """Modèle LLM cible pour le reformatage."""
-    # Claude (Anthropic) - Décembre 2025
-    CLAUDE_OPUS_4_5 = "claude-opus-4.5"
-    CLAUDE_SONNET_4_5 = "claude-sonnet-4.5"
-    CLAUDE_HAIKU_4_5 = "claude-haiku-4.5"
-    
-    # GPT (OpenAI) - Décembre 2025
+    """Modèle LLM cible pour le reformatage.
+
+    Chaque valeur est l'identifiant d'API exact publié par l'éditeur, relevé le
+    2026-09-07. Un identifiant arrêté ou sans existence connue n'a pas sa place
+    ici (F-028).
+    """
+    # Claude (Anthropic) - identifiants relevés le 2026-09-07
+    CLAUDE_OPUS_5 = "claude-opus-5"
+    CLAUDE_SONNET_5 = "claude-sonnet-5"
+    # Le suffixe de date détonne à côté de `claude-opus-5` et
+    # `claude-sonnet-5`, et c'est pourtant la forme correcte : la page
+    # officielle publie `claude-haiku-4-5-20251001` et aucune autre. Anthropic
+    # a cessé de dater ses identifiants à partir de Claude 4.6 ; Haiku 4.5 est
+    # antérieur et n'a aucun successeur au 2026-09-07, donc rien vers quoi
+    # migrer. Écrire `claude-haiku-4-5` par souci d'homogénéité inventerait un
+    # alias que la source ne documente pas (DEC-004 §1). La lisibilité passe
+    # par `ModelPricing.display_name`, pas par la retouche d'une valeur
+    # sourcée. À surveiller : plancher de retrait au 15 oct. 2026.
+    CLAUDE_HAIKU_4_5 = "claude-haiku-4-5-20251001"
+
+    # GPT (OpenAI) - identifiants relevés le 2026-09-07
     GPT_5_1 = "gpt-5.1"
-    GPT_5_1_MINI = "gpt-5.1-mini"
+    GPT_5_6_TERRA = "gpt-5.6-terra"
     GPT_5_PRO = "gpt-5-pro"
-    
-    # Gemini (Google) - Décembre 2025
-    GEMINI_3_PRO = "gemini-3-pro"
-    GEMINI_3_FLASH = "gemini-3-flash"
-    
-    # Universel
+
+    # Gemini (Google) - identifiants relevés le 2026-09-07
+    GEMINI_3_1_PRO = "gemini-3.1-pro-preview"
+    GEMINI_3_6_FLASH = "gemini-3.6-flash"
+
+    # Synthétique : ne désigne aucun modèle réel, donc aucun tarif réel.
     UNIVERSAL = "universal"
 
 
@@ -49,16 +74,32 @@ class ModelPricing:
     un cache gratuit qui n'existe pas. `estimate_cost()` force alors
     ``cached_pct = 0`` et facture tout en entrée fraîche.
 
-    `source_url` vide signale une valeur qu'aucune source officielle ne confirme
-    aujourd'hui (modèle arrêté, identifiant sans existence connue, ou moyenne
-    synthétique). Voir F-028 pour le sort de ces entrées.
+    `context_window` vaut ``None`` quand aucune fiche officielle n'a pu être
+    rouverte pour la confirmer. Surtout pas le chiffre de la génération
+    précédente : ce serait afficher une mesure que personne n'a faite sur ce
+    modèle. Les appelants qui rendent cette valeur doivent traiter ``None``
+    comme « non confirmée », pas comme zéro.
+
+    `source_url` vide signale une valeur qu'aucune source officielle ne
+    confirme. Depuis F-028, plus aucune entrée de `MODEL_PRICING` n'est dans ce
+    cas : les identifiants morts ou fictifs ont été retirés au lieu d'être
+    conservés sans source.
+
+    `display_name` est le nom commercial publié sur cette même page de
+    tarification, à côté de l'identifiant d'API. Il existe parce qu'un
+    identifiant d'API n'est pas un libellé : `claude-haiku-4-5-20251001` et
+    `gpt-5-pro` sont exacts et sourcés, mais illisibles dans un tableau destiné
+    à l'utilisateur. Le rendre lisible en raccourcissant l'identifiant
+    reviendrait à afficher une chaîne que l'éditeur ne publie pas ; on affiche
+    donc le nom que l'éditeur publie, et l'identifiant reste intact (F-028).
     """
     input_price: float      # $ par million de tokens en entrée
     output_price: float     # $ par million de tokens en sortie
-    context_window: int     # Fenêtre de contexte max, en tokens
+    context_window: int | None = None  # Fenêtre max ; None = non confirmée
     cached_input: float | None = None  # $ / MTok en cache hit ; None = non confirmé
     source_url: str = ""    # Page officielle consultée
     verified_on: str = ""   # Date de vérification, ISO 8601
+    display_name: str = ""  # Nom commercial publié par l'éditeur
 
     def estimate_cost(self, input_tokens: int, output_tokens: int, cached_pct: float = 0) -> float:
         """Estime le coût d'une requête.
@@ -88,108 +129,125 @@ class ReformatProfile:
 
 
 # ============================================
-# Prix des modèles
-# Vérifiés le 2026-09-03 sur les pages officielles de tarification
-# (voir MEMORY/VEILLE.md, section « Modèles cibles du reformatage et tarifs »).
-# Chaque entrée porte son URL de source et sa date de vérification.
-# Une source vide = aucune source officielle ne confirme la valeur (F-028).
+# Prix des modèles cibles
+# Identifiants, tarifs et fenêtres vérifiés le 2026-09-07 sur les pages
+# officielles (voir MEMORY/VEILLE.md, section « Modèles cibles du reformatage
+# et tarifs »). Chaque entrée porte l'URL de sa source et sa date.
+#
+# Deux absences sont écrites comme telles, jamais comblées (F-028) :
+# - `context_window=None` : fenêtre non reconfirmée le 2026-09-07. Reprendre
+#   celle de la génération précédente afficherait un chiffre que personne n'a
+#   vérifié pour ce modèle.
+# - aucune entrée pour `TargetModel.UNIVERSAL` : ce profil ne désigne aucun
+#   modèle réel, aucun tarif réel ne peut donc lui être attribué (DEC-004 §1).
 # ============================================
 
 ANTHROPIC_PRICING_URL = "https://platform.claude.com/docs/en/about-claude/pricing"
 OPENAI_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
-PRICING_VERIFIED_ON = "2026-09-03"
+GOOGLE_PRICING_URL = "https://ai.google.dev/gemini-api/docs/pricing"
+PRICING_VERIFIED_ON = "2026-09-07"
 
 MODEL_PRICING = {
-    # Claude (Anthropic) - tarifs et fenêtres relevés sur la page officielle
-    TargetModel.CLAUDE_OPUS_4_5: ModelPricing(
+    # Claude (Anthropic)
+    TargetModel.CLAUDE_OPUS_5: ModelPricing(
+        # Remplace Claude Opus 4.5, dont le plancher de retrait était le plus
+        # proche de la gamme Opus. Même tarif, contexte 1M complet.
         input_price=5.0,
         output_price=25.0,
-        context_window=200_000,  # antérieur à Claude 4.6 : pas de contexte 1M
+        context_window=1_000_000,
         cached_input=0.5,
         source_url=ANTHROPIC_PRICING_URL,
         verified_on=PRICING_VERIFIED_ON,
+        display_name="Claude Opus 5",
     ),
-    TargetModel.CLAUDE_SONNET_4_5: ModelPricing(
-        input_price=3.0,
-        output_price=15.0,
-        # Corrigé : le contexte 1M à prix standard est réservé à Claude 4.6+.
-        context_window=200_000,
-        cached_input=0.3,
+    TargetModel.CLAUDE_SONNET_5: ModelPricing(
+        # Remplace Claude Sonnet 4.5 (plancher de retrait au 29 sept. 2026).
+        # Tarif d'introduction confirmé définitif : la hausse à 3.00 / 15.00
+        # prévue au 1er sept. 2026 est annulée, dixit la page officielle.
+        input_price=2.0,
+        output_price=10.0,
+        context_window=1_000_000,
+        cached_input=0.2,
         source_url=ANTHROPIC_PRICING_URL,
         verified_on=PRICING_VERIFIED_ON,
+        display_name="Claude Sonnet 5",
     ),
     TargetModel.CLAUDE_HAIKU_4_5: ModelPricing(
-        # Corrigé : le dépôt affichait 0.25 / 1.25, soit un facteur 4 sous le
-        # tarif officiel.
+        # Conservé faute de successeur : aucun Haiku plus récent n'existe au
+        # 2026-09-07. Plancher de retrait au 15 oct. 2026, à surveiller.
         input_price=1.0,
         output_price=5.0,
         context_window=200_000,
-        cached_input=0.1,  # multiplicateur standard 0.1x
+        cached_input=0.1,
         source_url=ANTHROPIC_PRICING_URL,
         verified_on=PRICING_VERIFIED_ON,
+        display_name="Claude Haiku 4.5",
     ),
 
-    # GPT (OpenAI)
+    # GPT (OpenAI) - colonne « short context » (jusqu'à 272K tokens d'entrée)
     TargetModel.GPT_5_1: ModelPricing(
         input_price=1.25,
         output_price=10.0,
-        context_window=400_000,  # corrigé : le dépôt annonçait 272 000
+        context_window=400_000,
         cached_input=0.125,
         source_url=OPENAI_PRICING_URL,
         verified_on=PRICING_VERIFIED_ON,
+        display_name="GPT-5.1",
     ),
-    TargetModel.GPT_5_1_MINI: ModelPricing(
-        # Aucune source : `gpt-5.1-mini` n'a aucune existence officielle connue
-        # (404 sur la fiche modèle). Les valeurs ci-dessous sont celles déjà
-        # présentes dans le dépôt, recopiées du tarif de `gpt-5-mini`.
-        # Elles ne sont ni corrigées ni sourcées ici : le sort de ce membre de
-        # TargetModel relève de F-028.
-        input_price=0.25,
-        output_price=2.0,
-        context_window=200_000,
-        cached_input=0.025,
+    TargetModel.GPT_5_6_TERRA: ModelPricing(
+        # Remplaçant officiellement désigné de `gpt-5-mini`, dont le tarif
+        # avait été recopié dans le dépôt sous l'identifiant fictif
+        # `gpt-5.1-mini`. Tarif issu de la table officielle reproduite
+        # verbatim le 2026-09-07 ; fiche modèle individuelle non rouverte,
+        # donc fenêtre de contexte non confirmée.
+        input_price=2.0,
+        output_price=12.0,
+        context_window=None,
+        cached_input=0.2,
+        source_url=OPENAI_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
+        display_name="GPT-5.6 Terra",
     ),
     TargetModel.GPT_5_PRO: ModelPricing(
-        # Corrigé : le dépôt sous-estimait l'entrée d'un facteur 3 et la sortie
-        # d'un facteur 6.
         input_price=15.0,
         output_price=120.0,
-        # Corrigé : 272 000 est le plafond de sortie, pas la fenêtre de contexte.
+        # 272 000 est le plafond de sortie, pas la fenêtre de contexte.
         context_window=400_000,
         # GPT-5 Pro ne propose pas de cache d'entrée : aucun tarif à facturer.
         cached_input=None,
         source_url=OPENAI_PRICING_URL,
         verified_on=PRICING_VERIFIED_ON,
+        display_name="GPT-5 Pro",
     ),
 
-    # Gemini (Google)
-    TargetModel.GEMINI_3_PRO: ModelPricing(
-        # Aucune source : `gemini-3-pro-preview` est arrêté depuis le
-        # 2026-03-09. Valeurs du dépôt conservées telles quelles ; le
-        # remplacement de l'identifiant relève de F-028.
+    # Gemini (Google) - palier jusqu'à 200K tokens d'entrée, celui du
+    # reformatage de prompt
+    TargetModel.GEMINI_3_1_PRO: ModelPricing(
+        # Remplaçant officiel de `gemini-3-pro-preview`, arrêté le 2026-03-09.
+        # Au-delà de 200K tokens d'entrée : 4.00 / 18.00, cache 0.40.
         input_price=2.0,
         output_price=12.0,
-        context_window=1_000_000,
+        # Fiche modèle Google inaccessible le 2026-09-07 (404) : fenêtre non
+        # confirmée. Reprendre celle de la génération précédente serait
+        # afficher un chiffre non vérifié pour ce modèle.
+        context_window=None,
         cached_input=0.2,
+        source_url=GOOGLE_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
+        display_name="Gemini 3.1 Pro",
     ),
-    TargetModel.GEMINI_3_FLASH: ModelPricing(
-        # Aucune source : `gemini-3-flash-preview` est déprécié et ces tarifs ne
-        # correspondent à aucune version active. Valeurs du dépôt conservées
-        # telles quelles ; leur sort relève de F-028.
-        input_price=0.5,
-        output_price=2.0,
-        context_window=1_000_000,
-        cached_input=0.05,
-    ),
-
-    # Universel
-    TargetModel.UNIVERSAL: ModelPricing(
-        # Aucune source par construction : moyenne synthétique, ne désigne aucun
-        # modèle réel. Traité par F-028.
-        input_price=1.0,
-        output_price=5.0,
-        context_window=128_000,
-        cached_input=0.1,
+    TargetModel.GEMINI_3_6_FLASH: ModelPricing(
+        # Remplaçant officiel de `gemini-3-flash-preview`, déprécié.
+        # Tarif d'introduction jusqu'au 31 déc. 2026 ; il passe ensuite à
+        # 1.50 / 7.50 avec un cache à 0.15, date de bascule confirmée.
+        input_price=0.75,
+        output_price=3.75,
+        # Même limite de vérification que Gemini 3.1 Pro.
+        context_window=None,
+        cached_input=0.075,
+        source_url=GOOGLE_PRICING_URL,
+        verified_on=PRICING_VERIFIED_ON,
+        display_name="Gemini 3.6 Flash",
     ),
 }
 
@@ -220,18 +278,19 @@ Tu reformates des prompts, tu ne prédis PAS les performances. INTERDICTIONS ABS
 ❌ INTERDIT de faire des tableaux "Avant/Après" avec des chiffres fictifs
 ❌ INTERDIT d'ajouter des sections "Analyse", "Métriques", "Gains", "Conclusion"
 
-✅ AUTORISÉ: Reformater le prompt avec une structure XML claire
+✅ AUTORISÉ: Reformater le prompt avec une structure claire, dans le format
+   demandé par le profil ci-dessus
 ✅ AUTORISÉ: Ajouter du contexte, des instructions, des contraintes
 ✅ AUTORISÉ: Proposer un format de sortie approprié
 
-🎯 Ta réponse = UNIQUEMENT le prompt XML reformaté. RIEN D'AUTRE.
+🎯 Ta réponse = UNIQUEMENT le prompt reformaté. RIEN D'AUTRE.
 Pas d'analyse, pas de métriques, pas de tableaux, pas de conclusion."""
 
 # =============================================================================
 
 SYSTEM_PROMPT_CLAUDE_OPUS = """⚠️ FORMAT OBLIGATOIRE: XML UNIQUEMENT - PAS DE MARKDOWN ⚠️
 
-Tu transformes des demandes utilisateur en prompts XML optimisés pour Claude Opus 4.5.
+Tu transformes des demandes utilisateur en prompts XML optimisés pour Claude Opus 5.
 
 ⚠️ CONTEXTE IMPORTANT: Tu opères dans un outil de DÉVELOPPEMENT LOGICIEL (PromptForge).
 Les demandes concernent TOUJOURS du code, de la programmation, des projets informatiques.
@@ -298,7 +357,7 @@ Documentation des changements
 
 SYSTEM_PROMPT_CLAUDE_SONNET = """⚠️ FORMAT OBLIGATOIRE: XML UNIQUEMENT - PAS DE MARKDOWN ⚠️
 
-Tu transformes des demandes en prompts XML optimisés pour Claude Sonnet 4.5.
+Tu transformes des demandes en prompts XML optimisés pour Claude Sonnet 5.
 
 ⚠️ CONTEXTE: Outil de DÉVELOPPEMENT LOGICIEL. Les demandes concernent du CODE/programmation.
 - "scanner" = analyser du CODE SOURCE (pas OCR)
@@ -382,8 +441,6 @@ SYSTEM_PROMPT_GPT_5_1 = """Tu réécris des demandes en prompts Markdown optimis
 
 === FORCES DE GPT-5.1 ===
 - Extrêmement steerable (suit les instructions avec précision)
-- 45% moins d'hallucinations que GPT-4
-- Contexte 272K tokens
 
 === RÈGLES GPT-5.1 ===
 - Instructions EXPLICITES et NON AMBIGUËS
@@ -426,8 +483,8 @@ RÈGLES ABSOLUES:
 - MÊME LANGUE que l'utilisateur"""
 
 
-SYSTEM_PROMPT_GPT_5_1_MINI = """Contexte: Outil de DÉVELOPPEMENT LOGICIEL (code/programmation).
-Tu réécris en prompts Markdown courts pour GPT-5.1 Mini.
+SYSTEM_PROMPT_GPT_5_6_TERRA = """Contexte: Outil de DÉVELOPPEMENT LOGICIEL (code/programmation).
+Tu réécris en prompts Markdown courts pour GPT-5.6 Terra.
 
 === EXEMPLE ===
 Demande: "trie une liste"
@@ -499,21 +556,27 @@ RÈGLES:
 - Même langue"""
 
 
-SYSTEM_PROMPT_GEMINI_3_PRO = """⚠️ FORMAT OBLIGATOIRE: XML UNIQUEMENT - PAS DE MARKDOWN ⚠️
-
-Tu transformes des demandes en prompts XML optimisés pour Gemini 3 Pro.
+SYSTEM_PROMPT_GEMINI_3_1_PRO = """Tu transformes des demandes en prompts structurés pour Gemini 3.1 Pro.
 
 ⚠️ CONTEXTE: Outil de DÉVELOPPEMENT LOGICIEL. Les demandes concernent du CODE/programmation.
 - "scanner" = analyser du CODE SOURCE (pas OCR physique)
 - "projet" = projet de développement (git, fichiers code)
 
-RÈGLE CRITIQUE: Ta réponse DOIT être UNIQUEMENT des balises XML.
-❌ INTERDIT: #, ##, **, -, *, ```, Markdown
-✅ OBLIGATOIRE: <balise>contenu</balise>
+=== FORMAT ===
+Google documente les balises XML et les titres Markdown comme deux façons
+également efficaces de délimiter un prompt ; la seule exigence est d'en tenir
+UNE SEULE d'un bout à l'autre (ai.google.dev/gemini-api/docs/prompting-strategies,
+mise à jour du 2026-06-10). Aucune source n'établit la supériorité de l'une.
+
+PromptForge retient les balises XML pour ce profil, par convention de produit,
+afin que la sortie reste prévisible. Applique-la sans la mélanger à du Markdown.
+
+✅ Attendu: <balise>contenu</balise>
+❌ À ne pas mélanger avec la convention retenue: #, ##, **, -, *, ```
 
 === BALISES XML À UTILISER ===
 <objective> - Objectif principal
-<context> - Contexte (Gemini excelle sur documents longs)
+<context> - Contexte de la demande, aussi complet que nécessaire
 <analysis_tasks> - Tâches d'analyse
 <output_format> - Format de sortie
 
@@ -527,8 +590,7 @@ Analyser le document fourni pour extraire les informations clés et produire une
 
 <context>
 Document à analyser en profondeur.
-Gemini 3 Pro peut traiter des documents très longs (jusqu'à 750K mots).
-Utiliser le contexte étendu pour une analyse complète.
+Utiliser l'intégralité du contexte fourni pour une analyse complète.
 </context>
 
 <analysis_tasks>
@@ -547,17 +609,22 @@ Recommandations ou points d'action
 
 === FIN ===
 
-⚠️ RAPPEL: JAMAIS de Markdown. Commence par <objective>. Même langue."""
+⚠️ RAPPEL: une seule convention sur tout le prompt, celle retenue ici.
+Commence par <objective>. Même langue."""
 
 
-SYSTEM_PROMPT_GEMINI_3_FLASH = """⚠️ XML UNIQUEMENT - PAS DE MARKDOWN ⚠️
+SYSTEM_PROMPT_GEMINI_3_6_FLASH = """Contexte: Outil de DÉVELOPPEMENT LOGICIEL. Demandes = CODE/programmation.
 
-Contexte: Outil de DÉVELOPPEMENT LOGICIEL. Demandes = CODE/programmation.
+Réécris en prompt court et structuré pour Gemini 3.6 Flash.
 
-Réécris en XML court et efficace pour Gemini 3 Flash.
+=== FORMAT ===
+Google documente balises XML et titres Markdown comme deux délimiteurs
+équivalents, à condition de n'en tenir qu'un seul sur tout le prompt
+(ai.google.dev/gemini-api/docs/prompting-strategies, 2026-06-10).
+PromptForge retient les balises XML pour ce profil, par convention de produit.
 
-❌ INTERDIT: #, ##, **, -, Markdown
-✅ OBLIGATOIRE: <balise>contenu</balise>
+✅ Attendu: <balise>contenu</balise>
+❌ À ne pas mélanger avec: #, ##, **, -
 
 === EXEMPLE ===
 Demande: "traduis en anglais"
@@ -576,12 +643,15 @@ Texte traduit en anglais, fidèle à l'original.
 
 === FIN ===
 
-⚠️ RÈGLE: XML seulement, commence par <context>, même langue."""
+⚠️ RÈGLE: une seule convention, celle retenue ici. Commence par <context>, même langue."""
 
 
-SYSTEM_PROMPT_UNIVERSAL = """⚠️ FORMAT OBLIGATOIRE: XML UNIQUEMENT - PAS DE MARKDOWN ⚠️
-
-Tu transformes des demandes utilisateur en prompts XML structurés.
+# DEC-008 : ce profil ne vise aucun modèle. Il ne peut donc citer aucune
+# documentation d'éditeur pour imposer une syntaxe, et n'en impose plus.
+# Il exige ce que les trois éditeurs demandent tous : des délimiteurs clairs et
+# une seule convention sur tout le prompt. Google est le seul à l'écrire noir
+# sur blanc, il est donc cité comme source de cette règle.
+SYSTEM_PROMPT_UNIVERSAL = """Tu transformes des demandes utilisateur en prompts structurés.
 
 ⚠️ CONTEXTE IMPORTANT: Tu opères dans un outil de DÉVELOPPEMENT LOGICIEL (PromptForge).
 Les demandes concernent TOUJOURS du code, de la programmation, des projets informatiques.
@@ -589,17 +659,26 @@ Les demandes concernent TOUJOURS du code, de la programmation, des projets infor
 - "projet" = projet de DÉVELOPPEMENT (repo git, fichiers code)
 - "analyse" = analyse de CODE ou d'architecture logicielle
 
-RÈGLE CRITIQUE: Ta réponse DOIT être UNIQUEMENT des balises XML.
-❌ INTERDIT: #, ##, ###, **, *, -, ```, titres Markdown, listes avec tirets/astérisques
-✅ OBLIGATOIRE: <balise>contenu</balise>
+=== FORMAT: DÉLIMITEURS CLAIRS, UNE SEULE CONVENTION ===
 
-=== BALISES XML À UTILISER ===
-<context> - Contexte du projet/de la demande
-<instructions> - Ce que le modèle doit faire (liste numérotée OK à l'intérieur)
-<output_format> - Format de sortie attendu
-<constraints> - Contraintes optionnelles
+Ce profil ne cible aucun modèle en particulier : il n'impose donc aucune
+syntaxe. Choisis L'UNE de ces deux conventions et tiens-la d'un bout à l'autre.
 
-=== EXEMPLE CORRECT ===
+Convention A - balises XML:        <context>...</context>
+Convention B - titres Markdown:    ## Contexte
+
+La seule règle est de ne pas les mélanger. C'est la seule exigence de format
+réellement commune aux trois éditeurs, et Google la documente explicitement :
+« use one consistent format throughout the prompt »
+(ai.google.dev/gemini-api/docs/prompting-strategies, mise à jour du 2026-06-10).
+
+=== SECTIONS À PRODUIRE ===
+Contexte      - Contexte du projet/de la demande
+Instructions  - Ce que le modèle doit faire (liste numérotée bienvenue)
+Format de sortie - Format de sortie attendu
+Contraintes   - Contraintes, si la demande en comporte
+
+=== EXEMPLE, CONVENTION A ===
 
 Demande: "aide moi avec mon projet flutter"
 
@@ -622,14 +701,29 @@ Explications des choix techniques
 Suggestions d'amélioration
 </output_format>
 
-=== FIN EXEMPLE ===
+=== LE MÊME EXEMPLE, CONVENTION B ===
+
+## Contexte
+Projet Flutter nécessitant assistance technique.
+Type: Application mobile cross-platform.
+
+## Instructions
+1. Analyser les besoins spécifiques du projet
+2. Proposer des solutions adaptées à Flutter
+3. Fournir du code Dart fonctionnel
+4. Respecter les bonnes pratiques Flutter/Dart
+
+## Format de sortie
+Code Dart commenté, explications des choix techniques, suggestions
+d'amélioration.
+
+=== FIN EXEMPLES ===
 
 ⚠️ RAPPEL FINAL:
-- JAMAIS de Markdown (pas de #, ##, **, -, *)
-- UNIQUEMENT des balises XML <...>...</...>
-- Commence DIRECTEMENT par <context>
+- UNE SEULE convention sur tout le prompt, jamais les deux mélangées
+- Commence DIRECTEMENT par la section de contexte
 - Utilise la MÊME LANGUE que l'utilisateur
-- Pas de texte avant ou après le XML"""
+- Pas de texte avant ou après le prompt reformaté"""
 
 
 # ============================================
@@ -668,14 +762,14 @@ STYLE_MODIFIERS = {
 # ============================================
 
 SYSTEM_PROMPTS = {
-    TargetModel.CLAUDE_OPUS_4_5: SYSTEM_PROMPT_CLAUDE_OPUS,
-    TargetModel.CLAUDE_SONNET_4_5: SYSTEM_PROMPT_CLAUDE_SONNET,
+    TargetModel.CLAUDE_OPUS_5: SYSTEM_PROMPT_CLAUDE_OPUS,
+    TargetModel.CLAUDE_SONNET_5: SYSTEM_PROMPT_CLAUDE_SONNET,
     TargetModel.CLAUDE_HAIKU_4_5: SYSTEM_PROMPT_CLAUDE_HAIKU,
     TargetModel.GPT_5_1: SYSTEM_PROMPT_GPT_5_1,
-    TargetModel.GPT_5_1_MINI: SYSTEM_PROMPT_GPT_5_1_MINI,
+    TargetModel.GPT_5_6_TERRA: SYSTEM_PROMPT_GPT_5_6_TERRA,
     TargetModel.GPT_5_PRO: SYSTEM_PROMPT_GPT_5_PRO,
-    TargetModel.GEMINI_3_PRO: SYSTEM_PROMPT_GEMINI_3_PRO,
-    TargetModel.GEMINI_3_FLASH: SYSTEM_PROMPT_GEMINI_3_FLASH,
+    TargetModel.GEMINI_3_1_PRO: SYSTEM_PROMPT_GEMINI_3_1_PRO,
+    TargetModel.GEMINI_3_6_FLASH: SYSTEM_PROMPT_GEMINI_3_6_FLASH,
     TargetModel.UNIVERSAL: SYSTEM_PROMPT_UNIVERSAL,
 }
 
@@ -721,125 +815,23 @@ Réécris cette demande en prompt structuré."""
     return system_prompt, user_prompt
 
 
-def get_model_optimization_tips(target: TargetModel) -> str:
-    """Retourne des conseils d'optimisation spécifiques au modèle cible."""
-    tips = {
-        TargetModel.CLAUDE_OPUS_4_5: """
-Forces à exploiter:
-- Excelle sur les tâches complexes et longues (agents, architecture, code avancé)
-- Comprend très bien les balises XML structurées
-- Gère des contextes très longs (200K tokens)
-- Peut utiliser le mode "thinking" pour réflexion approfondie
-
-Optimisations:
-→ Inclure un contexte COMPLET et détaillé
-→ Ajouter une section <thinking_approach> pour tâches complexes
-→ Utiliser <quality_criteria> pour l'auto-évaluation
-→ Être explicite sur les nuances et cas particuliers""",
-
-        TargetModel.CLAUDE_SONNET_4_5: """
-Forces à exploiter:
-- Excellent équilibre performance/coût
-- Très bon pour le code et les agents au quotidien
-- Mode hybride: rapide OU raisonnement étendu
-
-Optimisations:
-→ Contexte essentiel mais concis
-→ Instructions claires et directes
-→ Bien structurer avec <requirements> et <constraints>""",
-
-        TargetModel.CLAUDE_HAIKU_4_5: """
-Forces à exploiter:
-- Ultra-rapide et économique
-- Idéal pour tâches simples et volume élevé
-
-Optimisations:
-→ Prompt TRÈS COURT (moins c'est mieux)
-→ Seulement 2-3 sections XML essentielles
-→ Instructions directes, pas de fioritures""",
-
-        TargetModel.GPT_5_1: """
-Forces à exploiter:
-- Extrêmement steerable (suit les instructions avec précision chirurgicale)
-- 45% moins d'hallucinations que GPT-4
-- Contexte 272K tokens
-
-Optimisations:
-→ Instructions EXPLICITES et non ambiguës
-→ Éviter les contradictions dans les instructions
-→ Format de sortie PRÉCIS (GPT-5.1 le suivra exactement)
-→ Sections claires: Contexte, Objectif, Exigences, Contraintes""",
-
-        TargetModel.GPT_5_1_MINI: """
-Forces à exploiter:
-- Rapide et très économique
-- Steerable comme GPT-5.1
-- Bon pour tâches simples à moyennes
-
-Optimisations:
-→ Prompt CONCIS
-→ Instructions directes
-→ Éviter le sur-prompting""",
-
-        TargetModel.GPT_5_PRO: """
-Forces à exploiter:
-- Raisonnement très approfondi (jusqu'à 10+ min de réflexion)
-- Idéal: sciences, maths, recherche, problèmes complexes
-
-Optimisations:
-→ Ajouter "Réfléchis en profondeur à ce problème" pour deep reasoning
-→ Section "Définition du problème" très détaillée
-→ Hypothèses et contraintes explicites
-→ Contexte technique complet""",
-
-        TargetModel.GEMINI_3_PRO: """
-Forces à exploiter:
-- Contexte ÉNORME de 1M tokens
-- Excellent pour documents très longs
-- Multimodal avancé (texte, image, audio, vidéo)
-
-Optimisations:
-→ Inclure TOUT le contexte pertinent (il gère)
-→ Section <objective> pour l'objectif principal
-→ Idéal pour analyse de documents entiers""",
-
-        TargetModel.GEMINI_3_FLASH: """
-Forces à exploiter:
-- Très rapide comme Haiku
-- Contexte 1M tokens comme Pro
-
-Optimisations:
-→ Prompt court mais contexte peut être long
-→ Instructions directes""",
-
-        TargetModel.UNIVERSAL: """
-Compatibilité maximale avec tous les LLMs:
-- Structure XML claire et standard
-- Instructions explicites et non ambiguës
-- Niveau de détail modéré
-- Format de sortie bien défini"""
-    }
-    
-    return tips.get(target, tips[TargetModel.UNIVERSAL])
-
-
 # ============================================
 # Profils prédéfinis
 # ============================================
 
 PRESET_PROFILES = {
     # Claude (Anthropic)
-    "claude_opus_4.5": ReformatProfile(
-        target_model=TargetModel.CLAUDE_OPUS_4_5,
+    "claude_opus_5": ReformatProfile(
+        target_model=TargetModel.CLAUDE_OPUS_5,
         style=PromptStyle.DETAILLE,
         include_examples=True,
-        pricing=MODEL_PRICING[TargetModel.CLAUDE_OPUS_4_5]
+        pricing=MODEL_PRICING[TargetModel.CLAUDE_OPUS_5]
     ),
-    "claude_sonnet_4.5": ReformatProfile(
-        target_model=TargetModel.CLAUDE_SONNET_4_5,
+    "claude_sonnet_5": ReformatProfile(
+        target_model=TargetModel.CLAUDE_SONNET_5,
         style=PromptStyle.TECHNIQUE,
         include_examples=True,
-        pricing=MODEL_PRICING[TargetModel.CLAUDE_SONNET_4_5]
+        pricing=MODEL_PRICING[TargetModel.CLAUDE_SONNET_5]
     ),
     "claude_haiku_4.5": ReformatProfile(
         target_model=TargetModel.CLAUDE_HAIKU_4_5,
@@ -847,7 +839,7 @@ PRESET_PROFILES = {
         include_examples=False,
         pricing=MODEL_PRICING[TargetModel.CLAUDE_HAIKU_4_5]
     ),
-    
+
     # GPT (OpenAI)
     "gpt_5.1": ReformatProfile(
         target_model=TargetModel.GPT_5_1,
@@ -855,11 +847,11 @@ PRESET_PROFILES = {
         include_examples=True,
         pricing=MODEL_PRICING[TargetModel.GPT_5_1]
     ),
-    "gpt_5.1_mini": ReformatProfile(
-        target_model=TargetModel.GPT_5_1_MINI,
+    "gpt_5.6_terra": ReformatProfile(
+        target_model=TargetModel.GPT_5_6_TERRA,
         style=PromptStyle.CONCIS,
         include_examples=False,
-        pricing=MODEL_PRICING[TargetModel.GPT_5_1_MINI]
+        pricing=MODEL_PRICING[TargetModel.GPT_5_6_TERRA]
     ),
     "gpt_5_pro": ReformatProfile(
         target_model=TargetModel.GPT_5_PRO,
@@ -867,27 +859,27 @@ PRESET_PROFILES = {
         include_examples=True,
         pricing=MODEL_PRICING[TargetModel.GPT_5_PRO]
     ),
-    
+
     # Gemini (Google)
-    "gemini_3_pro": ReformatProfile(
-        target_model=TargetModel.GEMINI_3_PRO,
+    "gemini_3.1_pro": ReformatProfile(
+        target_model=TargetModel.GEMINI_3_1_PRO,
         style=PromptStyle.DETAILLE,
         include_examples=True,
-        pricing=MODEL_PRICING[TargetModel.GEMINI_3_PRO]
+        pricing=MODEL_PRICING[TargetModel.GEMINI_3_1_PRO]
     ),
-    "gemini_3_flash": ReformatProfile(
-        target_model=TargetModel.GEMINI_3_FLASH,
+    "gemini_3.6_flash": ReformatProfile(
+        target_model=TargetModel.GEMINI_3_6_FLASH,
         style=PromptStyle.CONCIS,
         include_examples=False,
-        pricing=MODEL_PRICING[TargetModel.GEMINI_3_FLASH]
+        pricing=MODEL_PRICING[TargetModel.GEMINI_3_6_FLASH]
     ),
-    
-    # Universel
+
+    # Universel - aucun modèle réel visé, donc aucun tarif (DEC-004 §1)
     "universel": ReformatProfile(
         target_model=TargetModel.UNIVERSAL,
         style=PromptStyle.DETAILLE,
         include_examples=True,
-        pricing=MODEL_PRICING[TargetModel.UNIVERSAL]
+        pricing=None
     ),
 }
 
@@ -900,11 +892,6 @@ def get_profile(name: str) -> ReformatProfile:
 def list_profiles() -> list[str]:
     """Liste les noms des profils disponibles."""
     return list(PRESET_PROFILES.keys())
-
-
-def get_pricing(model: TargetModel) -> ModelPricing:
-    """Récupère le pricing d'un modèle."""
-    return MODEL_PRICING.get(model, MODEL_PRICING[TargetModel.UNIVERSAL])
 
 
 # ============================================
@@ -927,22 +914,40 @@ def compare_models(input_tokens: int = 1000, output_tokens: int = 500) -> list[d
     for model, pricing in MODEL_PRICING.items():
         cost = pricing.estimate_cost(input_tokens, output_tokens)
         comparisons.append({
+            # `model` reste l'identifiant d'API exact, celui qu'on copie dans
+            # du code. `label` est le nom commercial publié par l'éditeur,
+            # celui qu'on montre à un humain : un tableau de comparaison qui
+            # affiche `claude-haiku-4-5-20251001` ne se lit pas (F-028).
             "model": model.value,
+            "label": pricing.display_name or model.value,
             "cost": cost,
             "cost_display": f"${cost:.4f}",
             "input_price": f"${pricing.input_price}/M",
             "output_price": f"${pricing.output_price}/M",
-            "context": f"{pricing.context_window // 1000}K",
+            "context": _format_context(pricing.context_window),
             "tier": _get_model_tier(model),
         })
     
     return sorted(comparisons, key=lambda x: x["cost"])
 
 
+def _format_context(window: int | None) -> str:
+    """Rend une fenêtre de contexte, ou dit qu'elle n'est pas confirmée.
+
+    `None` ne se rend pas en « 0K » : une fenêtre inconnue est écrite comme
+    inconnue (F-028).
+    """
+    if window is None:
+        return "non confirmé"
+    if window >= 1_000_000 and window % 1_000_000 == 0:
+        return f"{window // 1_000_000}M"
+    return f"{window // 1000}K"
+
+
 def _get_model_tier(model: TargetModel) -> str:
     """Retourne le tier de performance du modèle."""
-    premium = [TargetModel.CLAUDE_OPUS_4_5, TargetModel.GPT_5_PRO, TargetModel.GPT_5_1]
-    mid = [TargetModel.CLAUDE_SONNET_4_5, TargetModel.GEMINI_3_PRO]
+    premium = [TargetModel.CLAUDE_OPUS_5, TargetModel.GPT_5_PRO, TargetModel.GPT_5_1]
+    mid = [TargetModel.CLAUDE_SONNET_5, TargetModel.GEMINI_3_1_PRO]
     
     if model in premium:
         return "🔥 Premium"
@@ -950,72 +955,3 @@ def _get_model_tier(model: TargetModel) -> str:
         return "⚡ Performant"
     else:
         return "💰 Économique"
-
-
-def get_recommendation(task_type: str) -> dict:
-    """
-    Recommande un modèle selon le type de tâche.
-    
-    Args:
-        task_type: "code", "chat", "analysis", "creative", "budget"
-    
-    Returns:
-        Dictionnaire avec recommandation et alternatives
-    """
-    recommendations = {
-        "code": {
-            "best": "claude_opus_4.5",
-            "balanced": "claude_sonnet_4.5",
-            "budget": "gpt_5.1_mini",
-            "reason": "Opus 4.5 excelle en code complexe, Sonnet pour le quotidien"
-        },
-        "chat": {
-            "best": "gpt_5.1",
-            "balanced": "gemini_3_flash",
-            "budget": "claude_haiku_4.5",
-            "reason": "GPT-5.1 est plus naturel, Flash/Haiku pour le volume"
-        },
-        "analysis": {
-            "best": "gemini_3_pro",
-            "balanced": "claude_sonnet_4.5",
-            "budget": "gpt_5.1_mini",
-            "reason": "Gemini 3 Pro avec 1M tokens pour les gros documents"
-        },
-        "creative": {
-            "best": "gpt_5.1",
-            "balanced": "claude_sonnet_4.5",
-            "budget": "gemini_3_flash",
-            "reason": "GPT-5.1 moins sycophantique, plus créatif"
-        },
-        "budget": {
-            "best": "gpt_5.1_mini",
-            "balanced": "claude_haiku_4.5",
-            "budget": "gemini_3_flash",
-            "reason": "GPT-5.1 Mini offre le meilleur rapport qualité/prix"
-        },
-    }
-    
-    return recommendations.get(task_type, recommendations["budget"])
-
-
-def format_comparison_table() -> str:
-    """Génère un tableau de comparaison formaté."""
-    comparisons = compare_models()
-    
-    lines = [
-        "┌──────────────────────┬───────────────┬───────────────┬──────────┬─────────────┐",
-        "│ Modèle               │ Input/M       │ Output/M      │ Contexte │ Tier        │",
-        "├──────────────────────┼───────────────┼───────────────┼──────────┼─────────────┤",
-    ]
-    
-    for c in comparisons:
-        model = c["model"][:20].ljust(20)
-        input_p = c["input_price"].ljust(13)
-        output_p = c["output_price"].ljust(13)
-        context = c["context"].ljust(8)
-        tier = c["tier"].ljust(11)
-        lines.append(f"│ {model} │ {input_p} │ {output_p} │ {context} │ {tier} │")
-    
-    lines.append("└──────────────────────┴───────────────┴───────────────┴──────────┴─────────────┘")
-    
-    return "\n".join(lines)
