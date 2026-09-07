@@ -38,9 +38,9 @@ from .scanner_helpers import (
 )
 from .template_helpers import get_template_choices, get_template_content
 from .profiles_ui import get_profile_choices, get_profile_info
-from .onboarding import ONBOARDING_FLOWS, QuestionType
+from .onboarding import ONBOARDING_FLOWS
 from .wizard import (
-    SLOT_TYPE_ORDER, WIZARD_SLOT_COUNT, SAVE_PENDING_MESSAGE,
+    SLOT_TYPE_ORDER, WIZARD_SLOT_COUNT, SAVE_PENDING_MESSAGE, build_slot_field,
     on_profession_selected, start_wizard, go_next, go_prev,
     restart_wizard, save_wizard_project
 )
@@ -554,23 +554,14 @@ def create_interface() -> gr.Blocks:
                             # le champ de son type y est visible. La capacite est
                             # derivee de la donnee, donc aucune question ne peut
                             # etre tronquee en silence.
-                            wizard_fields = []
-                            for _slot in range(WIZARD_SLOT_COUNT):
-                                for _qtype in SLOT_TYPE_ORDER:
-                                    _tag = f"Q{_slot + 1}·{_qtype.value}"
-                                    if _qtype is QuestionType.TEXT:
-                                        _field = gr.Textbox(label=_tag, visible=False, interactive=True)
-                                    elif _qtype is QuestionType.TEXTAREA:
-                                        _field = gr.Textbox(label=_tag, visible=False, lines=4, interactive=True)
-                                    elif _qtype is QuestionType.SELECT:
-                                        _field = gr.Dropdown(label=_tag, visible=False, interactive=True, allow_custom_value=True)
-                                    elif _qtype is QuestionType.MULTISELECT:
-                                        _field = gr.Dropdown(label=_tag, visible=False, multiselect=True, interactive=True, allow_custom_value=True)
-                                    elif _qtype is QuestionType.NUMBER:
-                                        _field = gr.Number(label=_tag, visible=False, interactive=True)
-                                    else:
-                                        _field = gr.Slider(label=_tag, visible=False, minimum=0, maximum=100, step=1, interactive=True)
-                                    wizard_fields.append(_field)
+                            # Le rendu d'un champ vit dans web/wizard.py, a
+                            # cote de SLOT_TYPE_ORDER : un type sans
+                            # constructeur y leve, il n'y a pas de repli.
+                            wizard_fields = [
+                                build_slot_field(_qtype, f"Q{_slot + 1}·{_qtype.value}")
+                                for _slot in range(WIZARD_SLOT_COUNT)
+                                for _qtype in SLOT_TYPE_ORDER
+                            ]
 
                             wizard_error = gr.Markdown("")
 

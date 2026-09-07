@@ -339,7 +339,156 @@ class TestNoUnwiredComponent:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. VERROUS DE STRUCTURE : UNE SUPPRESSION ACCIDENTELLE SE VOIT
+# 3. COUTURE wizard.py <-> interface.py : LE CONTRAT, PAS LA PRESENCE (D-074)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Le verrou d'orphelins ci-dessus compte un composant comme cable s'il est
+# `inputs` **ou** `outputs`. Pour les trente champs de l'assistant, les deux
+# roles sont distincts et chacun masque la perte de l'autre :
+#
+#   - sans les champs en `outputs`, aucune question ne s'affiche jamais ;
+#   - sans les champs en `inputs`, le premier « Suivant » leve
+#     `WizardCapacityError` ;
+#   - un champ construit dans le mauvais type Gradio rend une question
+#     inutilisable sans qu'aucun compte ne bouge.
+#
+# Ces trois mutations ont ete mesurees survivantes le 2026-09-07 sur la suite
+# entiere : l'onglet etait mort, la suite verte. C'est la rechute de D-063,
+# que les tests de presence ne peuvent pas voir par construction. Ce qui suit
+# verifie donc le **contrat** : quels composants, dans quel ordre, de quel
+# type — position par position.
+
+
+#: Signature discriminante attendue pour chaque type de question, ecrite ici
+#: independamment de `_SLOT_FIELD_BUILDERS`. Une table derivee du code teste
+#: ne prouverait rien : elle suivrait la faute.
+#: Second membre : nombre de lignes pour un `Textbox`, drapeau `multiselect`
+#: pour un `Dropdown`, `None` quand la classe suffit a distinguer.
+EXPECTED_SLOT_SIGNATURES = {
+    "text": ("Textbox", 1),
+    "textarea": ("Textbox", 4),
+    "select": ("Dropdown", False),
+    "multiselect": ("Dropdown", True),
+    "number": ("Number", None),
+    "slider": ("Slider", None),
+}
+
+
+def _field_signature(block):
+    """(classe Gradio, trait discriminant) d'un composant de champ."""
+    name = type(block).__name__
+    if name == "Textbox":
+        return (name, getattr(block, "lines", None))
+    if name == "Dropdown":
+        return (name, bool(getattr(block, "multiselect", False)))
+    return (name, None)
+
+
+def _wizard_handler(app, function):
+    """Le gestionnaire branche sur une fonction de navigation donnee."""
+    from promptforge.web import wizard
+
+    expected = getattr(wizard, function)
+    found = [h for h in _handlers(app) if getattr(h, "fn", None) is expected]
+    assert len(found) == 1, (
+        f"{len(found)} gestionnaire(s) branche(s) sur wizard.{function} au lieu "
+        f"d'un seul. Le cablage de l'assistant a change sans que ce test le sache."
+    )
+    return found[0]
+
+
+class TestWizardSeamContract:
+    """Le contrat de `web/wizard.py` est-il **exactement** ce qui est branche ?"""
+
+    def test_navigation_outputs_carry_the_whole_field_pool(self, built):
+        """Sans les champs en sortie, aucune question ne s'affiche jamais."""
+        from promptforge.web.wizard import WIZARD_FIELD_COUNT, WIZARD_NAV_HEADER_COUNT
+
+        for function in ("start_wizard", "go_next", "go_prev"):
+            outputs = list(_wizard_handler(built.app, function).outputs or [])
+            assert len(outputs) == WIZARD_NAV_HEADER_COUNT + WIZARD_FIELD_COUNT, (
+                f"wizard.{function} rend "
+                f"{WIZARD_NAV_HEADER_COUNT + WIZARD_FIELD_COUNT} valeurs mais "
+                f"{len(outputs)} composants sont branches en sortie. Les valeurs "
+                f"excedentaires sont jetees : les champs concernes ne s'affichent "
+                f"jamais et l'onglet est mort sans qu'aucun compte ne bouge."
+            )
+
+    def test_navigation_inputs_carry_the_whole_field_pool(self, built):
+        """Sans les champs en entree, le premier « Suivant » leve WizardCapacityError."""
+        from promptforge.web.wizard import WIZARD_FIELD_COUNT
+
+        state_count = 3  # profession, step, answers
+        for function in ("go_next", "go_prev"):
+            inputs = list(_wizard_handler(built.app, function).inputs or [])
+            assert len(inputs) == state_count + WIZARD_FIELD_COUNT, (
+                f"wizard.{function} lit {WIZARD_FIELD_COUNT} champs apres ses "
+                f"{state_count} etats, mais {len(inputs)} composants sont branches "
+                f"en entree. `collect_answers` refuse une charge tronquee : "
+                f"l'utilisateur recevrait une erreur des le premier « Suivant »."
+            )
+
+    def test_inputs_and_outputs_designate_the_very_same_fields(self, built):
+        """Meme pool, meme ordre : sinon une reponse atterrit sur une autre question.
+
+        Compare par `_id`, seule identite fiable d'un composant Gradio. Le
+        pool est positionnel : un decalage d'un cran suffit a stocker la
+        reponse d'une question dans une autre.
+        """
+        from promptforge.web.wizard import WIZARD_NAV_HEADER_COUNT
+
+        for function in ("go_next", "go_prev"):
+            handler = _wizard_handler(built.app, function)
+            out_fields = [c._id for c in list(handler.outputs or [])[WIZARD_NAV_HEADER_COUNT:]]
+            in_fields = [c._id for c in list(handler.inputs or [])[3:]]
+            assert in_fields == out_fields, (
+                f"wizard.{function} : les champs lus ne sont pas ceux ecrits.\n"
+                f"  entrees : {in_fields}\n  sorties : {out_fields}"
+            )
+
+    def test_each_field_has_the_gradio_class_its_slot_position_demands(self, built):
+        """Un champ NUMBER rendu en Slider reste « cable » et devient inutilisable."""
+        from promptforge.web.wizard import (
+            FIELDS_PER_SLOT,
+            SLOT_TYPE_ORDER,
+            WIZARD_NAV_HEADER_COUNT,
+        )
+
+        fields = list(_wizard_handler(built.app, "go_next").outputs or [])[WIZARD_NAV_HEADER_COUNT:]
+        for index, block in enumerate(fields):
+            question_type = SLOT_TYPE_ORDER[index % FIELDS_PER_SLOT]
+            expected = EXPECTED_SLOT_SIGNATURES[question_type.value]
+            assert _field_signature(block) == expected, (
+                f"Bloc {index // FIELDS_PER_SLOT + 1}, position "
+                f"« {question_type.value} » : composant {_field_signature(block)} "
+                f"au lieu de {expected}. Une question de ce type serait rendue "
+                f"dans un champ d'un autre type — visible, cable, inutilisable."
+            )
+
+    def test_the_signature_table_covers_every_declared_slot_type(self):
+        """La table du test doit suivre `SLOT_TYPE_ORDER`, sinon elle devient borgne."""
+        from promptforge.web.wizard import SLOT_TYPE_ORDER
+
+        assert {q.value for q in SLOT_TYPE_ORDER} == set(EXPECTED_SLOT_SIGNATURES), (
+            "Un type de question a ete ajoute ou retire de SLOT_TYPE_ORDER sans "
+            "que EXPECTED_SLOT_SIGNATURES ne suive : la verification de type "
+            "laisserait passer le nouveau venu."
+        )
+
+    def test_an_unknown_question_type_is_refused_not_silently_rendered(self):
+        """Le repli silencieux est interdit : un type inconnu doit lever.
+
+        Piege documente par `CLAUDE.md` pour `get_profile()`, qui retombe sur
+        « universel » sans echouer et sert le mauvais prompt.
+        """
+        from promptforge.web.wizard import UnsupportedQuestionTypeError, build_slot_field
+
+        with pytest.raises(UnsupportedQuestionTypeError):
+            build_slot_field("un-type-qui-n-existe-pas", "Q1")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. VERROUS DE STRUCTURE : UNE SUPPRESSION ACCIDENTELLE SE VOIT
 # ═══════════════════════════════════════════════════════════════════════════
 
 

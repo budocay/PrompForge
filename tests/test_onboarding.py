@@ -232,7 +232,7 @@ class WizardDriver:
 
     @property
     def fields(self):
-        return list(self.view[self.w.WIZARD_NAV_HEADER_COUNT:])
+        return list(self.view[self.w.WIZARD_NAV_HEADER_COUNT :])
 
     @property
     def visible_fields(self):
@@ -390,9 +390,9 @@ class TestWizardReachesEveryQuestion:
             )
             grand_total += len(expected)
 
-        assert grand_total == 123, (
-            f"{grand_total} questions parcourues au lieu des 123 mesurees le 2026-09-07."
-        )
+        assert (
+            grand_total == 123
+        ), f"{grand_total} questions parcourues au lieu des 123 mesurees le 2026-09-07."
 
     def test_generated_context_holds_no_unanswered_question(self):
         """« Non renseigné » dans le contexte = question inatteignable."""
@@ -412,9 +412,9 @@ class TestWizardReachesEveryQuestion:
             context = _walk_whole_flow(flow["name"]).result_text()
             for step in flow["steps"]:
                 for question in step.questions:
-                    assert f"**{question.label}**" in context, (
-                        f"{key} : « {question.label} » absente du contexte genere."
-                    )
+                    assert (
+                        f"**{question.label}**" in context
+                    ), f"{key} : « {question.label} » absente du contexte genere."
 
     def test_typed_values_survive_until_the_generated_context(self):
         driver = _walk_whole_flow("🔍 SEO Specialist")
@@ -463,9 +463,9 @@ class TestWizardNavigation:
             driver = WizardDriver().start(flow["name"])
             last = len(flow["steps"]) - 1
             for index in range(last):
-                assert driver.header("next_btn")["value"] == "Suivant ➡️", (
-                    f"{key} etape {index} : le bouton annonce deja la fin."
-                )
+                assert (
+                    driver.header("next_btn")["value"] == "Suivant ➡️"
+                ), f"{key} etape {index} : le bouton annonce deja la fin."
                 driver.fill_visible_step(f"s{index}")
                 driver.next()
             assert driver.header("step") == last
@@ -478,8 +478,11 @@ class TestWizardNavigation:
         first_step_answers = dict(driver.header("answers"))
         assert first_step_answers, "Rien n'a ete enregistre a la premiere etape"
 
+        # `fill_visible_step` n'ecrit que cote navigateur (`driver.raw`) : la
+        # vue serveur, elle, n'a pas encore vu l'etape 2. D'ou le nom — c'est
+        # l'etat AVANT le retour arriere, pas « les reponses de l'etape 2 ».
         driver.fill_visible_step("etape2")
-        second_step_answers = dict(driver.header("answers"))
+        answers_before_going_back = dict(driver.header("answers"))
 
         driver.prev()
         assert driver.header("step") == 0
@@ -491,9 +494,9 @@ class TestWizardNavigation:
             )
         # Et le retour arriere enregistre aussi l'etape qu'on quitte : sans
         # cela, la saisie de la deuxieme etape partirait a la poubelle.
-        assert set(preserved) > set(second_step_answers), (
+        assert set(preserved) > set(answers_before_going_back), (
             "Le retour arriere n'a enregistre aucune reponse de l'etape quittee : "
-            f"{sorted(preserved)} n'ajoute rien a {sorted(second_step_answers)}."
+            f"{sorted(preserved)} n'ajoute rien a {sorted(answers_before_going_back)}."
         )
 
     def test_typing_then_going_back_and_forward_restores_the_typed_values(self):
@@ -559,9 +562,9 @@ class TestWizardNavigation:
 
     def test_hidden_fields_never_contaminate_another_question(self):
         """Un champ masque garde sa valeur cote navigateur : elle doit etre ignoree."""
-        from promptforge.web.wizard import collect_answers
+        from promptforge.web.wizard import WIZARD_FIELD_COUNT, collect_answers
 
-        polluted = ["POLLUTION"] * 30
+        polluted = ["POLLUTION"] * WIZARD_FIELD_COUNT
         answers = collect_answers("seo-specialist", 0, {}, polluted)
         assert set(answers) == {"level", "specialization"}
 
@@ -593,9 +596,9 @@ class TestWizardRequiredFields:
         questions = ONBOARDING_FLOWS["seo-specialist"]["steps"][0].questions
         slot = next(i for i, q in enumerate(questions) if not q.required)
         question = questions[slot]
-        assert question.question_type is QuestionType.MULTISELECT, (
-            "Type de « specialization » deplace : reajustez la valeur saisie."
-        )
+        assert (
+            question.question_type is QuestionType.MULTISELECT
+        ), "Type de « specialization » deplace : reajustez la valeur saisie."
 
         raw = [None] * WIZARD_FIELD_COUNT
         raw[slot * FIELDS_PER_SLOT + SLOT_TYPE_INDEX[question.question_type]] = ["SEO Technique"]
@@ -605,10 +608,15 @@ class TestWizardRequiredFields:
 
     def test_answering_the_required_field_unblocks(self):
         from promptforge.web.onboarding import QuestionType
-        from promptforge.web.wizard import SLOT_TYPE_INDEX, WIZARD_FIELD_COUNT, go_next
+        from promptforge.web.wizard import (
+            FIELDS_PER_SLOT,
+            SLOT_TYPE_INDEX,
+            WIZARD_FIELD_COUNT,
+            go_next,
+        )
 
         raw = [None] * WIZARD_FIELD_COUNT
-        raw[0 * 6 + SLOT_TYPE_INDEX[QuestionType.SELECT]] = "Expert (5+ ans)"
+        raw[0 * FIELDS_PER_SLOT + SLOT_TYPE_INDEX[QuestionType.SELECT]] = "Expert (5+ ans)"
         view = go_next("seo-specialist", 0, {}, *raw)
         assert view[_nav_names().index("step")] == 1
         assert view[_nav_names().index("error")] == ""
@@ -677,11 +685,37 @@ class TestWizardSave:
         assert (forge.projects_path / "mon-profil-seo.md").read_text(encoding="utf-8") == context
         assert dropdown["value"] == "mon-profil-seo"
 
+        # Le message annonce « cree ET active ». Verifier la seule creation
+        # laissait disparaitre l'activation sans qu'un test ne bouge.
+        assert "activé" in status, status
+        active = forge.get_current_project()
+        assert active is not None and active.name == "mon-profil-seo", (
+            f"Activation annoncee mais projet actif = " f"{active.name if active else 'aucun'}."
+        )
+        # `is_active` remonte de SQLite en entier (1), pas en booleen, malgre
+        # l'annotation `bool` de la dataclass : on teste la verite, pas le type.
+        assert forge.db.get_project(
+            "mon-profil-seo"
+        ).is_active, "Le projet est en base mais son drapeau d'activation est faux."
+
     def test_empty_name_is_refused(self, sandbox):
+        """Le refus doit etre prononce AVANT le disque, et pour le bon motif.
+
+        Sans la garde de nom, `normalize_name("   ")` rend une chaine vide :
+        le code ecrit un fichier litteralement nomme « .md », puis
+        `init_project` le refuse au motif que ce n'est pas un fichier .md. Un
+        `startswith("❌")` seul se contente de ce plantage en aval — il
+        verrouille le message d'une autre erreur, pas la garde.
+        """
+        from promptforge.web.ollama_helpers import get_forge
         from promptforge.web.wizard import save_wizard_project
 
         status, _, _ = save_wizard_project("   ", "du contenu")
-        assert status.startswith("❌")
+        assert "Nom de projet requis" in status, status
+        assert not (get_forge().projects_path / ".md").exists(), (
+            "Un fichier « .md » a ete ecrit avant le refus : la garde de nom a "
+            "saute et l'erreur remontee vient d'un plantage en aval."
+        )
 
     def test_empty_config_is_refused(self, sandbox):
         from promptforge.web.wizard import save_wizard_project
@@ -737,6 +771,20 @@ class TestWizardSave:
         assert status.startswith("❌"), status
         assert "introuvable" in status
 
+    def test_an_activation_that_never_happened_is_caught_by_the_read_back(
+        self, sandbox, monkeypatch
+    ):
+        """Projet cree mais non actif : le succes est refuse, pas maquille."""
+        from promptforge.web import wizard
+        from promptforge.web.ollama_helpers import get_forge
+
+        forge = get_forge()
+        monkeypatch.setattr(type(forge), "use_project", lambda self, *a, **k: (False, "raté"))
+        status, _, _ = wizard.save_wizard_project("projet-inactif", "du contenu")
+        assert status.startswith("❌"), status
+        assert "non activé" in status
+        assert forge.db.get_project("projet-inactif") is not None
+
 
 class TestWizardIsActuallyWiredInTheInterface:
     """D-064 : `web/onboarding.py` doit etre joignable depuis l'interface."""
@@ -745,9 +793,9 @@ class TestWizardIsActuallyWiredInTheInterface:
         import promptforge.web.interface as interface
 
         source = Path(interface.__file__).read_text(encoding="utf-8")
-        assert "Logique complète du wizard serait ici" not in source, (
-            "L'aveu de non-cablage est toujours dans le fichier."
-        )
+        assert (
+            "Logique complète du wizard serait ici" not in source
+        ), "L'aveu de non-cablage est toujours dans le fichier."
         for handler in ("start_wizard", "go_next", "go_prev", "restart_wizard"):
             assert f"fn={handler}" in source, f"{handler} n'est branche sur aucun evenement."
 

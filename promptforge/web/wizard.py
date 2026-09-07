@@ -135,6 +135,69 @@ class WizardCapacityError(RuntimeError):
     """
 
 
+class UnsupportedQuestionTypeError(RuntimeError):
+    """Aucun composant ne sait rendre ce type de question.
+
+    Volontairement bruyante. Le repli silencieux — un `else` qui rend un
+    composant arbitraire — est le piege que `CLAUDE.md` documente deja pour
+    `get_profile()`, qui retombe sur « universel » sans echouer : la mauvaise
+    reponse est servie et rien ne le signale. Ici un type non couvert casse la
+    construction de l'interface, donc se voit au premier test qui l'assemble.
+    """
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSTRUCTION D'UN CHAMP DU POOL
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Le rendu vit ici, a cote de `SLOT_TYPE_ORDER`, et non dans `interface.py` :
+# la liste des types et leur traduction en composants ne doivent pas pouvoir
+# diverger. Un type ajoute a `SLOT_TYPE_ORDER` sans constructeur fait echouer
+# l'assertion ci-dessous a l'import, pas trois ecrans plus loin.
+#
+# Les champs sont poses masques : `field_updates()` decide seul de ce qui est
+# visible a une etape donnee.
+
+_SLOT_FIELD_BUILDERS = {
+    QuestionType.TEXT: lambda tag: gr.Textbox(label=tag, visible=False, interactive=True),
+    QuestionType.TEXTAREA: lambda tag: gr.Textbox(
+        label=tag, visible=False, lines=4, interactive=True
+    ),
+    QuestionType.SELECT: lambda tag: gr.Dropdown(
+        label=tag, visible=False, interactive=True, allow_custom_value=True
+    ),
+    QuestionType.MULTISELECT: lambda tag: gr.Dropdown(
+        label=tag, visible=False, multiselect=True, interactive=True, allow_custom_value=True
+    ),
+    QuestionType.NUMBER: lambda tag: gr.Number(label=tag, visible=False, interactive=True),
+    QuestionType.SLIDER: lambda tag: gr.Slider(
+        label=tag, visible=False, minimum=0, maximum=100, step=1, interactive=True
+    ),
+}
+
+assert set(_SLOT_FIELD_BUILDERS) == set(SLOT_TYPE_ORDER)
+
+
+def build_slot_field(question_type: QuestionType, tag: str):
+    """Composant Gradio d'un champ de bloc, pose masque.
+
+    Args:
+        question_type: type de question que ce champ saura rendre.
+        tag: libelle de construction, remplace des qu'une question l'occupe.
+
+    Raises:
+        UnsupportedQuestionTypeError: le type n'a pas de constructeur.
+    """
+    builder = _SLOT_FIELD_BUILDERS.get(question_type)
+    if builder is None:
+        raise UnsupportedQuestionTypeError(
+            f"Aucun composant ne rend le type « {question_type} ». Ajoutez son "
+            f"constructeur a _SLOT_FIELD_BUILDERS plutot que de laisser un repli "
+            f"rendre un champ d'un autre type sans le dire."
+        )
+    return builder(tag)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # LECTURE DU FLUX
 # ═══════════════════════════════════════════════════════════════════════════
@@ -203,6 +266,24 @@ def initial_value(question: Question, answers: dict):
     return question.default or ""
 
 
+def _normalise_number(value):
+    """Valeur numerique stockable : le vide reste vide, l'entier reste entier.
+
+    Un `Number` vide rend `None` et un `Slider` rend toujours un flottant ;
+    sans cette normalisation, « 3 » serait stocke « 3.0 » et ressortirait tel
+    quel dans le contexte genere.
+    """
+    if value is None or value == "":
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        # Valeur non numerique saisie a la main : on la rend telle quelle
+        # plutot que de la perdre.
+        return value
+    return int(number) if number.is_integer() else number
+
+
 def normalise_answer(question: Question, value):
     """Ramene une valeur de composant Gradio a une reponse stockable."""
     if question.question_type is QuestionType.MULTISELECT:
@@ -210,13 +291,7 @@ def normalise_answer(question: Question, value):
             return []
         return list(value) if isinstance(value, (list, tuple)) else [value]
     if question.question_type in (QuestionType.NUMBER, QuestionType.SLIDER):
-        if value is None or value == "":
-            return ""
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return value
-        return int(number) if number.is_integer() else number
+        return _normalise_number(value)
     if value is None:
         return ""
     return value.strip() if isinstance(value, str) else value
@@ -471,6 +546,29 @@ def restart_wizard() -> tuple:
 SAVE_PENDING_MESSAGE = "⏳ Sauvegarde en cours…"
 
 
+def _read_back_failure(forge, normalized: str, projects: list[str]) -> str | None:
+    """Relit ce qui vient d'etre ecrit ; rend un message d'erreur, ou `None`.
+
+    Sans cette relecture, le message de succes serait une declaration — la
+    lecon de D-054. Elle porte sur les DEUX moities de ce qui est annonce,
+    « cree » **et** « active » : ne verifier que l'existence laissait
+    disparaitre l'activation sans qu'un mot du message ne change.
+    """
+    if normalized not in projects:
+        return (
+            f"❌ Projet « {normalized} » introuvable après enregistrement — "
+            f"rien n'a été sauvegardé."
+        )
+    active = forge.get_current_project()
+    if active is None or active.name != normalized:
+        return (
+            f"❌ Projet « {normalized} » enregistré mais non activé "
+            f"(projet actif : {active.name if active else 'aucun'}) — "
+            f"active-le depuis l'onglet Projets."
+        )
+    return None
+
+
 def save_wizard_project(project_name: str, config_content: str):
     """Ecrit la config, enregistre le projet, l'active, **puis verifie**.
 
@@ -511,15 +609,10 @@ def save_wizard_project(project_name: str, config_content: str):
 
     forge.use_project(normalized)
 
-    # Relecture : sans elle, le message de succes serait une declaration.
     projects = get_projects_list()
-    if normalized not in projects:
-        return (
-            f"❌ Projet « {normalized} » introuvable après enregistrement — "
-            f"rien n'a été sauvegardé.",
-            gr.update(choices=projects),
-            gr.update(choices=projects),
-        )
+    failure = _read_back_failure(forge, normalized, projects)
+    if failure:
+        return failure, gr.update(choices=projects), gr.update(choices=projects)
 
     logger.info(f"Wizard project saved: {normalized}")
     return (
