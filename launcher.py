@@ -113,6 +113,10 @@ state = {
     # Mesure materielle (DEC-001) et recommandation (DEC-003/DEC-006).
     "hardware": None,        # Instantane serialisable de HardwareProfile
     "recommendation": None,  # Instantane serialisable de Recommendation
+    # Tags tenant dans la memoire mesuree, catalogue COMPLET : sert a marquer
+    # ce que la machine encaisse, licence comprise. `None` = rien de mesure,
+    # ce qui ne veut dire ni « tient » ni « ne tient pas ».
+    "fitting_tags": None,
     "catalog_available": CORE.available,
     "catalog_error": CORE.error,
     "docker_compose_file": None,  # Fichier docker-compose sélectionné
@@ -176,19 +180,122 @@ def model_entry(model):
         "estimated": model.memory_footprint_is_estimated,
         "context_tokens": model.context_window_tokens,
         "license": model.license_name,
+        # Qualification OSI et palier viennent du modele lui-meme : ce sont
+        # deux proprietes du catalogue, pas deux tables paralleles a tenir.
+        "osi_status": model.license_osi_status,
+        "osi_approved": model.is_osi_approved,
+        "tier": model.memory_tier,
+        "tier_label": model.memory_tier_label,
         "source_url": model.source_url,
         "verified_on": model.verified_on,
     }
 
 
 def catalog_entries():
-    """Le catalogue, du plus lourd au plus leger (DEC-006).
+    """Le catalogue, du plus lourd au plus leger (DEC-006), annote.
 
     L'ordre est celui de l'empreinte memoire, **jamais** celui d'une note de
     qualite : aucune source n'en publie, et les scores maison ont ete
     supprimes (D-021).
+
+    Deux annotations s'ajoutent aux faits du catalogue, et une seule des deux
+    est une opinion de cette couche :
+
+    * `fits` croise l'empreinte avec la memoire mesuree. La regle appartient au
+      coeur : c'est `recommend().fits`, recopie ici, jamais recalculee.
+      ``None`` tant que rien n'est mesure — ni « tient », ni « ne tient pas ».
+    * `installed` croise le tag avec ce qu'`ollama /api/tags` a rendu. Le
+      coeur a explicitement refuse ce croisement : « deja telecharge » n'est
+      pas une regle de memoire, et l'appariement nom/tag existe deja ici, dans
+      `is_model_installed()`. Il n'y en a donc qu'un, et il est a cet etage.
     """
-    return [model_entry(model) for model in CORE.models_by_footprint()]
+    tiennent = state.get("fitting_tags")
+    installes = state.get("installed_models") or []
+    entrees = []
+    for model in CORE.models_by_footprint():
+        entree = model_entry(model)
+        entree["fits"] = None if tiennent is None else (model.tag in tiennent)
+        entree["installed"] = is_model_installed(model.tag, installes)
+        entrees.append(entree)
+    return entrees
+
+
+def memory_tier_entries():
+    """Les cinq paliers memoire de l'offre par defaut, prets a rendre.
+
+    Le regroupement et l'ordre viennent de `group_by_memory_tier()` et de
+    `MEMORY_TIERS` : l'interface ne decoupe aucune tranche elle-meme, sinon
+    elle porterait une seconde classification a cote de celle de la veille
+    (D-022). Le catalogue passe est celui des licences approuvees OSI, parce
+    que c'est ce que l'interface propose par defaut.
+
+    Les cinq paliers sont rendus **meme vides**. Sur le catalogue du
+    2026-09-04 le palier le plus lourd n'a aucune entree approuvee OSI : le
+    taire ferait croire a un palier inexistant, alors que le fait a montrer
+    est qu'il existe et qu'aucun modele libre ne l'occupe.
+    """
+    return [
+        {"tier_id": tier_id, "label": label, "tags": [m.tag for m in modeles]}
+        for tier_id, label, modeles in CORE.memory_tier_groups(CORE.open_source_models())
+    ]
+
+
+#: Ce que l'interface propose par defaut, et pourquoi elle ecarte le reste.
+#:
+#: Trois etats de licence, jamais deux : approuvee OSI, non approuvee, et **non
+#: verifiee**. Fondre le troisieme dans le deuxieme affirmerait qu'une licence
+#: n'est pas libre alors que la veille refuse de trancher — la meme faute que
+#: `STATUS_UNKNOWN` corrige pour les services.
+LICENSE_NOTICE = (
+    "Par defaut, seules les licences approuvees OSI sont proposees : "
+    "{approuves} modeles sur {total}. Qualification d'apres {url} ; "
+    "l'appartenance de MIT et Apache-2.0 a cette liste est citee de cette "
+    "source et N'A PAS ete reverifiee en ligne."
+)
+LICENSE_RESTRICTED_NOTICE = (
+    "{restreints} modeles a licence non approuvee OSI : poids diffuses "
+    "publiquement, mais restrictions contractuelles d'usage. Ecartes du choix "
+    "par defaut, pas du catalogue."
+)
+LICENSE_UNDETERMINED_NOTICE = (
+    "{non_verifies} modeles dont la qualification OSI n'a pas pu etre "
+    "tranchee. Ni libres ni non libres : non verifies. Le motif de chacun est "
+    "inscrit au catalogue."
+)
+LICENSE_SCOPE_NOTICE = (
+    "Recommandation et choix maximal sont calcules sur les {approuves} "
+    "modeles a licence approuvee OSI uniquement."
+)
+
+
+def license_policy():
+    """La politique de licence servie a l'interface, ou ``None``.
+
+    Les trois ensembles de tags viennent de `CoreBridge.license_qualification()`,
+    donc des filtres du coeur. Les phrases sont ici parce qu'elles s'adressent
+    a l'utilisateur de ce launcher ; les comptes qu'elles portent sont
+    calcules, jamais ecrits.
+    """
+    qualification = CORE.license_qualification()
+    if qualification is None:
+        return None
+    comptes = {
+        "approuves": len(qualification["approved"]),
+        "restreints": len(qualification["restricted"]),
+        "non_verifies": len(qualification["undetermined"]),
+        "total": qualification["total"],
+        "url": qualification["reference_url"],
+    }
+    return {
+        "reference_url": qualification["reference_url"],
+        "approved": list(qualification["approved"]),
+        "restricted": list(qualification["restricted"]),
+        "undetermined": list(qualification["undetermined"]),
+        "notice": LICENSE_NOTICE.format(**comptes),
+        "restricted_notice": LICENSE_RESTRICTED_NOTICE.format(**comptes),
+        "undetermined_notice": LICENSE_UNDETERMINED_NOTICE.format(**comptes),
+        "scope_notice": LICENSE_SCOPE_NOTICE.format(**comptes),
+    }
 
 
 # Mapping des docker-compose par configuration
@@ -467,6 +574,7 @@ def detect_hardware():
         state["catalog_error"] = CORE.error
         state["hardware"] = None
         state["recommendation"] = None
+        state["fitting_tags"] = None
         state["gpu_type"] = None
         state["gpu"] = "Non mesure"
         log(f"Mesure materielle indisponible : {CORE.error}")
@@ -505,12 +613,35 @@ def apply_recommendation(profile=None):
     Le classement est celui de DEC-006 : empreinte memoire, jamais une note de
     qualite. Aucune qualite de reformatage n'est mesuree a ce jour ;
     l'interface doit le dire, et le dit.
+
+    **Deux appels a `recommend()`, deux questions differentes.**
+
+    * La **decision** — que proposer par defaut — porte sur le sous-catalogue a
+      licence approuvee OSI. Recommander un modele que l'interface n'offre pas
+      serait incoherent, et l'offre par defaut est open source.
+    * La **capacite** — ce que la machine encaisse — porte sur le catalogue
+      complet. Elle ne depend pas de la licence : marquer « depasse la memoire
+      mesuree » un modele restreint qui tient serait un mensonge de plus,
+      cache derriere un filtre juridique.
+
+    Aucune des deux ne reimplemente quoi que ce soit : c'est la meme fonction
+    du coeur, appelee sur deux catalogues.
     """
     if not CORE.available:
         state["recommendation"] = None
+        state["fitting_tags"] = None
         return None
 
-    reco = CORE.recommend_for(profile) if profile is not None else None
+    capacite = CORE.recommend_for(profile) if profile is not None else None
+    state["fitting_tags"] = (
+        [m.tag for m in capacite.fits] if capacite is not None and capacite.measured else None
+    )
+
+    reco = (
+        CORE.recommend_for(profile, catalog=CORE.open_source_models())
+        if profile is not None
+        else None
+    )
     if reco is None:
         state["recommendation"] = None
         return None
@@ -793,6 +924,13 @@ def status_payload(now=None):
     # est lue au catalogue du coeur et envoyee au client, qui ne porte plus
     # aucun `<option>` en dur. Ordre : empreinte memoire decroissante (DEC-006).
     payload["models"] = catalog_entries()
+    # Les cinq paliers de `group_by_memory_tier()`, dans l'ordre de
+    # `MEMORY_TIERS`. Le client rend ces groupes tels quels : il ne decoupe
+    # aucune tranche, il n'en connait meme pas les bornes.
+    payload["memory_tier_groups"] = memory_tier_entries()
+    # Ce qui est propose par defaut, ce qui est ecarte, et pourquoi. Un modele
+    # absent sans explication serait une decision prise a la place du dev.
+    payload["license_policy"] = license_policy()
     # DEC-006, dit a l'utilisateur au lieu d'etre suppose : le tri porte sur la
     # memoire, aucune qualite de reformatage n'est mesuree a ce jour.
     payload["quality_disclaimer"] = QUALITY_DISCLAIMER
@@ -1397,10 +1535,20 @@ HTML_TEMPLATE = """
                                  rendue par updateModelSelector() a partir de
                                  data.models, servi par /api/status depuis le
                                  catalogue du coeur. -->
-                            <select id="model-select" onchange="onModelChange(this.value)"></select>
+                            <select id="model-select" onchange="onModelChange(this.value)" style="min-width: 420px;"></select>
                             <span id="model-status" style="font-size: 1.2em;" title="Statut du modele"></span>
                         </div>
                         <div id="model-recommendation" style="margin-top: 6px; font-size: 0.78em; color: #aaa; max-width: 640px;"></div>
+                        <!-- Les licences ecartees ne disparaissent pas en
+                             silence : cette bascule les fait reapparaitre,
+                             groupees par motif d'exclusion. -->
+                        <div style="margin-top: 6px; font-size: 0.74em; color: #888;">
+                            <label style="cursor: pointer;">
+                                <input type="checkbox" id="show-restricted" onchange="onToggleRestricted()">
+                                Afficher aussi les licences restreintes et non verifiees
+                            </label>
+                        </div>
+                        <div id="model-licenses" style="margin-top: 4px; font-size: 0.72em; color: #888; max-width: 640px;"></div>
                         <div id="model-disclaimer" style="margin-top: 4px; font-size: 0.72em; color: #888; max-width: 640px;"></div>
                     </div>
                 </div>
@@ -1573,9 +1721,12 @@ HTML_TEMPLATE = """
                 // État des images Docker
                 updateDockerImagesStatus(data);
                 
-                // Liste des modeles, recommandation et reserve de DEC-006
+                // Liste des modeles, recommandation, licences et reserve de
+                // DEC-006. `updateLicenses` vient apres la liste : elle dit
+                // ce que la liste propose, et ce qu'elle ecarte.
                 updateModelSelector(data);
                 updateRecommendation(data);
+                updateLicenses(data);
 
                 var modelStatus = document.getElementById('model-status');
                 if (modelStatus) {
@@ -1772,16 +1923,53 @@ HTML_TEMPLATE = """
                 + (hw.total_memory_source ? ' | sonde : ' + hw.total_memory_source : '');
         }
 
-        function modelLabel(model, fits) {
-            var texte = model.tag + ' - ' + gb(model.footprint_gb) + ' en memoire';
+        // Le dernier etat servi, garde pour re-rendre la liste quand la
+        // bascule de licence change, sans attendre le prochain /api/status.
+        var dernierEtat = null;
+
+        function modelesParTag(data) {
+            var carte = {};
+            (data.models || []).forEach(function (m) { carte[m.tag] = m; });
+            return carte;
+        }
+
+        function modelesDe(tags, carte) {
+            return (tags || []).map(function (t) { return carte[t]; })
+                               .filter(function (m) { return !!m; });
+        }
+
+        function modelLabel(model) {
+            // Trois faits par ligne, dans cet ordre : est-il deja la, que
+            // coute-t-il en memoire, que coute-t-il a telecharger. Le premier
+            // est celui qui manquait : la liste ne disait pas ce qui etait
+            // deja installe. `installed` est calcule cote serveur par
+            // is_model_installed(), le seul appariement nom/tag du depot.
+            var marque = model.installed ? '●' : '○';
+            if (model.fits === false) marque += ' ✕';
+            var texte = marque + ' ' + model.tag + ' - ' + gb(model.footprint_gb) + ' en memoire';
             if (model.estimated) texte += ' (estimation)';
-            texte += ', ' + gb(model.download_gb) + ' a telecharger';
-            if (fits === false) texte = '✕ ' + texte;
+            texte += ', ' + gb(model.download_gb) + ' de telechargement';
+            texte += model.installed ? ' - deja installe' : ' - non installe';
+            if (model.fits === false) texte += ', depasse la memoire mesuree';
+            else if (model.fits !== true) texte += ', capacite non mesuree';
             return texte;
+        }
+
+        function optionModele(model, courant) {
+            var choisi = (model.tag === courant) ? ' selected' : '';
+            return '<option value="' + model.tag + '"' + choisi + '>'
+                + modelLabel(model) + '</option>';
+        }
+
+        function groupeOptions(libelle, modeles, courant) {
+            return '<optgroup label="' + libelle + '">'
+                + modeles.map(function (m) { return optionModele(m, courant); }).join('')
+                + '</optgroup>';
         }
 
         function updateModelSelector(data) {
             try {
+                dernierEtat = data;
                 var select = document.getElementById('model-select');
                 if (!select) return;
 
@@ -1794,38 +1982,80 @@ HTML_TEMPLATE = """
                 }
                 select.disabled = false;
 
-                var reco = data.recommendation || null;
-                var mesure = !!(reco && reco.measured);
-                var tiennent = (reco && reco.fits) ? reco.fits : [];
+                var carte = modelesParTag(data);
+                var politique = data.license_policy || {};
+                var restreints = politique.restricted || [];
+                var nonVerifies = politique.undetermined || [];
+                var courant = data.ollama_model || null;
 
-                function option(model) {
-                    var fits = mesure ? (tiennent.indexOf(model.tag) !== -1) : null;
-                    var choisi = (model.tag === data.ollama_model) ? ' selected' : '';
-                    return '<option value="' + model.tag + '"' + choisi + '>'
-                        + modelLabel(model, fits) + '</option>';
+                // La bascule fait reapparaitre les licences ecartees. Elle est
+                // forcee quand le modele retenu en fait partie : une liste ou
+                // le modele actif n'apparait pas afficherait un AUTRE modele
+                // comme selectionne, ce qui serait faux.
+                var ecarte = !!courant
+                    && (restreints.indexOf(courant) !== -1 || nonVerifies.indexOf(courant) !== -1);
+                var bascule = document.getElementById('show-restricted');
+                var montrerEcartes = !!(bascule && bascule.checked) || ecarte;
+
+                // Les cinq paliers, dans l'ordre servi par le coeur. Aucun
+                // n'est supprime : un palier vide, ou hors de portee de la
+                // machine, reste visible et marque - c'est une information,
+                // pas un trou. Le decoupage vient de group_by_memory_tier(),
+                // ce fichier n'en connait meme pas les bornes.
+                var html = '';
+                (data.memory_tier_groups || []).forEach(function (groupe) {
+                    var membres = modelesDe(groupe.tags, carte);
+                    var libelle = groupe.label;
+                    if (membres.length === 0) {
+                        libelle += ' - aucun modele a licence approuvee OSI';
+                    } else if (membres.every(function (m) { return m.fits === false; })) {
+                        libelle += ' - hors capacite mesuree';
+                    }
+                    html += groupeOptions(libelle, membres, courant);
+                });
+
+                if (montrerEcartes) {
+                    // Deux groupes distincts, jamais fondus : « non approuvee »
+                    // est une conclusion, « non verifiee » est son absence.
+                    var horsOsi = modelesDe(restreints, carte);
+                    var nonTranches = modelesDe(nonVerifies, carte);
+                    if (horsOsi.length) {
+                        html += groupeOptions(
+                            'Licence NON approuvee OSI - ecartes du choix par defaut',
+                            horsOsi, courant);
+                    }
+                    if (nonTranches.length) {
+                        html += groupeOptions(
+                            'Licence NON VERIFIEE - qualification OSI non tranchee',
+                            nonTranches, courant);
+                    }
                 }
 
-                if (!mesure) {
-                    select.innerHTML = '<optgroup label="Memoire non mesuree - aucun filtrage par capacite">'
-                        + modeles.map(option).join('') + '</optgroup>';
-                } else {
-                    var dedans = modeles.filter(function (m) { return tiennent.indexOf(m.tag) !== -1; });
-                    var dehors = modeles.filter(function (m) { return tiennent.indexOf(m.tag) === -1; });
-                    var html = '';
-                    if (dedans.length) {
-                        html += '<optgroup label="Tient dans ' + gb(reco.available_memory_gb) + ' mesures">'
-                            + dedans.map(option).join('') + '</optgroup>';
-                    }
-                    if (dehors.length) {
-                        html += '<optgroup label="Depasse la memoire mesuree">'
-                            + dehors.map(option).join('') + '</optgroup>';
-                    }
-                    select.innerHTML = html;
-                }
-                if (data.ollama_model) select.value = data.ollama_model;
+                select.innerHTML = html;
+                if (courant) select.value = courant;
             } catch (e) {
                 console.error('Erreur updateModelSelector:', e);
             }
+        }
+
+        function onToggleRestricted() {
+            if (dernierEtat) updateModelSelector(dernierEtat);
+        }
+
+        function updateLicenses(data) {
+            var el = document.getElementById('model-licenses');
+            if (!el) return;
+            var politique = data.license_policy || null;
+            if (!politique) {
+                el.innerHTML = '';
+                return;
+            }
+            // La qualification est citee avec sa reference, et la reserve sur
+            // sa reverification est affichee avec elle : une source citee sans
+            // reverification se declare, elle ne se sous-entend pas.
+            el.innerHTML = [politique.notice,
+                            politique.restricted_notice,
+                            politique.undetermined_notice].join('<br>');
         }
 
         function updateRecommendation(data) {
@@ -1861,18 +2091,42 @@ HTML_TEMPLATE = """
             var nature = reco.basis === 'official'
                 ? 'chiffre officiel de la fiche du modele'
                 : "estimation d'ingenierie, non mesuree sur cette machine";
+            // `installed` est porte par l'entree de catalogue servie, pas
+            // recalcule ici : un second appariement nom/tag en JavaScript
+            // serait la copie qui diverge.
+            var carte = modelesParTag(data);
+            function etatInstall(tag) {
+                var entree = carte[tag];
+                if (!entree) return '';
+                return entree.installed ? ' - <strong>deja installe</strong>'
+                                        : ' - non installe, a telecharger';
+            }
             var lignes = [];
             lignes.push('✅ <strong>' + reco.recommended.tag + '</strong> recommande - '
                 + gb(reco.recommended.footprint_gb) + ' en memoire (' + nature + ')'
-                + (reco.margin_gb !== null ? ', marge ' + gb(reco.margin_gb) : ''));
+                + (reco.margin_gb !== null ? ', marge ' + gb(reco.margin_gb) : '')
+                + etatInstall(reco.recommended.tag));
             if (reco.maximum && reco.maximum.tag !== reco.recommended.tag) {
                 lignes.push('⬆️ Choix maximal tenant dans la memoire mesuree : <strong>'
                     + reco.maximum.tag + '</strong> (' + gb(reco.maximum.footprint_gb)
-                    + ', marge reduite)');
+                    + ', marge reduite)' + etatInstall(reco.maximum.tag));
             }
+            // Ce que la machine porte deja, en une ligne. C'est la question
+            // que la liste ne repondait pas : l'utilisateur ne savait pas ce
+            // qu'il avait avant d'ouvrir un terminal.
+            var installes = (data.models || []).filter(function (m) { return m.installed; })
+                                               .map(function (m) { return m.tag; });
+            lignes.push(installes.length
+                ? '💾 Deja telecharges sur cette machine : <strong>'
+                    + installes.join('</strong>, <strong>') + '</strong>'
+                : "💾 Aucun modele du catalogue n'est telecharge sur cette machine.");
             if (reco.unified) {
                 lignes.push('Memoire unifiee : ' + gb(reco.reserved_gb)
                     + ' laisses au systeme et aux applications pour le choix par defaut.');
+            }
+            if (data.license_policy) {
+                lignes.push('<span style="color:#777;">'
+                    + data.license_policy.scope_notice + '</span>');
             }
             if (data.catalog_source) {
                 lignes.push('<span style="color:#777;">Source du catalogue : '

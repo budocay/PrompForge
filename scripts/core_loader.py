@@ -171,6 +171,75 @@ class CoreBridge:
             "verified_on": self.catalog_module.CATALOG_VERIFIED_ON,
         }
 
+    def open_source_models(self) -> dict:
+        """Le sous-catalogue a licence **approuvee OSI**, ou ``{}``.
+
+        Delegue a `models_catalog.open_source_only()` : aucun filtre de licence
+        n'est ecrit ici ni chez l'appelant. Le resultat garde la forme d'un
+        catalogue, donc se passe tel quel a `memory_tier_groups()` et a
+        `recommend_for(catalog=...)`.
+
+        Les entrees dont la qualification n'est pas tranchee sont **exclues**,
+        conformement au defaut du coeur : sur une question juridique,
+        l'incertitude n'est pas un feu vert. `license_qualification()` dit
+        lesquelles, pour qu'une interface les affiche a part au lieu de les
+        faire disparaitre sans un mot.
+        """
+        if not self.available:
+            return {}
+        return self.catalog_module.open_source_only()
+
+    def memory_tier_groups(self, catalog=None) -> tuple:
+        """Les cinq paliers memoire, dans l'ordre d'affichage du coeur.
+
+        Args:
+            catalog: Sous-catalogue a regrouper. Le catalogue complet par
+                defaut ; `open_source_models()` pour la liste proposee.
+
+        Returns:
+            tuple: triplets ``(tier_id, label, modeles)``, toujours les cinq
+            paliers et toujours dans l'ordre de `MEMORY_TIERS`, y compris ceux
+            qu'un filtre laisse vides — un palier vide se lit, il ne se devine
+            pas. Tuple vide si le pont est indisponible.
+        """
+        if not self.available:
+            return ()
+        catalogue_module = self.catalog_module
+        source = catalogue_module.CATALOG if catalog is None else catalog
+        groupes = catalogue_module.group_by_memory_tier(source)
+        return tuple(
+            (tier.tier_id, tier.label, groupes[tier.tier_id])
+            for tier in catalogue_module.MEMORY_TIERS
+        )
+
+    def license_qualification(self):
+        """Repartition des tags par qualification OSI, ou ``None``.
+
+        Les trois ensembles sont derives des filtres du coeur, jamais d'une
+        relecture des noms de licence : `open_source_only()` donne les
+        approuves, `undetermined_license_tags()` les non tranches, et les
+        restreints sont le complement. Une quatrieme lecture des licences dans
+        l'interface serait la duplication que D-022 recense.
+
+        Returns:
+            dict: ``reference_url`` (a citer aupres de l'utilisateur),
+            ``approved``, ``restricted``, ``undetermined``, ``total``.
+        """
+        if not self.available:
+            return None
+        catalogue_module = self.catalog_module
+        approuves = tuple(catalogue_module.open_source_only())
+        non_tranches = catalogue_module.undetermined_license_tags()
+        ecartes = set(approuves) | set(non_tranches)
+        restreints = tuple(tag for tag in catalogue_module.CATALOG if tag not in ecartes)
+        return {
+            "reference_url": catalogue_module.OSI_REFERENCE_URL,
+            "approved": approuves,
+            "restricted": restreints,
+            "undetermined": non_tranches,
+            "total": len(catalogue_module.CATALOG),
+        }
+
     # -- Materiel ----------------------------------------------------------
 
     def detect_hardware(self):
@@ -179,19 +248,28 @@ class CoreBridge:
             return None
         return self.hardware_module.detect_hardware()
 
-    def recommend_for(self, profile):
+    def recommend_for(self, profile, catalog=None):
         """Recommande un modele pour un profil materiel mesure.
 
         Rend ``None`` si le pont est indisponible. Un profil sans mesure
         memoire produit une `Recommendation` marquee ``measured=False`` : le
         catalogue refuse deja de recommander au hasard, ce pont ne comble
         surtout pas ce trou.
+
+        Args:
+            profile: `HardwareProfile` mesure.
+            catalog: Sous-catalogue a consulter. Le catalogue complet par
+                defaut. L'appelant passe `open_source_models()` quand il ne
+                propose que de l'open source : restreindre l'offre sans
+                restreindre la recommandation reviendrait a recommander un
+                modele que l'interface n'offre pas.
         """
         if not self.available or profile is None:
             return None
         return self.catalog_module.recommend(
             profile.available_memory_bytes,
             unified=bool(profile.unified_memory),
+            catalog=self.catalog_module.CATALOG if catalog is None else catalog,
         )
 
 

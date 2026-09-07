@@ -276,16 +276,24 @@ def extract_launcher_script(module):
     return trouve.group(1)
 
 
-def render_launcher_ui(script, payload):
+def render_launcher_ui(script, payload, elements=None):
     """Execute `updateUI(payload)` dans Node et rend l'etat des elements.
 
     Un `HTTP 200` sur `/` ne prouve rien : il a deja ete pris pour une preuve
     que l'interface fonctionnait, alors que le bloc <script> entier ne se
     compilait pas. Ici le JavaScript reellement servi est reellement execute,
     sur le payload reellement rendu, et on lit ce qui s'affiche.
+
+    Args:
+        script: le bloc <script> servi, tel quel.
+        payload: ce que `/api/status` rend, tel quel.
+        elements: etat initial du DOM, par identifiant. Sert a poser une case
+            a cocher deja cochee : la bascule des licences restreintes est un
+            etat du document, pas du payload, et la tester en appelant une
+            fonction interne ne prouverait pas que la page la lit.
     """
     harnais = """
-const elements = {};
+const elements = __ELEMENTS__;
 function el(id) {
   if (!elements[id]) elements[id] = {id: id, textContent: '', innerHTML: '',
     className: '', title: '', value: '', disabled: false, style: {}};
@@ -298,7 +306,7 @@ function setInterval() {}
 async function fetch() { throw new Error('pas de reseau dans ce harnais'); }
 function confirm() { return false; }
 const window = { open: function () {} };
-"""
+""".replace("__ELEMENTS__", _json.dumps(elements or {}))
     queue = "\nupdateUI(" + _json.dumps(payload) + ");\n"
     queue += "process.stdout.write(JSON.stringify(elements));\n"
 
@@ -1525,8 +1533,16 @@ class TestRecommendationIsMeasuredNotGuessed:
         # Recalcul independant : mesure du materiel puis recommandation, sans
         # passer par le launcher. Comparer le launcher a lui-meme ne prouverait
         # rien.
+        #
+        # Le catalogue consulte est celui des licences approuvees OSI, parce
+        # que c'est ce que l'interface propose : recommander hors de son offre
+        # serait incoherent. Sur la machine de reference les deux catalogues
+        # donnent la meme reponse ; le cas ou ils divergent est verrouille par
+        # `TestOnlyOpenSourceIsOffered`, qui impose la memoire pour le
+        # produire. Ecrire ici le catalogue complet ferait passer ce test pour
+        # la mauvaise raison.
         profil = pont.detect_hardware()
-        attendue = pont.recommend_for(profil)
+        attendue = pont.recommend_for(profil, catalog=pont.open_source_models())
 
         module = fresh_launcher("_reco_mesuree")
         module.subprocess = DockerStub()
@@ -1807,10 +1823,15 @@ class TestTheServedJavaScriptActuallyRuns:
 
         liste = rendu["model-select"]["innerHTML"]
         assert f'value="{tag}"' in liste and "selected" in liste
+        # L'offre par defaut est l'open source approuve OSI, et elle est
+        # complete : les onze entrees approuvees sont la, aucune des sept
+        # autres ne l'est. Le detail de cette regle est verifie par
+        # `TestOnlyOpenSourceIsOffered`.
         for entree in payload["models"]:
-            assert f'value="{entree["tag"]}"' in liste, (
-                f"{entree['tag']} absent de la liste rendue"
-            )
+            if entree["osi_approved"]:
+                assert f'value="{entree["tag"]}"' in liste, (
+                    f"{entree['tag']} approuve OSI, absent de la liste rendue"
+                )
 
         memoire = rendu["memory-value"]["textContent"]
         assert "Gio" in memoire and "Non mesuree" not in memoire
@@ -1835,6 +1856,502 @@ class TestTheServedJavaScriptActuallyRuns:
         assert "/absent" in bloc, "le motif doit etre affiche, pas avale"
         assert "Catalogue indisponible" in rendu["model-select"]["innerHTML"]
         assert rendu["model-select"]["disabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# Trois reproches du dev, verifies sur le rendu et non sur le payload
+# ---------------------------------------------------------------------------
+# « tu ne me donne pas les meilleures images par rapport a mes capacites »
+# « on cherche des images opensources un point c'est tout et faudrait les
+#   classifier comme avant »
+# « tu ne listes pas non plus si j'ai deja des modeles d'installe »
+#
+# L'interface rendait une liste plate de dix-sept tags dans un seul groupe
+# « Tient dans 32 Gio mesures », licences confondues, sans dire ce qui etait
+# deja telecharge. Les tests ci-dessous executent le JavaScript servi et
+# lisent la liste rendue : un payload correct qui produit une liste fausse
+# est exactement le defaut qui a laisse passer un bloc <script> qui ne
+# compilait pas.
+
+
+def element_coche(identifiant):
+    """Un element de DOM deja coche, pour le harnais de rendu."""
+    return {
+        identifiant: {
+            "id": identifiant, "checked": True, "textContent": "",
+            "innerHTML": "", "className": "", "title": "", "value": "",
+            "disabled": False, "style": {},
+        }
+    }
+
+
+def tags_rendus(html):
+    """Les tags reellement presents dans la liste rendue, dans l'ordre."""
+    return re.findall(r'<option value="([^"]+)"', html)
+
+
+def libelles_de_groupes(html):
+    """Les libelles d'`<optgroup>` rendus, dans l'ordre."""
+    return re.findall(r'<optgroup label="([^"]*)"', html)
+
+
+def launcher_mesure(nom, installes=()):
+    """Un launcher ayant mesure la machine, avec une liste Ollama imposee.
+
+    La liste installee est injectee plutot que sondee : Ollama n'a aucun
+    modele sur cette machine (D-028), et un test qui n'affirmerait rien
+    faute de modele ne verifierait rien.
+    """
+    module = fresh_launcher(nom)
+    module.detect_hardware()
+    module.state["installed_models"] = list(installes)
+    return module
+
+
+class TestOnlyOpenSourceIsOffered:
+    """Le defaut ne propose que de l'open source approuve OSI (DEC-004).
+
+    Le filtre vient de `models_catalog.open_source_only()` : le launcher n'en
+    ecrit aucun. Et rien ne disparait en silence - le catalogue garde les sept
+    autres entrees, l'interface doit pouvoir les montrer sur demande.
+    """
+
+    def test_the_policy_served_is_the_cores_own_partition(self):
+        module = fresh_launcher("_licences_partition")
+        pont = load_core_bridge()
+        politique = module.status_payload()["license_policy"]
+        qualification = pont.license_qualification()
+
+        assert politique["approved"] == list(qualification["approved"])
+        assert politique["restricted"] == list(qualification["restricted"])
+        assert politique["undetermined"] == list(qualification["undetermined"])
+
+        approuves = set(politique["approved"])
+        restreints = set(politique["restricted"])
+        non_verifies = set(politique["undetermined"])
+        assert approuves & restreints == set()
+        assert approuves & non_verifies == set()
+        assert restreints & non_verifies == set()
+        assert approuves | restreints | non_verifies == set(pont.known_tags())
+
+    def test_undetermined_licenses_are_never_folded_into_the_restricted_ones(self):
+        """« Non approuvee » est une conclusion, « non verifiee » son absence.
+
+        Les fondre affirmerait que ces trois entrees ne sont pas libres, ce
+        que la veille refuse d'affirmer. Meme faute que d'ecrire « eteint »
+        sur une sonde qui n'a pas conclu.
+        """
+        module = fresh_launcher("_licences_non_verifiees")
+        pont = load_core_bridge()
+        politique = module.status_payload()["license_policy"]
+
+        assert list(politique["undetermined"]) == list(
+            pont.catalog_module.undetermined_license_tags()
+        )
+        assert politique["undetermined"], "le catalogue en porte trois"
+        assert "non verifie" in politique["undetermined_notice"].lower()
+        assert politique["undetermined_notice"] != politique["restricted_notice"]
+
+    def test_the_osi_reference_and_its_reserve_are_displayed(self):
+        """La qualification est citee avec sa source ET sa reserve (D-044)."""
+        module = launcher_mesure("_licences_source")
+        payload = module.status_payload()
+        politique = payload["license_policy"]
+
+        assert politique["reference_url"] == (
+            load_core_bridge().catalog_module.OSI_REFERENCE_URL
+        )
+        assert politique["reference_url"] in politique["notice"]
+        assert "N'A PAS ete reverifiee" in politique["notice"]
+        assert "MIT et Apache-2.0" in politique["notice"]
+
+    def test_the_recommendation_is_computed_on_the_open_source_subset(self):
+        """Recommander hors de ce qu'on propose serait incoherent.
+
+        Le resultat est recalcule par le pont, independamment du launcher :
+        comparer le launcher a lui-meme ne prouverait rien.
+        """
+        module = launcher_mesure("_reco_open_source")
+        pont = load_core_bridge()
+        profil = pont.detect_hardware()
+        attendu = pont.recommend_for(profil, catalog=pont.open_source_models())
+
+        reco = module.status_payload()["recommendation"]
+        assert reco["recommended"]["tag"] == attendu.recommended.tag
+        assert reco["maximum"]["tag"] == attendu.maximum.tag
+        assert attendu.recommended.is_osi_approved
+        assert attendu.maximum.is_osi_approved
+
+    def test_a_larger_machine_still_never_lands_on_a_restricted_licence(self):
+        """Le cas ou filtrer change reellement la reponse.
+
+        Sur la machine de reference, 32 Gio, le catalogue complet et le
+        sous-ensemble OSI recommandent le meme modele : ce test-la ne
+        distinguerait rien. A 96 Gio, le plus lourd du catalogue complet est
+        `llama3.1:70b`, sous licence Meta. La memoire est donc imposee pour
+        que la difference existe et soit verifiable.
+        """
+        module = launcher_mesure("_reco_grosse_machine")
+        pont = load_core_bridge()
+
+        class ProfilLarge:
+            available_memory_bytes = 96 * 1024 ** 3
+            unified_memory = False
+
+        module.apply_recommendation(ProfilLarge())
+        payload = module.status_payload()
+        approuves = payload["license_policy"]["approved"]
+        reco = payload["recommendation"]
+
+        sans_filtre = pont.recommend_for(ProfilLarge())
+        assert sans_filtre.maximum.tag not in approuves, (
+            "sans ce contraste le test ne prouverait rien"
+        )
+        assert reco["recommended"]["tag"] in approuves
+        assert reco["maximum"]["tag"] in approuves
+
+        servis = {e["tag"]: e for e in payload["models"]}
+        assert servis[sans_filtre.maximum.tag]["fits"] is True, (
+            "la capacite ne depend pas de la licence : ce modele tient, et le "
+            "dire faux serait un second mensonge"
+        )
+
+    def test_capacity_is_measured_on_the_whole_catalog(self):
+        """Un modele restreint qui tient ne doit pas etre dit trop lourd.
+
+        La licence decide de l'offre, jamais de la capacite : marquer
+        « depasse la memoire mesuree » un modele qui tient serait un second
+        mensonge cache derriere le premier filtre.
+        """
+        module = launcher_mesure("_capacite_complete")
+        pont = load_core_bridge()
+        attendu = pont.recommend_for(pont.detect_hardware())
+
+        servis = {e["tag"]: e for e in module.status_payload()["models"]}
+        tiennent = {m.tag for m in attendu.fits}
+        assert tiennent, "cette machine doit encaisser au moins un modele"
+        for tag, entree in servis.items():
+            assert entree["fits"] is (tag in tiennent), tag
+
+        restreints_qui_tiennent = [
+            tag for tag, e in servis.items()
+            if e["fits"] and not e["osi_approved"]
+        ]
+        assert restreints_qui_tiennent, (
+            "sans ce cas le test ne prouverait rien sur cette machine"
+        )
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_the_rendered_list_carries_no_non_osi_tag_by_default(self):
+        """La preuve porte sur la liste rendue, pas sur le payload."""
+        module = launcher_mesure("_rendu_osi_seul")
+        payload = module.status_payload()
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+        liste = rendu["model-select"]["innerHTML"]
+
+        politique = payload["license_policy"]
+        rendus = tags_rendus(liste)
+        assert rendus, "la liste rendue est vide"
+        for tag in rendus:
+            assert tag in politique["approved"], (
+                f"{tag} n'est pas approuve OSI et figure pourtant dans le "
+                f"choix par defaut"
+            )
+        for tag in list(politique["restricted"]) + list(politique["undetermined"]):
+            assert tag not in rendus, f"{tag} propose par defaut"
+        assert sorted(rendus) == sorted(politique["approved"]), (
+            "toutes les entrees approuvees doivent etre proposees"
+        )
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_the_excluded_ones_reappear_on_demand_in_two_distinct_groups(self):
+        """Ecarter n'est pas effacer : la bascule les rend, et dit pourquoi."""
+        module = launcher_mesure("_rendu_bascule")
+        payload = module.status_payload()
+        rendu = render_launcher_ui(
+            extract_launcher_script(module), payload,
+            elements=element_coche("show-restricted"),
+        )
+        liste = rendu["model-select"]["innerHTML"]
+        politique = payload["license_policy"]
+
+        rendus = tags_rendus(liste)
+        for tag in list(politique["restricted"]) + list(politique["undetermined"]):
+            assert tag in rendus, f"{tag} reste invisible malgre la bascule"
+
+        libelles = libelles_de_groupes(liste)
+        restreint = [texte for texte in libelles if "NON approuvee OSI" in texte]
+        non_verifie = [texte for texte in libelles if "NON VERIFIEE" in texte]
+        assert len(restreint) == 1 and len(non_verifie) == 1, (
+            f"les deux motifs d'exclusion doivent former deux groupes : {libelles}"
+        )
+        assert restreint[0] != non_verifie[0]
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_a_restricted_model_kept_by_the_user_stays_visible(self):
+        """Une liste ou le modele actif manque afficherait un autre modele.
+
+        Le `<select>` retomberait sur sa premiere option : la page dirait que
+        le dev a choisi un modele qu'il n'a pas choisi.
+        """
+        module = launcher_mesure("_rendu_courant_restreint")
+        payload = module.status_payload()
+        restreint = payload["license_policy"]["restricted"][0]
+        payload["ollama_model"] = restreint
+
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+        liste = rendu["model-select"]["innerHTML"]
+        assert f'value="{restreint}" selected' in liste, (
+            "le modele retenu doit rester dans la liste, meme ecarte par defaut"
+        )
+        assert rendu["model-select"]["value"] == restreint
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_the_page_states_what_it_offers_and_what_it_sets_aside(self):
+        module = launcher_mesure("_rendu_notices")
+        payload = module.status_payload()
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+
+        bloc = rendu["model-licenses"]["innerHTML"]
+        politique = payload["license_policy"]
+        assert politique["notice"] in bloc
+        assert politique["restricted_notice"] in bloc
+        assert politique["undetermined_notice"] in bloc
+        assert politique["reference_url"] in bloc
+
+        reco = rendu["model-recommendation"]["innerHTML"]
+        assert politique["scope_notice"] in reco, (
+            "le perimetre de la recommandation doit etre dit, pas suppose"
+        )
+
+
+class TestTheFiveMemoryTiersAreRendered:
+    """« faudrait les classifier comme avant » : les cinq paliers, en ordre.
+
+    Le decoupage vient de `group_by_memory_tier()` et l'ordre de
+    `MEMORY_TIERS`. Le launcher n'a ni bornes, ni tranches, ni libelles a lui.
+    """
+
+    def test_the_served_groups_are_the_cores_five_tiers_in_order(self):
+        module = fresh_launcher("_paliers_ordre")
+        pont = load_core_bridge()
+        groupes = module.status_payload()["memory_tier_groups"]
+
+        attendus = [
+            (tier.tier_id, tier.label) for tier in pont.catalog_module.MEMORY_TIERS
+        ]
+        assert [(g["tier_id"], g["label"]) for g in groupes] == attendus
+        assert len(groupes) == 5
+
+    def test_every_label_is_the_models_own_tier_label(self):
+        """Aucun libelle n'est reecrit : c'est `memory_tier_label`, mot pour mot."""
+        module = fresh_launcher("_paliers_libelles")
+        payload = module.status_payload()
+        par_tag = {e["tag"]: e for e in payload["models"]}
+
+        for groupe in payload["memory_tier_groups"]:
+            for tag in groupe["tags"]:
+                assert par_tag[tag]["tier"] == groupe["tier_id"]
+                assert par_tag[tag]["tier_label"] == groupe["label"]
+
+    def test_the_groups_hold_exactly_the_open_source_catalog(self):
+        module = fresh_launcher("_paliers_contenu")
+        pont = load_core_bridge()
+        groupes = module.status_payload()["memory_tier_groups"]
+
+        classes = [tag for g in groupes for tag in g["tags"]]
+        assert sorted(classes) == sorted(pont.open_source_models())
+        assert len(classes) == len(set(classes)), "un tag ne peut avoir deux paliers"
+
+    def test_an_empty_tier_is_kept_and_explained(self):
+        """Le palier le plus lourd n'a aucune entree approuvee OSI.
+
+        Mesure du 2026-09-07 : `llama3.1:70b` l'occupe seul, sous licence
+        Meta. Le supprimer ferait croire que ce palier n'existe pas, alors que
+        le fait a montrer est qu'aucun modele libre ne l'occupe.
+        """
+        module = fresh_launcher("_palier_vide")
+        groupes = module.status_payload()["memory_tier_groups"]
+        vides = [g for g in groupes if not g["tags"]]
+        assert vides, "sans palier vide ce test ne verrouille rien"
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_the_page_renders_the_five_tiers_in_order(self):
+        module = launcher_mesure("_rendu_paliers")
+        payload = module.status_payload()
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+        libelles = libelles_de_groupes(rendu["model-select"]["innerHTML"])
+
+        attendus = [g["label"] for g in payload["memory_tier_groups"]]
+        assert len(libelles) == len(attendus), (
+            f"cinq groupes attendus par defaut, rendus : {libelles}"
+        )
+        for libelle, attendu in zip(libelles, attendus):
+            assert libelle.startswith(attendu), (
+                f"palier rendu hors ordre ou renomme : {libelle!r}"
+            )
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_a_tier_beyond_the_machine_is_marked_not_removed(self):
+        """« un palier que sa machine n'encaisse pas doit rester visible ».
+
+        La memoire est ramenee a 6 Gio par une mesure imposee : sur la machine
+        de reference tout tient, et le cas ne se produirait jamais.
+        """
+        module = launcher_mesure("_rendu_palier_hors_capacite")
+
+        class ProfilEtroit:
+            available_memory_bytes = 6 * 1024 ** 3
+            unified_memory = False
+
+        module.apply_recommendation(ProfilEtroit())
+        payload = module.status_payload()
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+        liste = rendu["model-select"]["innerHTML"]
+
+        libelles = libelles_de_groupes(liste)
+        hors = [texte for texte in libelles if "hors capacite mesuree" in texte]
+        assert hors, f"aucun palier marque hors capacite : {libelles}"
+        assert len(libelles) == 5, "un palier hors capacite reste rendu"
+
+        par_tag = {e["tag"]: e for e in payload["models"]}
+        trop_lourds = [
+            t for t in tags_rendus(liste) if par_tag[t]["fits"] is False
+        ]
+        assert trop_lourds, "sans modele trop lourd le marquage ne prouve rien"
+        for tag in trop_lourds:
+            assert f'>○ ✕ {tag} ' in liste or f'>● ✕ {tag} ' in liste, (
+                f"{tag} ne tient pas et n'est pas marque dans la liste"
+            )
+
+
+class TestInstalledModelsAreVisible:
+    """« tu ne listes pas non plus si j'ai deja des modeles d'installe ».
+
+    Le croisement appartient a cette couche : `agent-backend` l'a refuse dans
+    `recommend()` au motif que « deja telecharge » n'est pas une regle de
+    memoire, et que l'appariement nom/tag existe deja ici. Il n'y en a donc
+    qu'un, `is_model_installed()`, et ces tests verifient qu'aucun second
+    appariement n'est ne en JavaScript.
+    """
+
+    def test_every_served_entry_carries_its_install_state(self):
+        module = launcher_mesure("_installes_payload", installes=["qwen3:8b"])
+        payload = module.status_payload()
+        par_tag = {e["tag"]: e for e in payload["models"]}
+
+        assert par_tag["qwen3:8b"]["installed"] is True
+        autres = [t for t, e in par_tag.items() if e["installed"]]
+        assert autres == ["qwen3:8b"], f"un seul modele est installe : {autres}"
+
+    def test_the_install_state_reuses_the_existing_matching_rule(self):
+        """Suffixe de quantization et `latest` : la regle deja ecrite, pas une autre."""
+        module = launcher_mesure(
+            "_installes_variantes", installes=["qwen3:8b-q4_0", "mistral:latest"]
+        )
+        par_tag = {e["tag"]: e for e in module.status_payload()["models"]}
+        assert par_tag["qwen3:8b"]["installed"] is True, "suffixe de quantization"
+        assert par_tag["mistral:7b"]["installed"] is True, "tag latest"
+        assert par_tag["qwen3:4b"]["installed"] is False
+
+        for tag, entree in par_tag.items():
+            assert entree["installed"] is module.is_model_installed(
+                tag, module.state["installed_models"]
+            ), tag
+
+    def test_nothing_installed_is_stated_not_left_blank(self):
+        module = launcher_mesure("_installes_aucun")
+        par_tag = {e["tag"]: e for e in module.status_payload()["models"]}
+        assert not any(e["installed"] for e in par_tag.values())
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_the_rendered_list_marks_the_installed_model(self):
+        module = launcher_mesure("_rendu_installe", installes=["qwen3:8b"])
+        payload = module.status_payload()
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+        liste = rendu["model-select"]["innerHTML"]
+
+        assert re.search(r'<option value="qwen3:8b"[^>]*>● qwen3:8b[^<]*deja installe',
+                         liste), (
+            f"qwen3:8b n'est pas marque comme installe : {liste[:400]}"
+        )
+        non_installe = re.search(
+            r'<option value="mistral:7b"[^>]*>(○[^<]*)</option>', liste
+        )
+        assert non_installe and "non installe" in non_installe.group(1), (
+            "un modele absent doit etre dit absent, pas laisse muet"
+        )
+
+        bloc = rendu["model-recommendation"]["innerHTML"]
+        assert "Deja telecharges sur cette machine" in bloc
+        assert "qwen3:8b" in bloc
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_the_page_says_so_when_nothing_is_downloaded(self):
+        module = launcher_mesure("_rendu_rien_installe")
+        rendu = render_launcher_ui(
+            extract_launcher_script(module), module.status_payload()
+        )
+        bloc = rendu["model-recommendation"]["innerHTML"]
+        assert "Aucun modele du catalogue n'est telecharge" in bloc, (
+            f"l'absence doit etre ecrite, pas deduite d'une ligne vide : {bloc}"
+        )
+
+    @pytest.mark.skipif(shutil.which("node") is None, reason="Node absent")
+    def test_the_recommended_model_says_whether_it_is_already_there(self):
+        module = launcher_mesure("_rendu_reco_installe")
+        payload = module.status_payload()
+        tag = payload["recommendation"]["recommended"]["tag"]
+
+        rendu = render_launcher_ui(extract_launcher_script(module), payload)
+        assert "non installe, a telecharger" in rendu["model-recommendation"]["innerHTML"]
+
+        module2 = launcher_mesure("_rendu_reco_deja_la", installes=[tag])
+        rendu2 = render_launcher_ui(
+            extract_launcher_script(module2), module2.status_payload()
+        )
+        assert "deja installe" in rendu2["model-recommendation"]["innerHTML"]
+
+
+class TestNoSecondCatalogRuleInJavaScript:
+    """Le JavaScript rend ce qu'on lui sert ; il ne recalcule aucune regle."""
+
+    def test_the_script_holds_no_license_nor_tier_literal(self):
+        module = fresh_launcher("_js_sans_regle")
+        pont = load_core_bridge()
+        script = extract_launcher_script(module)
+
+        for tag in pont.known_tags():
+            assert tag not in script, f"tag {tag} ecrit en dur dans le JavaScript"
+        for tier in pont.catalog_module.MEMORY_TIERS:
+            assert tier.label not in script, f"libelle de palier duplique : {tier.label}"
+            assert tier.tier_id not in script
+        for statut in pont.catalog_module.LICENSE_OSI_STATUSES:
+            assert statut not in script, (
+                f"le JavaScript trie les licences lui-meme ({statut}) au lieu "
+                f"de rendre les ensembles servis"
+            )
+        assert pont.catalog_module.OSI_REFERENCE_URL not in script
+
+    def test_the_launcher_writes_no_license_filter_of_its_own(self):
+        """Le launcher passe par le pont, jamais par le module du coeur.
+
+        `catalog_module` est l'attribut par lequel on atteindrait
+        `open_source_only()` ou `group_by_memory_tier()` a la main : son
+        absence du source verifie que le filtre et le decoupage restent au
+        coeur, et que le pont est le seul chemin.
+        """
+        lignes = [
+            ligne
+            for ligne in code_without_comments(BASE_DIR / "launcher.py").splitlines()
+            if "catalog_module" in ligne
+        ]
+        assert lignes == [], f"acces direct au module du coeur : {lignes}"
+
+        source = code_without_comments(BASE_DIR / "launcher.py")
+        assert "CORE.open_source_models()" in source
+        assert "CORE.memory_tier_groups(" in source
+        assert "CORE.license_qualification()" in source
 
 
 class TestLauncherRunsUnderTheSystemPython:
@@ -1881,10 +2398,13 @@ class TestLauncherRunsUnderTheSystemPython:
             "spec.loader.exec_module(module)\n"
             "module.detect_hardware()\n"
             "charge = module.status_payload()\n"
+            "politique = charge['license_policy'] or {}\n"
             "print(json.dumps({'python': '%d.%d' % sys.version_info[:2],\n"
             "                  'catalogue': charge['catalog_available'],\n"
             "                  'modeles': len(charge['models']),\n"
             "                  'modele': charge['ollama_model'],\n"
+            "                  'paliers': [g['tier_id'] for g in charge['memory_tier_groups']],\n"
+            "                  'approuves': politique.get('approved'),\n"
             "                  'mesure': (charge['recommendation'] or {}).get('measured')}))\n"
         )
         sortie = subprocess.run(
@@ -1904,6 +2424,20 @@ class TestLauncherRunsUnderTheSystemPython:
         assert resultat["modeles"] > 0
         assert resultat["mesure"] is True
         assert resultat["modele"], "aucun modele recommande sous 3.9"
+
+        # Paliers et licences passent par le meme pont : les verifier sous
+        # 3.14 seulement laisserait la moitie du rendu non couverte sur
+        # l'interpreteur qui compte reellement pour un amorceur (D-061).
+        pont = load_core_bridge()
+        assert resultat["paliers"] == [
+            tier.tier_id for tier in pont.catalog_module.MEMORY_TIERS
+        ], "les cinq paliers doivent etre servis sous 3.9 aussi"
+        assert resultat["approuves"] == list(
+            pont.license_qualification()["approved"]
+        ), "la qualification de licence doit tenir sous 3.9"
+        assert resultat["modele"] in resultat["approuves"], (
+            "le modele recommande sous 3.9 doit rester approuve OSI"
+        )
 
     def test_the_bridge_registers_modules_before_executing_them(self):
         """Le piege mesure de `core_loader`, verrouille pour de bon.
