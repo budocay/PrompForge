@@ -6,6 +6,7 @@ Lance avec: python launcher.py
 import subprocess
 import platform
 import os
+import socket
 import sys
 import json
 import threading
@@ -20,6 +21,53 @@ LAUNCHER_PORT = 7850
 PROMPTFORGE_PORT = 7860
 OLLAMA_PORT = 11434
 
+# ---------------------------------------------------------------------------
+# Trois etats de service, jamais deux
+# ---------------------------------------------------------------------------
+# `check_ollama()` ecrivait `False` sur toute exception, delai depasse compris :
+# « je ne sais pas » devenait « c'est eteint », et l'utilisateur concluait que
+# le produit ne marchait pas. Meme confusion que D-018, ou « non mesurable »
+# devenait « pas de GPU ».
+#
+#   STATUS_UP      : sonde reussie, le service repond comme attendu.
+#   STATUS_DOWN    : sonde concluante et negative (connexion refusee, binaire
+#                    absent, code de retour non nul). C'est une connaissance.
+#   STATUS_UNKNOWN : la sonde n'a pas conclu (delai depasse, reponse illisible,
+#                    erreur inattendue). Ce n'est PAS un service eteint.
+STATUS_UP = "up"
+STATUS_DOWN = "down"
+STATUS_UNKNOWN = "unknown"
+
+# ---------------------------------------------------------------------------
+# Cadence de rafraichissement de l'etat
+# ---------------------------------------------------------------------------
+# Le client interroge deja `/api/status` toutes les 3 s, mais le serveur rendait
+# le meme dictionnaire fige depuis son demarrage : une instance lancee a 11h14
+# affichait encore a 15h l'etat mesure a 11h14. Le rafraichissement est donc
+# fait cote serveur, declenche par `/api/status`, avec deux cadences distinctes
+# justifiees par le cout mesure de chaque sonde sur la machine de reference :
+#
+#   ollama /api/tags     4.4 ms   | sondes HTTP sur la boucle locale
+#   promptforge /        0.5 ms   |
+#   docker info        107.6 ms   | sous-processus vers le demon
+#   docker images       88.0 ms   |
+#
+# (mesure du 2026-09-04, moyenne de 5 appels pour le HTTP, 3 pour Docker)
+#
+# Les sondes HTTP coutent trois ordres de grandeur de moins que les sondes
+# Docker : les separer evite de payer 200 ms de sous-processus toutes les
+# deux secondes pour observer un demon qui, lui, ne demarre ni ne s'arrete
+# plusieurs fois par minute.
+FAST_PROBE_TTL = 2.0    # Ollama + PromptForge : cadence utile au client (3 s)
+SLOW_PROBE_TTL = 15.0   # Docker : evenement rare et lent, 15 s suffisent
+STALE_AFTER = 10.0      # Au-dela, l'interface declare son etat perime
+
+# Delai des sondes HTTP. Court, parce que la boucle locale ne justifie pas
+# davantage : soit rien n'ecoute et l'echec est immediat, soit le service
+# repond en quelques millisecondes. Un delai long ne ferait que bloquer plus
+# longtemps sur le seul cas ambigu, qui est desormais rendu STATUS_UNKNOWN.
+HTTP_PROBE_TIMEOUT = 2.0
+
 # État global
 state = {
     "os": platform.system(),
@@ -28,9 +76,12 @@ state = {
     "gfx_version": None,
     "docker_installed": True,  # Par défaut True, vérifié après
     "docker_running": False,
+    "docker_status": STATUS_UNKNOWN,  # up | down | unknown
     "ollama_installed": True,  # Par défaut True, vérifié après
     "ollama_running": False,
+    "ollama_status": STATUS_UNKNOWN,  # up | down | unknown
     "promptforge_running": False,
+    "promptforge_status": STATUS_UNKNOWN,  # up | down | unknown
     "ollama_model": "qwen3:8b",  # Qwen3 = meilleur raisonnement + post-traitement XML
     "installed_models": [],  # Liste des modèles Ollama installés
     "model_installed": False,  # True si le modèle recommandé est installé
@@ -39,6 +90,10 @@ state = {
     "docker_images": {},  # État des images Docker {name: {exists, created, size}}
     "rebuild_needed": False,  # True si les images doivent être reconstruites
     "last_build_time": None,  # Timestamp du dernier build
+    "checked_at": None,  # Epoch de la derniere sonde rapide (None = jamais)
+    "checked_at_label": None,  # Meme instant, en HH:MM:SS, pour l'interface
+    "docker_checked_at": None,  # Epoch de la derniere sonde Docker
+    "probe_in_progress": False,  # Une sonde est en vol (evite l'empilement)
     "logs": [],
     "action_in_progress": False
 }
@@ -119,6 +174,80 @@ def log(message):
     if len(state["logs"]) > 50:
         state["logs"] = state["logs"][-50:]
     print(f"[{timestamp}] {message}")
+
+
+# Dernier message journalise par sonde, pour n'ecrire qu'aux transitions.
+_last_logged = {}
+
+
+def log_change(key, message):
+    """Journalise seulement si le message differe du precedent pour cette cle.
+
+    Les sondes tournent desormais toutes les deux secondes. Les faire ecrire a
+    chaque passage noierait en quelques secondes le tampon de cinquante lignes
+    et effacerait precisement ce que l'utilisateur cherche a y lire.
+    """
+    if _last_logged.get(key) == message:
+        return False
+    _last_logged[key] = message
+    log(message)
+    return True
+
+
+def probe_http(url, timeout=HTTP_PROBE_TIMEOUT):
+    """Sonde HTTP a trois etats. Rend `(statut, corps)`.
+
+    - `STATUS_DOWN` seulement quand la sonde conclut : rien n'ecoute sur le
+      port (connexion refusee), ou l'hote est injoignable.
+    - `STATUS_UNKNOWN` des que la sonde ne conclut pas : delai depasse, code
+      HTTP inattendu, erreur non prevue. Le corps vaut alors `None`.
+    """
+    try:
+        request = urllib.request.Request(url)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status == 200:
+                return STATUS_UP, response.read()
+            # Quelque chose repond, mais pas ce qui est attendu : on ne sait pas.
+            return STATUS_UNKNOWN, None
+    except urllib.error.HTTPError:
+        # Le serveur a repondu : il tourne, mais pas comme prevu.
+        return STATUS_UNKNOWN, None
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ConnectionRefusedError):
+            return STATUS_DOWN, None
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return STATUS_UNKNOWN, None
+        if isinstance(reason, OSError):
+            # Hote introuvable, reseau coupe : le service n'est pas la.
+            return STATUS_DOWN, None
+        return STATUS_UNKNOWN, None
+    # `socket.timeout` n'est un alias de `TimeoutError` qu'a partir de 3.10.
+    # `launcher.py` amorce une machine nue et tourne sous le Python systeme,
+    # soit 3.9.6 ici (D-061), ou les deux classes sont distinctes : appliquer
+    # la simplification suggeree par ruff (UP041) casserait silencieusement la
+    # distinction entre « delai depasse » et « service eteint » sur la seule
+    # machine ou elle compte. Mesure : sous 3.9, `socket.timeout is
+    # TimeoutError` rend False ; sous 3.14, True.
+    except (socket.timeout, TimeoutError):  # noqa: UP041
+        return STATUS_UNKNOWN, None
+    except ConnectionRefusedError:
+        return STATUS_DOWN, None
+    except Exception:
+        return STATUS_UNKNOWN, None
+
+
+def set_service_status(service, status):
+    """Ecrit le statut a trois etats et le booleen historique qui en derive.
+
+    Le booleen `<service>_running` est conserve : il est lu ailleurs dans le
+    fichier. Il ne vaut `True` que sur `STATUS_UP`, donc « inconnu » n'est
+    jamais confondu avec « actif ». L'interface, elle, lit le statut a trois
+    etats et distingue « eteint » de « indetermine ».
+    """
+    state[f"{service}_status"] = status
+    state[f"{service}_running"] = status == STATUS_UP
+    return status
 
 
 def check_installations():
@@ -353,7 +482,13 @@ def select_docker_compose():
 
 
 def check_docker():
-    """Vérifie si Docker est lancé."""
+    """Sonde le demon Docker. Rend un des trois statuts.
+
+    `TimeoutExpired` ne veut pas dire « Docker est eteint » : le demon peut
+    etre en train de demarrer. Ce cas rend `STATUS_UNKNOWN`. Un code de
+    retour non nul, lui, conclut : le client a parle, le demon n'a pas
+    repondu, c'est `STATUS_DOWN`.
+    """
     try:
         result = subprocess.run(
             ["docker", "info"],
@@ -363,43 +498,69 @@ def check_docker():
             encoding='utf-8',
             errors='replace'
         )
-        state["docker_running"] = result.returncode == 0
-        if state["docker_running"]:
-            log("Docker: OK")
-        else:
-            log("Docker: Non disponible")
+    except subprocess.TimeoutExpired:
+        log_change("docker", "Docker: indetermine (delai depasse)")
+        return set_service_status("docker", STATUS_UNKNOWN)
+    except FileNotFoundError:
+        state["docker_installed"] = False
+        log_change("docker", "Docker: binaire absent")
+        return set_service_status("docker", STATUS_DOWN)
     except Exception as e:
-        state["docker_running"] = False
-        log(f"Docker: Erreur - {e}")
+        log_change("docker", f"Docker: indetermine - {e}")
+        return set_service_status("docker", STATUS_UNKNOWN)
+
+    if result.returncode == 0:
+        log_change("docker", "Docker: OK")
+        return set_service_status("docker", STATUS_UP)
+    log_change("docker", "Docker: demon non demarre")
+    return set_service_status("docker", STATUS_DOWN)
 
 
 def check_ollama():
-    """Vérifie si Ollama est accessible et liste les modèles installés."""
-    try:
-        req = urllib.request.Request(f"http://localhost:{OLLAMA_PORT}/api/tags")
-        with urllib.request.urlopen(req, timeout=3) as response:
-            if response.status == 200:
-                state["ollama_running"] = True
-                data = json.loads(response.read().decode())
-                models = [m["name"] for m in data.get("models", [])]
-                state["installed_models"] = models
-                
-                # Vérifier si le modèle recommandé est installé
-                current_model = state.get("ollama_model", "qwen3:8b")
-                model_installed = is_model_installed(current_model, models)
-                state["model_installed"] = model_installed
-                
-                if model_installed:
-                    log(f"Ollama: OK - {len(models)} modele(s) - {current_model} ✓")
-                else:
-                    log(f"Ollama: OK - {len(models)} modele(s) - ⚠️ {current_model} non installe!")
-                return
-    except:
-        pass
-    state["ollama_running"] = False
-    state["installed_models"] = []
-    state["model_installed"] = False
-    log("Ollama: Non disponible")
+    """Sonde Ollama et liste les modeles installes. Rend un des trois statuts.
+
+    Le `except: pass` d'origine ecrasait tout en `False` : un delai depasse,
+    donc « je ne sais pas », s'affichait « Ollama non disponible » et
+    l'utilisateur en concluait que le produit ne marchait pas.
+    """
+    status, payload = probe_http(
+        f"http://localhost:{OLLAMA_PORT}/api/tags", timeout=HTTP_PROBE_TIMEOUT
+    )
+
+    if status == STATUS_UP:
+        try:
+            data = json.loads(payload.decode("utf-8"))
+            models = [m["name"] for m in data.get("models", []) if "name" in m]
+        except (ValueError, AttributeError, TypeError, UnicodeDecodeError) as e:
+            # Quelque chose ecoute et rend 200, mais pas l'API d'Ollama.
+            log_change("ollama", f"Ollama: reponse illisible, etat indetermine - {e}")
+            return set_service_status("ollama", STATUS_UNKNOWN)
+
+        state["installed_models"] = models
+        current_model = state.get("ollama_model", "qwen3:8b")
+        model_installed = is_model_installed(current_model, models)
+        state["model_installed"] = model_installed
+
+        if model_installed:
+            log_change("ollama", f"Ollama: OK - {len(models)} modele(s) - {current_model} ✓")
+        else:
+            log_change(
+                "ollama",
+                f"Ollama: OK - {len(models)} modele(s) - ⚠️ {current_model} non installe!"
+            )
+        return set_service_status("ollama", STATUS_UP)
+
+    if status == STATUS_DOWN:
+        # Rien n'ecoute : aucun modele n'est joignable, l'affirmer est exact.
+        state["installed_models"] = []
+        state["model_installed"] = False
+        log_change("ollama", "Ollama: arrete (aucune ecoute sur le port)")
+        return set_service_status("ollama", STATUS_DOWN)
+
+    # Indetermine : on ne sait pas, donc on n'efface pas la derniere liste
+    # connue et on ne pretend pas non plus qu'elle est a jour.
+    log_change("ollama", "Ollama: etat indetermine (pas de reponse concluante)")
+    return set_service_status("ollama", STATUS_UNKNOWN)
 
 
 def is_model_installed(target_model, installed_models):
@@ -443,26 +604,114 @@ def is_model_installed(target_model, installed_models):
 
 
 def check_promptforge():
-    """Vérifie si PromptForge est accessible."""
+    """Sonde l'interface PromptForge. Rend un des trois statuts."""
+    status, _ = probe_http(f"http://localhost:{PROMPTFORGE_PORT}/", timeout=HTTP_PROBE_TIMEOUT)
+    if status == STATUS_UP:
+        log_change("promptforge", "PromptForge: OK")
+    elif status == STATUS_DOWN:
+        log_change("promptforge", "PromptForge: arrete")
+    else:
+        log_change("promptforge", "PromptForge: etat indetermine")
+    return set_service_status("promptforge", status)
+
+
+# ---------------------------------------------------------------------------
+# Ordonnancement des sondes
+# ---------------------------------------------------------------------------
+# Une seule sonde en vol a la fois : sans cela, un `docker info` lent
+# (10 s de delai) verrait s'empiler derriere lui une sonde toutes les
+# deux secondes. `_probe_lock` protege la decision, pas l'execution.
+_probe_lock = threading.Lock()
+
+
+def stamp_probe(now=None, include_docker=False):
+    """Horodate la derniere sonde. C'est ce que l'interface affiche."""
+    now = time.time() if now is None else now
+    state["checked_at"] = now
+    state["checked_at_label"] = time.strftime("%H:%M:%S", time.localtime(now))
+    if include_docker:
+        state["docker_checked_at"] = now
+    return now
+
+
+def run_probes(include_docker=True, now=None):
+    """Execute les sondes et horodate le resultat.
+
+    `include_docker` separe la cadence lente (sous-processus vers le demon)
+    de la cadence rapide (deux requetes HTTP sur la boucle locale).
+    """
+    if include_docker:
+        check_docker()
+        check_docker_images()
+    check_ollama()
+    check_promptforge()
+    return stamp_probe(now=now, include_docker=include_docker)
+
+
+def probe_due(now=None):
+    """Rend `(sonde_rapide_due, sonde_docker_due)` pour l'instant donne."""
+    now = time.time() if now is None else now
+    fast_due = now - (state["checked_at"] or 0) >= FAST_PROBE_TTL
+    slow_due = now - (state["docker_checked_at"] or 0) >= SLOW_PROBE_TTL
+    return fast_due, slow_due
+
+
+def ensure_fresh_status(now=None):
+    """Declenche une sonde en tache de fond si l'etat a vieilli.
+
+    Appele par `/api/status`, donc a la cadence du client (3 s). Rend le
+    `Thread` lance, ou `None` si rien n'etait du. La reponse HTTP n'attend
+    jamais la sonde : elle rend l'instantane courant avec son horodatage, et
+    le client obtient la valeur fraiche au sondage suivant. Peremption
+    maximale observee par l'utilisateur : environ 5 s.
+    """
+    with _probe_lock:
+        if state["probe_in_progress"]:
+            return None
+        fast_due, slow_due = probe_due(now)
+        if not fast_due and not slow_due:
+            return None
+        state["probe_in_progress"] = True
+
+    thread = threading.Thread(target=_probe_worker, args=(slow_due,), daemon=True)
+    thread.start()
+    return thread
+
+
+def _probe_worker(include_docker):
     try:
-        req = urllib.request.Request(f"http://localhost:{PROMPTFORGE_PORT}/")
-        with urllib.request.urlopen(req, timeout=3) as response:
-            state["promptforge_running"] = response.status == 200
-            if state["promptforge_running"]:
-                log("PromptForge: OK")
-                return
-    except:
-        pass
-    state["promptforge_running"] = False
-    log("PromptForge: Non disponible")
+        run_probes(include_docker=include_docker)
+    finally:
+        with _probe_lock:
+            state["probe_in_progress"] = False
+
+
+def status_payload(now=None):
+    """L'instantane servi par `/api/status`, augmente de sa fraicheur.
+
+    Un etat affiche sans date est un etat qui ment des qu'il vieillit : le
+    payload porte donc toujours l'age de la mesure et le drapeau `stale`.
+    """
+    now = time.time() if now is None else now
+    payload = dict(state)
+    payload["logs"] = list(state["logs"])
+    checked_at = state.get("checked_at")
+    payload["age_seconds"] = None if not checked_at else round(now - checked_at, 1)
+    payload["stale"] = checked_at is None or (now - checked_at) > STALE_AFTER
+    payload["stale_after_seconds"] = STALE_AFTER
+    payload["server_time"] = now
+    # D-060 : la table de compose n'existe qu'ici, en Python. Elle est
+    # envoyee au client au lieu d'etre recopiee en JavaScript.
+    payload["compose_options"] = DOCKER_COMPOSE_OPTIONS
+    return payload
 
 
 def refresh_status():
-    """Rafraîchit tous les statuts."""
-    check_docker()
-    check_ollama()
-    check_promptforge()
-    check_docker_images()
+    """Rafraichit tous les statuts, sans condition de fraicheur.
+
+    Chemin synchrone : demarrage du launcher et bouton « Rafraichir ».
+    """
+    return run_probes(include_docker=True)
 
 
 def check_docker_images():
@@ -503,12 +752,12 @@ def check_docker_images():
         state["rebuild_needed"] = check_rebuild_needed()
         
         if images:
-            log(f"Images Docker: {len(images)} trouvee(s)")
+            log_change("images", f"Images Docker: {len(images)} trouvee(s)")
         else:
-            log("Images Docker: Aucune (build necessaire)")
+            log_change("images", "Images Docker: Aucune (build necessaire)")
             
     except Exception as e:
-        log(f"Erreur verification images: {e}")
+        log_change("images", f"Erreur verification images: {e}")
         state["docker_images"] = {}
         state["rebuild_needed"] = True
 
@@ -576,6 +825,10 @@ def rebuild_docker_images(force=False):
     # pour que le bouton d'accès UI soit masqué
     state["promptforge_running"] = False
     state["ollama_running"] = False
+    # Le statut a trois etats suit le booleen : on vient de les arreter,
+    # ce n'est pas une mesure indeterminee.
+    state["promptforge_status"] = STATUS_DOWN
+    state["ollama_status"] = STATUS_DOWN
     
     # Construire les images
     cmd = ["docker", "compose", "-f", compose_file, "build"]
@@ -609,6 +862,10 @@ def clean_docker():
     # pour que le bouton d'accès UI soit masqué pendant le nettoyage
     state["promptforge_running"] = False
     state["ollama_running"] = False
+    # Le statut a trois etats suit le booleen : on vient de les arreter,
+    # ce n'est pas une mesure indeterminee.
+    state["promptforge_status"] = STATUS_DOWN
+    state["ollama_status"] = STATUS_DOWN
     
     # Arrêter tous les conteneurs du projet
     for key, info in DOCKER_COMPOSE_OPTIONS.items():
@@ -857,7 +1114,17 @@ HTML_TEMPLATE = """
         .status-ok { color: #00ff88; }
         .status-error { color: #ff4757; }
         .status-warning { color: #ffa502; }
-        .status-warning { color: #ffa502; }
+        /* Troisieme etat : ni actif, ni eteint. La sonde n'a pas conclu. */
+        .status-unknown { color: #b0b8c4; font-style: italic; }
+        /* Fraicheur de la mesure affichee, a cote du titre de la carte. */
+        .freshness {
+            font-size: 0.75em;
+            font-weight: normal;
+            color: #8ea0b5;
+            margin-left: 10px;
+        }
+        .freshness-stale { color: #ffa502; }
+        .freshness-offline { color: #ff4757; }
         .btn-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -980,7 +1247,7 @@ HTML_TEMPLATE = """
         
         <!-- Détection système -->
         <div class="card" id="system-card">
-            <h2>🖥️ Systeme detecte</h2>
+            <h2>🖥️ Systeme detecte<span class="freshness" id="freshness">Etat jamais verifie</span></h2>
             <div class="status-grid">
                 <div class="status-item" id="gpu-status">
                     <div class="icon">🎮</div>
@@ -1142,49 +1409,70 @@ HTML_TEMPLATE = """
                 if (gpuEl) gpuEl.textContent = data.gpu || 'Non detecte';
                 if (gpuCard) gpuCard.className = 'status-item gpu-' + (data.gpu_type || 'cpu');
                 
-                // Docker
+                // Fraicheur de la mesure affichee
+                updateFreshness(data);
+
+                // Docker (trois etats)
                 const dockerEl = document.getElementById('docker-value');
                 if (dockerEl) {
                     if (!data.docker_installed) {
                         dockerEl.textContent = '❌ Non installe';
                         dockerEl.className = 'value status-error';
-                    } else if (data.docker_running) {
+                    } else if (data.docker_status === 'up') {
                         dockerEl.textContent = '✅ Actif';
                         dockerEl.className = 'value status-ok';
+                    } else if (data.docker_status === 'unknown') {
+                        dockerEl.textContent = '❔ Indetermine';
+                        dockerEl.className = 'value status-unknown';
                     } else {
                         dockerEl.textContent = '⚠️ Non demarre';
                         dockerEl.className = 'value status-warning';
                     }
                 }
-                
-                // Ollama
+
+                // Ollama (trois etats)
                 const ollamaEl = document.getElementById('ollama-value');
                 if (ollamaEl) {
                     if (data.os === 'Windows' && !data.ollama_installed) {
                         ollamaEl.textContent = '❌ Non installe';
                         ollamaEl.className = 'value status-error';
-                    } else if (data.ollama_running) {
+                    } else if (data.ollama_status === 'up') {
                         ollamaEl.textContent = '✅ Actif';
                         ollamaEl.className = 'value status-ok';
+                    } else if (data.ollama_status === 'unknown') {
+                        ollamaEl.textContent = '❔ Indetermine';
+                        ollamaEl.className = 'value status-unknown';
                     } else {
                         ollamaEl.textContent = data.os === 'Windows' ? '⚠️ Non demarre' : '⏳ Via Docker';
                         ollamaEl.className = 'value ' + (data.os === 'Windows' ? 'status-warning' : 'status-ok');
                     }
                 }
-                
-                // PromptForge
+
+                // PromptForge (trois etats)
                 const pfEl = document.getElementById('promptforge-value');
                 if (pfEl) {
-                    pfEl.textContent = data.promptforge_running ? '✅ Actif' : '❌ Inactif';
-                    pfEl.className = 'value ' + (data.promptforge_running ? 'status-ok' : 'status-error');
+                    if (data.promptforge_status === 'up') {
+                        pfEl.textContent = '✅ Actif';
+                        pfEl.className = 'value status-ok';
+                    } else if (data.promptforge_status === 'unknown') {
+                        pfEl.textContent = '❔ Indetermine';
+                        pfEl.className = 'value status-unknown';
+                    } else {
+                        pfEl.textContent = '❌ Inactif';
+                        pfEl.className = 'value status-error';
+                    }
                 }
-                
+
                 // Alertes d'installation
                 updateInstallAlerts(data);
                 
                 // Bouton accès
                 const accessCard = document.getElementById('access-card');
-                if (accessCard) accessCard.style.display = data.promptforge_running ? 'block' : 'none';
+                // Masque seulement sur un « eteint » mesure. Sur un etat
+                // indetermine on laisse le lien : au pire il ne repond pas,
+                // au mieux il marche - et cacher l'acces au produit sur une
+                // absence de mesure est precisement le defaut corrige ici.
+                if (accessCard) accessCard.style.display = (data.promptforge_status === 'down') ? 'none' : 'block';
                 
                 // Docker Compose selector
                 updateComposeSelector(data);
@@ -1199,7 +1487,10 @@ HTML_TEMPLATE = """
                     modelSelect.value = data.ollama_model;
                 }
                 if (modelStatus) {
-                    if (!data.ollama_running) {
+                    if (data.ollama_status === 'unknown') {
+                        modelStatus.textContent = '❔';
+                        modelStatus.title = 'Etat d\'Ollama indetermine - la liste des modeles peut etre perimee';
+                    } else if (data.ollama_status !== 'up') {
                         modelStatus.textContent = '⏸️';
                         modelStatus.title = 'Ollama non demarre';
                     } else if (data.model_installed) {
@@ -1224,10 +1515,13 @@ HTML_TEMPLATE = """
                 const btnPfStart = document.getElementById('btn-pf-start');
                 const btnPfStop = document.getElementById('btn-pf-stop');
                 
-                if (btnOllamaStart) btnOllamaStart.disabled = data.ollama_running || data.action_in_progress || (data.os === 'Windows' && !data.ollama_installed);
-                if (btnOllamaStop) btnOllamaStop.disabled = !data.ollama_running || data.action_in_progress;
-                if (btnPfStart) btnPfStart.disabled = data.promptforge_running || data.action_in_progress || !data.docker_installed;
-                if (btnPfStop) btnPfStop.disabled = !data.promptforge_running || data.action_in_progress;
+                // Sur un etat indetermine, les DEUX boutons restent actifs :
+                // un etat qu'on ne connait pas ne doit jamais verrouiller
+                // l'utilisateur hors de son produit.
+                if (btnOllamaStart) btnOllamaStart.disabled = data.ollama_status === 'up' || data.action_in_progress || (data.os === 'Windows' && !data.ollama_installed);
+                if (btnOllamaStop) btnOllamaStop.disabled = data.ollama_status === 'down' || data.action_in_progress;
+                if (btnPfStart) btnPfStart.disabled = data.promptforge_status === 'up' || data.action_in_progress || !data.docker_installed;
+                if (btnPfStop) btnPfStop.disabled = data.promptforge_status === 'down' || data.action_in_progress;
             } catch (e) {
                 console.error('Erreur updateUI:', e);
             }
@@ -1288,35 +1582,60 @@ HTML_TEMPLATE = """
             }
         }
         
-        const COMPOSE_OPTIONS = {
-            "default": { label: "Par defaut (Ollama natif)", desc: "Interface en conteneur, Ollama natif sur l'hote - Windows, macOS, Linux" },
-            "nvidia": { label: "NVIDIA (Docker)", desc: "GPU NVIDIA 8GB+ - qwen3:8b (meilleur raisonnement)" },
-            "win-nvidia-native": { label: "Windows NVIDIA (Ollama natif)", desc: "Si conflit de port: utilise Ollama natif Windows" },
-            "win-amd": { label: "Windows + AMD (Ollama natif)", desc: "Pour Windows avec GPU AMD - Ollama tourne en natif" },
-            "linux-amd": { label: "Linux + AMD", desc: "Pour Linux avec GPU AMD 12GB+ - qwen3:14b" },
-            "linux-amd-max": { label: "Linux + AMD MAX (32B)", desc: "Pour Linux avec GPU AMD 20GB+ - qwen3:32b" },
-            "cpu": { label: "CPU uniquement", desc: "Sans GPU - phi4-mini (Microsoft, optimise CPU)" }
-        };
-        
+        // Fraicheur de l'etat affiche.
+        //
+        // Un etat sans date ment des qu'il vieillit. Trois rendus :
+        //   - frais       : horodatage + age en secondes ;
+        //   - perime      : au-dela de stale_after_seconds, en orange ;
+        //   - hors ligne  : le launcher lui-meme ne repond plus, en rouge.
+        // Le dernier cas compte : sans lui, l'age afficherait la meme valeur
+        // pour l'eternite pendant que le serveur est mort.
+        function updateFreshness(data) {
+            const el = document.getElementById('freshness');
+            if (!el) return;
+            if (!data.checked_at_label) {
+                el.textContent = 'Etat jamais verifie';
+                el.className = 'freshness freshness-stale';
+                return;
+            }
+            var age = (data.age_seconds === null || data.age_seconds === undefined)
+                ? '?' : Math.round(data.age_seconds);
+            var suffixe = data.probe_in_progress ? ' - verification en cours' : '';
+            el.textContent = 'Etat verifie a ' + data.checked_at_label
+                + ' (il y a ' + age + ' s)' + suffixe;
+            el.className = data.stale ? 'freshness freshness-stale' : 'freshness';
+        }
+
+        function markLauncherOffline(message) {
+            const el = document.getElementById('freshness');
+            if (!el) return;
+            el.textContent = 'Launcher injoignable - etat fige (' + message + ')';
+            el.className = 'freshness freshness-offline';
+        }
+
+        // D-060 : la table des compose n'existe qu'en Python
+        // (DOCKER_COMPOSE_OPTIONS). Elle arrive par /api/status dans
+        // data.compose_options. La copie JavaScript qui vivait ici a ete
+        // supprimee : elle avait deja divergee de son original.
         function updateComposeSelector(data) {
             try {
                 const select = document.getElementById('compose-select');
                 const descEl = document.getElementById('compose-description');
                 if (!select || !descEl) return;
-                
-                // Mettre à jour les options disponibles
+
+                const options = data.compose_options || {};
                 const available = data.available_compose_files || ['default'];
                 const current = data.docker_compose_file || 'default';
-                
+
                 select.innerHTML = available.map(function(key) {
-                    var opt = COMPOSE_OPTIONS[key] || { label: key };
+                    var opt = options[key] || { label: key };
                     var selected = key === current ? ' selected' : '';
-                    return '<option value="' + key + '"' + selected + '>' + opt.label + '</option>';
+                    return '<option value="' + key + '"' + selected + '>' + (opt.label || key) + '</option>';
                 }).join('');
-                
+
                 // Mettre à jour la description
-                const currentOpt = COMPOSE_OPTIONS[current] || {};
-                descEl.textContent = currentOpt.desc || '';
+                const currentOpt = options[current] || {};
+                descEl.textContent = currentOpt.description || '';
             } catch (e) {
                 console.error('Erreur updateComposeSelector:', e);
             }
@@ -1422,11 +1741,19 @@ HTML_TEMPLATE = """
                 if (dbg) dbg.innerHTML = 'UI Updated! GPU: ' + (data.gpu || 'null') + ', Docker: ' + data.docker_running;
             } catch (e) {
                 console.error('Erreur refresh:', e);
+                markLauncherOffline(e.message);
                 if (dbg) dbg.innerHTML = 'ERROR: ' + e.message;
             }
         }
-        
-        // Rafraîchir toutes les 3 secondes
+
+        // Cadence du client : 3 s.
+        //
+        // Le serveur ne resonde pas a chaque appel. `/api/status` declenche
+        // une sonde seulement si l'etat a depasse son TTL (2 s pour Ollama et
+        // PromptForge, 15 s pour Docker), en tache de fond et une seule a la
+        // fois. Un Ollama demarre apres l'ouverture de la page est donc vu
+        // en 5 s au pire, sans que l'utilisateur ait rien a cliquer, et sans
+        // lancer 200 ms de sous-processus Docker toutes les deux secondes.
         setInterval(refresh, 3000);
         
         // Premier appel
@@ -1451,7 +1778,11 @@ class LauncherHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
         elif self.path == "/api/status":
-            self.send_json(state)
+            # L'etat se recalcule tout seul : le client n'a rien a cliquer.
+            # La sonde part en tache de fond, la reponse est immediate et
+            # porte son propre horodatage.
+            ensure_fresh_status()
+            self.send_json(status_payload())
         else:
             self.send_error(404)
     
@@ -1524,7 +1855,7 @@ class LauncherHandler(SimpleHTTPRequestHandler):
             
             time.sleep(1)
             state["action_in_progress"] = False
-            self.send_json(state)
+            self.send_json(status_payload())
         else:
             self.send_error(404)
     

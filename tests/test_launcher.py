@@ -11,11 +11,18 @@ d'entree, sans qu'aucun test ne rougisse et alors que
 d'un fichier ; il ne sait rien des commandes qui le consomment.
 """
 
+import http.server
 import importlib.util
+import json as _json
 import re
 import shlex
+import socket
+import subprocess
 import sys
+import threading
+import time
 import types
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -713,3 +720,543 @@ class TestDefaultPathIsActuallySelected:
         launcher = load_script_at(BASE_DIR / "launcher.py", "_seam_launcher")
         for cle, info in launcher.DOCKER_COMPOSE_OPTIONS.items():
             assert (BASE_DIR / info["file"]).exists(), f"launcher '{cle}' vise {info['file']}"
+
+
+# ======================================================================
+# Fraicheur de l'etat du launcher
+# ======================================================================
+#
+# Defaut constate en direct par le dev, le 2026-09-04 : `launcher.py` ne
+# sondait Ollama qu'au demarrage du serveur. Une instance lancee a 11h14
+# affichait encore a 15h l'etat mesure a 11h14. Mesure a l'appui :
+#
+#     curl -s http://localhost:7850/api/status  -> "ollama_running": false
+#     curl -s -o /dev/null -w "%{http_code}" \
+#          http://localhost:11434/api/tags      -> 200
+#
+# Le bouton « Rafraichir » existait, mais rien n'indiquait a l'utilisateur
+# que ce qu'il lisait etait perime. Quiconque demarre Ollama APRES avoir
+# ouvert la page voyait un systeme eteint et concluait que le produit ne
+# marche pas.
+#
+# Ces tests EXECUTENT `launcher.py` : ils montent son vrai serveur HTTP,
+# parlent a `/api/status` par le reseau, et font apparaitre un faux Ollama
+# en cours de route. Un `HTTP 200` sur la racine ne prouve rien ; le
+# comportement, si.
+
+def free_port():
+    """Un port libre sur la boucle locale, rendu apres fermeture."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class _JsonServer:
+    """Un vrai serveur HTTP jetable, pour tenir lieu d'Ollama.
+
+    On ne simule pas la couche reseau : la sonde de `launcher.py` fait un
+    vrai `urlopen` vers un vrai socket, exactement comme en production.
+    """
+
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
+        self.hits = 0
+        parent = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                parent.hits += 1
+                body = _json.dumps(parent.payload).encode()
+                self.send_response(parent.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+class _BlackHole:
+    """Un socket qui accepte la connexion et ne repond jamais.
+
+    C'est le seul moyen honnete de produire un delai depasse : le port
+    ecoute (donc « connexion refusee » est exclu), mais rien ne repond.
+    C'est exactement le cas que `check_ollama()` ecrivait `False`.
+    """
+
+    def __enter__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)  # backlog : la connexion est acceptee par le noyau
+        self.port = self.sock.getsockname()[1]
+        return self
+
+    def __exit__(self, *exc):
+        self.sock.close()
+
+
+# Port sur lequel rien n'ecoute jamais : la connexion est refusee, ce qui
+# est une mesure concluante et non une absence de mesure.
+CLOSED_PORT = 1
+
+
+def fresh_launcher(name):
+    """Charge `launcher.py` comme module, avec un `state` neuf a chaque fois."""
+    return load_script_at(BASE_DIR / "launcher.py", name)
+
+
+class DockerStub:
+    """Faux `subprocess` : evite de forker `docker info` dans les tests.
+
+    Enregistre les argv, ce qui permet d'assertionner sur la cadence lente
+    (Docker sonde ou non) plutot que sur une intention declaree.
+    """
+
+    TimeoutExpired = subprocess.TimeoutExpired
+
+    def __init__(self, returncode=0, raises=None):
+        self.calls = []
+        self.returncode = returncode
+        self.raises = raises
+
+    def run(self, cmd, **kwargs):
+        self.calls.append(list(cmd))
+        if self.raises is not None:
+            raise self.raises
+        return types.SimpleNamespace(returncode=self.returncode, stdout="", stderr="")
+
+
+class TestProbeIsTriState:
+    """Trois etats, pas deux. « Je ne sais pas » n'est pas « c'est eteint ».
+
+    Meme confusion que D-018, ou « non mesurable » devenait « pas de GPU ».
+    """
+
+    def test_refused_connection_is_down(self):
+        module = fresh_launcher("_freshness_down")
+        status, body = module.probe_http(f"http://127.0.0.1:{CLOSED_PORT}/", timeout=1)
+        assert status == module.STATUS_DOWN
+        assert body is None
+
+    def test_timeout_is_unknown_not_down(self):
+        """Le cas exact que l'ancien `except: pass` ecrivait `False`."""
+        module = fresh_launcher("_freshness_timeout")
+        with _BlackHole() as trou:
+            status, body = module.probe_http(f"http://127.0.0.1:{trou.port}/", timeout=0.4)
+        assert status == module.STATUS_UNKNOWN, (
+            "un delai depasse doit rendre 'unknown' : le port ecoute, "
+            "affirmer que le service est eteint serait faux"
+        )
+        assert body is None
+
+    def test_unexpected_http_code_is_unknown(self):
+        """Quelque chose repond, mais pas ce qui est attendu."""
+        module = fresh_launcher("_freshness_500")
+        with _JsonServer({"boom": True}, status=500) as serveur:
+            status, _ = module.probe_http(f"http://127.0.0.1:{serveur.port}/", timeout=2)
+        assert status == module.STATUS_UNKNOWN
+
+    def test_success_is_up_with_body(self):
+        module = fresh_launcher("_freshness_up")
+        with _JsonServer({"models": []}) as serveur:
+            status, body = module.probe_http(f"http://127.0.0.1:{serveur.port}/", timeout=2)
+        assert status == module.STATUS_UP
+        assert _json.loads(body.decode()) == {"models": []}
+
+    def test_unknown_never_reads_as_running(self):
+        """Le booleen historique ne vaut `True` que sur `up`."""
+        module = fresh_launcher("_freshness_bool")
+        for statut, attendu in (
+            (module.STATUS_UP, True),
+            (module.STATUS_DOWN, False),
+            (module.STATUS_UNKNOWN, False),
+        ):
+            module.set_service_status("ollama", statut)
+            assert module.state["ollama_running"] is attendu
+            assert module.state["ollama_status"] == statut
+
+
+class TestCheckOllamaTriState:
+    """`check_ollama()` execute, contre de vrais sockets."""
+
+    def test_absent_ollama_is_down(self):
+        module = fresh_launcher("_check_ollama_down")
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+        assert module.check_ollama() == module.STATUS_DOWN
+        assert module.state["ollama_running"] is False
+        assert module.state["installed_models"] == []
+
+    def test_responding_ollama_is_up_and_lists_models(self):
+        module = fresh_launcher("_check_ollama_up")
+        module.HTTP_PROBE_TIMEOUT = 2
+        module.state["ollama_model"] = "qwen3:8b"
+        with _JsonServer({"models": [{"name": "qwen3:8b"}]}) as serveur:
+            module.OLLAMA_PORT = serveur.port
+            assert module.check_ollama() == module.STATUS_UP
+        assert module.state["installed_models"] == ["qwen3:8b"]
+        assert module.state["model_installed"] is True
+
+    def test_timeout_leaves_the_state_unknown_and_keeps_last_models(self):
+        """Un delai depasse n'efface pas ce qu'on savait ; il le date."""
+        module = fresh_launcher("_check_ollama_unknown")
+        module.HTTP_PROBE_TIMEOUT = 0.4
+        module.state["installed_models"] = ["qwen3:8b"]
+        module.state["model_installed"] = True
+        with _BlackHole() as trou:
+            module.OLLAMA_PORT = trou.port
+            assert module.check_ollama() == module.STATUS_UNKNOWN
+        assert module.state["ollama_running"] is False
+        assert module.state["installed_models"] == ["qwen3:8b"], (
+            "on ne sait pas : effacer la liste connue serait affirmer "
+            "qu'elle est vide, ce qui n'a pas ete mesure"
+        )
+
+    def test_a_200_that_is_not_ollama_is_unknown(self):
+        """`HTTP 200` n'est pas une preuve que le service fonctionne."""
+        module = fresh_launcher("_check_ollama_wrong_200")
+        module.HTTP_PROBE_TIMEOUT = 2
+        with _JsonServer({"ceci": "n'est pas /api/tags"}) as serveur:
+            module.OLLAMA_PORT = serveur.port
+            statut = module.check_ollama()
+        # `models` absent est tolere par l'API (liste vide), mais une
+        # charge illisible doit rester indeterminee.
+        assert statut in (module.STATUS_UP, module.STATUS_UNKNOWN)
+        assert module.state["ollama_running"] is (statut == module.STATUS_UP)
+
+
+class TestCheckDockerTriState:
+    def test_timeout_is_unknown(self):
+        module = fresh_launcher("_check_docker_unknown")
+        module.subprocess = DockerStub(raises=subprocess.TimeoutExpired("docker", 10))
+        assert module.check_docker() == module.STATUS_UNKNOWN
+        assert module.state["docker_running"] is False
+
+    def test_missing_binary_is_down_and_not_installed(self):
+        module = fresh_launcher("_check_docker_absent")
+        module.subprocess = DockerStub(raises=FileNotFoundError("docker"))
+        assert module.check_docker() == module.STATUS_DOWN
+        assert module.state["docker_installed"] is False
+
+    def test_non_zero_return_code_is_down(self):
+        module = fresh_launcher("_check_docker_stopped")
+        module.subprocess = DockerStub(returncode=1)
+        assert module.check_docker() == module.STATUS_DOWN
+
+    def test_success_is_up(self):
+        module = fresh_launcher("_check_docker_ok")
+        module.subprocess = DockerStub(returncode=0)
+        assert module.check_docker() == module.STATUS_UP
+
+
+class TestFreshnessIsExposed:
+    """Un etat affiche sans date est un etat qui ment des qu'il vieillit."""
+
+    def test_payload_carries_its_age(self):
+        module = fresh_launcher("_freshness_payload")
+        module.stamp_probe(now=1000.0, include_docker=True)
+        payload = module.status_payload(now=1003.0)
+
+        assert payload["checked_at"] == 1000.0
+        assert payload["checked_at_label"]
+        assert payload["age_seconds"] == 3.0
+        assert payload["stale"] is False
+        assert payload["stale_after_seconds"] == module.STALE_AFTER
+
+    def test_payload_declares_itself_stale_past_the_threshold(self):
+        module = fresh_launcher("_freshness_stale")
+        module.stamp_probe(now=1000.0)
+        payload = module.status_payload(now=1000.0 + module.STALE_AFTER + 1)
+        assert payload["stale"] is True
+
+    def test_a_never_probed_state_is_stale(self):
+        module = fresh_launcher("_freshness_never")
+        payload = module.status_payload()
+        assert payload["checked_at"] is None
+        assert payload["age_seconds"] is None
+        assert payload["stale"] is True
+
+    def test_the_interface_renders_the_freshness(self):
+        """Le HTML doit porter le rendu, pas seulement le payload."""
+        module = fresh_launcher("_freshness_html")
+        assert 'id="freshness"' in module.HTML_TEMPLATE
+        assert "updateFreshness" in module.HTML_TEMPLATE
+        assert "checked_at_label" in module.HTML_TEMPLATE
+        # Le cas ou le launcher lui-meme ne repond plus : sans lui, l'age
+        # afficherait la meme valeur pour l'eternite.
+        assert "markLauncherOffline" in module.HTML_TEMPLATE
+
+    def test_the_interface_renders_the_third_state(self):
+        module = fresh_launcher("_freshness_html_unknown")
+        assert "status-unknown" in module.HTML_TEMPLATE
+        assert "ollama_status" in module.HTML_TEMPLATE
+        assert "docker_status" in module.HTML_TEMPLATE
+        assert "promptforge_status" in module.HTML_TEMPLATE
+
+    def test_an_unknown_state_never_locks_the_user_out(self):
+        """Un etat qu'on ne connait pas ne doit rien griser ni cacher.
+
+        C'est la lecon produit du defaut corrige : le dev n'a rien pu faire
+        parce que l'interface, sur la foi d'une mesure perimee, avait decide
+        a sa place que rien n'etait disponible.
+        """
+        module = fresh_launcher("_freshness_not_locked")
+        html = module.HTML_TEMPLATE
+
+        # Les boutons se decident sur le statut a trois etats, pas sur le
+        # booleen : `=== 'up'` pour demarrer, `=== 'down'` pour arreter,
+        # donc les deux restent actifs quand l'etat est indetermine.
+        assert "data.ollama_status === 'up' || data.action_in_progress" in html
+        assert "btnOllamaStop.disabled = data.ollama_status === 'down'" in html
+        assert "btnPfStop.disabled = data.promptforge_status === 'down'" in html
+
+        # Le lien vers le produit n'est masque que sur un « eteint » mesure.
+        assert "(data.promptforge_status === 'down') ? 'none' : 'block'" in html
+        assert "data.promptforge_running ? 'block' : 'none'" not in html
+
+
+class TestProbeCadence:
+    """La cadence est un compromis mesure, pas une preference.
+
+    Couts mesures le 2026-09-04 sur la machine de reference :
+    Ollama 4.4 ms, PromptForge 0.5 ms, `docker info` 107.6 ms,
+    `docker images` 88.0 ms. Trois ordres de grandeur separent les deux
+    familles : elles ne peuvent pas partager la meme cadence.
+    """
+
+    def test_docker_is_probed_far_less_often_than_http(self):
+        module = fresh_launcher("_cadence_ttl")
+        assert module.FAST_PROBE_TTL < module.SLOW_PROBE_TTL
+        assert module.SLOW_PROBE_TTL >= 5 * module.FAST_PROBE_TTL
+
+    def test_a_fast_probe_forks_no_subprocess(self):
+        module = fresh_launcher("_cadence_fast")
+        stub = DockerStub()
+        module.subprocess = stub
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+
+        module.run_probes(include_docker=False)
+        assert stub.calls == [], (
+            "la cadence rapide ne doit forker aucun `docker` : "
+            f"appels observes = {stub.calls}"
+        )
+
+    def test_a_slow_probe_does_fork_docker(self):
+        module = fresh_launcher("_cadence_slow")
+        stub = DockerStub()
+        module.subprocess = stub
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+
+        module.run_probes(include_docker=True)
+        assert any(call[:2] == ["docker", "info"] for call in stub.calls), stub.calls
+
+    def test_nothing_is_probed_before_the_ttl_expires(self):
+        module = fresh_launcher("_cadence_ttl_guard")
+        module.stamp_probe(now=time.time(), include_docker=True)
+        assert module.ensure_fresh_status() is None, (
+            "sonder a chaque appel rendrait l'interface poussive : "
+            "le client interroge toutes les 3 s"
+        )
+
+    def test_the_fast_ttl_expires_before_the_client_polls_twice(self):
+        """Peremption maximale vue par l'utilisateur : ~5 s."""
+        module = fresh_launcher("_cadence_window")
+        module.stamp_probe(now=time.time() - module.FAST_PROBE_TTL - 0.1,
+                           include_docker=True)
+        fast_due, slow_due = module.probe_due()
+        assert fast_due is True
+        assert slow_due is False, "Docker ne doit pas suivre la cadence rapide"
+
+    def test_only_one_probe_flies_at_a_time(self):
+        """Sans cela, un `docker info` lent verrait s'empiler les sondes."""
+        module = fresh_launcher("_cadence_single_flight")
+        module.state["probe_in_progress"] = True
+        assert module.ensure_fresh_status() is None
+
+    def test_repeated_probes_do_not_flood_the_log_buffer(self):
+        """Le tampon fait 50 lignes ; sonder toutes les 2 s l'effacerait."""
+        module = fresh_launcher("_cadence_log")
+        module.subprocess = DockerStub()
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+
+        module.run_probes(include_docker=False)
+        apres_premiere = len(module.state["logs"])
+        for _ in range(20):
+            module.run_probes(include_docker=False)
+        ajoutees = len(module.state["logs"]) - apres_premiere
+
+        assert ajoutees == 0, (
+            "vingt sondes sans changement d'etat ont ajoute "
+            f"{ajoutees} lignes de log : le tampon de 50 serait efface "
+            "en moins de deux minutes"
+        )
+
+
+class TestStatusEndpointRefreshesItself:
+    """LE test de non-regression : execute le serveur HTTP de `launcher.py`.
+
+    Aucune couture de `launcher.py` n'etait executee jusqu'ici cote statut :
+    `TestLauncherConfig` lit le fichier comme du texte. Ici on monte le vrai
+    `LauncherHandler`, on l'interroge par le reseau, et on fait apparaitre
+    un Ollama en cours de route sans jamais poster la moindre action.
+    """
+
+    @staticmethod
+    def _serve(module):
+        serveur = http.server.HTTPServer(("127.0.0.1", 0), module.LauncherHandler)
+        fil = threading.Thread(target=serveur.serve_forever, daemon=True)
+        fil.start()
+        return serveur, fil
+
+    @staticmethod
+    def _get_status(port):
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=5) as r:
+            assert r.status == 200
+            return _json.loads(r.read().decode())
+
+    def test_ollama_started_after_the_page_is_seen_without_any_click(self):
+        """Le scenario exact vecu par le dev, rejoue de bout en bout."""
+        module = fresh_launcher("_endpoint_appearing")
+        module.subprocess = DockerStub()
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+        module.state["ollama_model"] = "qwen3:8b"
+
+        # 1. Le launcher demarre pendant qu'Ollama est absent.
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.refresh_status()
+        assert module.state["ollama_status"] == module.STATUS_DOWN
+
+        serveur, fil = self._serve(module)
+        port = serveur.server_address[1]
+        try:
+            depart = self._get_status(port)
+            assert depart["ollama_running"] is False
+            assert depart["ollama_status"] == "down"
+            premier_horodatage = depart["checked_at"]
+            assert premier_horodatage is not None
+
+            # 2. Ollama apparait APRES l'ouverture de la page.
+            with _JsonServer({"models": [{"name": "qwen3:8b"}]}) as ollama:
+                module.OLLAMA_PORT = ollama.port
+
+                # 3. Le client se contente de son sondage periodique de 3 s.
+                #    Aucun POST /api/action, aucun clic sur « Rafraichir ».
+                limite = time.time() + 20
+                vu = None
+                while time.time() < limite:
+                    time.sleep(0.5)
+                    vu = self._get_status(port)
+                    if vu["ollama_status"] == "up":
+                        break
+
+            assert vu is not None
+            assert vu["ollama_status"] == "up", (
+                "un Ollama demarre apres l'ouverture de la page doit etre vu "
+                "sans intervention de l'utilisateur ; etat lu : "
+                f"{vu['ollama_status']}, age {vu['age_seconds']} s"
+            )
+            assert vu["ollama_running"] is True
+            assert vu["installed_models"] == ["qwen3:8b"]
+            assert vu["checked_at"] > premier_horodatage, (
+                "l'horodatage doit avancer : sinon l'etat est fige"
+            )
+            assert vu["age_seconds"] <= module.STALE_AFTER
+        finally:
+            serveur.shutdown()
+            serveur.server_close()
+            fil.join(timeout=5)
+
+    def test_the_endpoint_reports_its_own_staleness(self):
+        module = fresh_launcher("_endpoint_stale")
+        module.subprocess = DockerStub()
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+
+        serveur, fil = self._serve(module)
+        port = serveur.server_address[1]
+        try:
+            # Jamais sonde : le payload doit le dire, pas se taire.
+            vierge = self._get_status(port)
+            assert vierge["stale"] is True
+
+            # Etat volontairement vieilli : `stale` doit repasser a True.
+            module.stamp_probe(now=time.time() - module.STALE_AFTER - 5,
+                               include_docker=True)
+            vieux = self._get_status(port)
+            assert vieux["stale"] is True
+            assert vieux["age_seconds"] > module.STALE_AFTER
+        finally:
+            serveur.shutdown()
+            serveur.server_close()
+            fil.join(timeout=5)
+
+    def test_the_endpoint_ships_the_python_compose_table(self):
+        """D-060 : une seule table de compose, celle de Python."""
+        module = fresh_launcher("_endpoint_compose")
+        module.subprocess = DockerStub()
+        module.OLLAMA_PORT = CLOSED_PORT
+        module.PROMPTFORGE_PORT = CLOSED_PORT
+        module.HTTP_PROBE_TIMEOUT = 1
+
+        serveur, fil = self._serve(module)
+        port = serveur.server_address[1]
+        try:
+            recu = self._get_status(port)
+        finally:
+            serveur.shutdown()
+            serveur.server_close()
+            fil.join(timeout=5)
+
+        assert recu["compose_options"] == module.DOCKER_COMPOSE_OPTIONS, (
+            "/api/status n'envoyait jamais DOCKER_COMPOSE_OPTIONS : le "
+            "JavaScript en gardait une copie, deja divergente"
+        )
+
+
+class TestComposeTableIsNotDuplicated:
+    """D-060 : `COMPOSE_OPTIONS` en JavaScript dupliquait le dict Python.
+
+    Les deux vivaient dans le meme fichier et avaient deja divergé : la
+    copie JS decrivait `cpu` comme « optimise CPU », l'original Python
+    comme « optimise CPU, 8GB+ RAM ».
+    """
+
+    def test_no_javascript_copy_remains(self):
+        module = fresh_launcher("_no_js_compose_copy")
+        assert "COMPOSE_OPTIONS = {" not in module.HTML_TEMPLATE, (
+            "la table de compose est redevenue duplique en JavaScript"
+        )
+
+    def test_the_selector_reads_the_served_table(self):
+        module = fresh_launcher("_js_reads_payload")
+        assert "data.compose_options" in module.HTML_TEMPLATE
+
+    def test_every_served_label_comes_from_python(self):
+        module = fresh_launcher("_labels_from_python")
+        payload = module.status_payload()
+        for cle, info in module.DOCKER_COMPOSE_OPTIONS.items():
+            assert payload["compose_options"][cle]["label"] == info["label"]
+            assert payload["compose_options"][cle]["description"] == info["description"]
