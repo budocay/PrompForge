@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from promptforge.core import PromptForge
+from promptforge.providers import OllamaTimeoutError
 from promptforge.security import SecurityContext
 
 
@@ -827,3 +828,126 @@ class TestComparisonRanksOnTariffOnly:
         apres = [ligne["model"] for ligne in profiles.compare_models()]
         assert apres[0] == "gpt-5-pro"
         assert apres[-1] == "gemini-3.6-flash"
+
+
+class TestFormatPromptTimeout:
+    """Le depassement de delai Ollama, vu depuis le quadruplet de `format_prompt()`.
+
+    F-032. Le contrat de retour est inchange : `format_prompt()` rend toujours
+    `(succes, message, prompt_formate, security_context)` et `generate()` rend
+    toujours `Optional[str]`. Seul le canal `message`, deja affiche tel quel par
+    le CLI (`cli.py:170`) et par le web (`web/interface.py:139`), gagne une
+    troisieme valeur distincte.
+    """
+
+    class TimingOutProvider:
+        """Provider qui depasse le delai, sans qu'Ollama soit installe."""
+
+        def __init__(self, model="qwen3:14b", timeout=600):
+            self.config = MagicMock(model=model, timeout=timeout)
+            self._model = model
+            self._timeout = timeout
+
+        def is_available(self):
+            return True
+
+        def list_models(self):
+            return [self._model]
+
+        def generate(self, prompt, system_prompt="", num_ctx=16384):
+            raise OllamaTimeoutError(self._model, self._timeout)
+
+    def test_timeout_is_reported_as_a_failure_not_a_crash(self, forge):
+        """Avant F-032, ce cas remontait un `TimeoutError` nu jusqu'a l'appelant."""
+        forge.ollama = self.TimingOutProvider()
+
+        result = forge.format_prompt("test prompt")
+
+        assert len(result) == 4
+        success, message, formatted, _ = result
+        assert success is False
+        assert formatted is None
+        assert message
+
+    def test_timeout_message_explains_the_model_was_too_slow(self, forge):
+        """L'utilisateur doit comprendre que le modele a trainé, pas que le service est tombé."""
+        forge.ollama = self.TimingOutProvider(model="qwen3:14b", timeout=600)
+
+        _, message, _, _ = forge.format_prompt("test prompt")
+
+        assert "qwen3:14b" in message
+        assert "600" in message
+        assert "joignable" in message.lower()
+
+    def test_timeout_message_offers_both_levers(self, forge):
+        forge.ollama = self.TimingOutProvider()
+
+        _, message, _, _ = forge.format_prompt("test prompt")
+
+        assert "OLLAMA_TIMEOUT" in message
+        assert "OLLAMA_MODEL" in message
+
+    def test_timeout_is_distinguishable_from_ollama_absent(
+        self, forge, mock_ollama_unavailable
+    ):
+        """Mutant vise : servir le meme message pour les deux conditions.
+
+        Si les deux messages se confondent, l'utilisateur dont le modele est
+        simplement lent ira relancer `ollama serve` pour rien.
+        """
+        forge.ollama = mock_ollama_unavailable
+        _, absent_message, _, _ = forge.format_prompt("test prompt")
+
+        forge.ollama = self.TimingOutProvider()
+        _, timeout_message, _, _ = forge.format_prompt("test prompt")
+
+        assert timeout_message != absent_message
+        assert "n'est pas disponible" in absent_message
+        assert "n'est pas disponible" not in timeout_message
+
+    def test_timeout_is_distinguishable_from_a_network_failure(self, forge):
+        """Mutant vise : confondre depassement de delai et erreur reseau.
+
+        Un echec reseau fait rendre None a `generate()` et aboutit au message
+        generique ; un depassement de delai doit dire autre chose.
+        """
+        network_failure = self.TimingOutProvider()
+        network_failure.generate = lambda *a, **k: None
+        forge.ollama = network_failure
+        _, network_message, _, _ = forge.format_prompt("test prompt")
+
+        forge.ollama = self.TimingOutProvider()
+        _, timeout_message, _, _ = forge.format_prompt("test prompt")
+
+        assert timeout_message != network_message
+        assert "Erreur lors du reformatage" in network_message
+        assert "delai" in timeout_message.lower()
+
+    def test_timeout_saves_nothing(self, forge, sample_config_file):
+        """Lecon D-054 : le message affirme « rien n'a ete sauvegarde ».
+
+        Ce test verifie que l'affirmation est vraie, dans les deux lieux de
+        stockage : la base SQLite et les fichiers Markdown d'historique.
+        """
+        forge.init_project("test", sample_config_file)
+        forge.use_project("test")
+        forge.ollama = self.TimingOutProvider()
+
+        success, message, _, _ = forge.format_prompt("test prompt")
+
+        assert success is False
+        assert "rien n'a ete sauvegarde" in message.lower()
+        assert forge.get_history() == []
+        assert list((Path(forge.base_path) / "history").glob("*.md")) == []
+
+    def test_security_context_survives_the_timeout(self, forge, sample_config_file):
+        """L'analyse de securite deja payee n'est pas jetee avec l'erreur."""
+        forge.init_project("test", sample_config_file)
+        forge.use_project("test")
+        forge.ollama = self.TimingOutProvider()
+
+        _, _, _, security_ctx = forge.format_prompt(
+            "ajouter une authentification", check_security=True
+        )
+
+        assert isinstance(security_ctx, SecurityContext)

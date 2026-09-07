@@ -11,6 +11,112 @@ from dataclasses import dataclass, field
 import urllib.request
 import urllib.error
 
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+class OllamaError(Exception):
+    """Erreur de communication avec Ollama."""
+
+
+class OllamaTimeoutError(OllamaError, TimeoutError):
+    """Ollama n'a pas repondu dans le delai imparti.
+
+    Herite aussi de ``TimeoutError`` : avant cette correction, un depassement
+    de delai remontait un ``TimeoutError`` brut jusqu'a l'appelant. Un appelant
+    qui s'en protegeait deja par ``except TimeoutError`` (ou ``except OSError``)
+    continue donc de fonctionner a l'identique.
+
+    Attributes:
+        model: Le modele qui n'a pas repondu.
+        timeout: Le delai depasse, en secondes.
+    """
+
+    def __init__(self, model: str, timeout: int) -> None:
+        self.model = model
+        self.timeout = timeout
+        super().__init__(build_timeout_message(model, timeout))
+
+
+# Delai par defaut, en secondes, pour une generation Ollama.
+#
+# Justification chiffree. Mesure de premiere main du 2026-09-07 sur cette
+# machine, via `OllamaProvider.generate()` et un prompt de reformatage
+# realiste, trois passages par modele :
+#     qwen3:14b -> 83,34 s | 195,23 s | 98,20 s
+#     qwen3:8b  ->  30,41 s |  51,36 s |  63,30 s
+# Le passage a 195,23 s vaut 1,63 fois l'ancien defaut de 120 s, sans aucune
+# charge artificielle et sur un prompt nominal : l'ancienne valeur etait donc
+# franchie par une generation parfaitement normale, et l'utilisateur perdait
+# son reformatage alors que le modele repondait. C'est le defaut signale.
+# Le depot avait par ailleurs deja releve 457,48 s en charge (dette D-073).
+#
+# 600 s couvre la plus longue generation jamais mesuree ici (457,48 s) avec
+# 31 % de marge, et 3,07 fois le maximum mesure ce jour. Cette valeur rejoint
+# le budget deja retenu dans ce fichier pour l'autre operation Ollama longue,
+# `pull_model` (600 s). Un delai trop long ne coute plus grand-chose depuis
+# que le depassement est rattrape, nomme et reglable : l'utilisateur presse
+# abaisse OLLAMA_TIMEOUT, l'utilisateur patient ne perd plus son travail.
+DEFAULT_OLLAMA_TIMEOUT = 600
+
+# Variable d'environnement de reglage, meme convention que OLLAMA_HOST et
+# OLLAMA_MODEL : lecture directe dans os.environ, sans fichier de config.
+OLLAMA_TIMEOUT_ENV_VAR = "OLLAMA_TIMEOUT"
+
+
+def get_default_ollama_timeout() -> int:
+    """Recupere le delai de generation depuis l'environnement.
+
+    Lit ``OLLAMA_TIMEOUT`` (en secondes). Une valeur absente, non entiere ou
+    nulle/negative retombe sur `DEFAULT_OLLAMA_TIMEOUT` avec un avertissement
+    journalise : un delai invalide ne doit ni faire echouer le demarrage, ni
+    passer inapercu.
+    """
+    raw = os.environ.get(OLLAMA_TIMEOUT_ENV_VAR)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_OLLAMA_TIMEOUT
+
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "%s=%r n'est pas un entier, repli sur %s s",
+            OLLAMA_TIMEOUT_ENV_VAR, raw, DEFAULT_OLLAMA_TIMEOUT,
+        )
+        return DEFAULT_OLLAMA_TIMEOUT
+
+    if value <= 0:
+        logger.warning(
+            "%s=%s doit etre strictement positif, repli sur %s s",
+            OLLAMA_TIMEOUT_ENV_VAR, value, DEFAULT_OLLAMA_TIMEOUT,
+        )
+        return DEFAULT_OLLAMA_TIMEOUT
+
+    return value
+
+
+def build_timeout_message(model: str, timeout: int) -> str:
+    """Construit le message rendu a l'utilisateur en cas de depassement de delai.
+
+    Le message doit etre distinguable d'un Ollama absent et d'une erreur
+    reseau, dire ce qui a ete perdu, et donner les deux leviers d'action.
+
+    Il ne consulte volontairement ni `hardware.py` ni `models_catalog.py` :
+    `detect_hardware()` lance plusieurs sous-processus (sysctl, nvidia-smi,
+    lspci) sur un chemin que l'utilisateur n'atteint qu'apres avoir deja
+    attendu `timeout` secondes, et ces sous-processus peuvent bloquer a leur
+    tour. Le chemin d'erreur reste donc sans entree-sortie.
+    """
+    return (
+        f"Le modele '{model}' n'a pas repondu dans le delai de {timeout} s. "
+        f"Ollama est joignable : c'est la generation qui a ete trop longue, "
+        f"pas le service qui est tombe. Rien n'a ete sauvegarde. "
+        f"Deux leviers : allonger le delai "
+        f"({OLLAMA_TIMEOUT_ENV_VAR}={timeout * 2} par exemple), "
+        f"ou choisir un modele plus leger via OLLAMA_MODEL."
+    )
+
 
 def get_default_ollama_url() -> str:
     """Récupère l'URL Ollama depuis l'environnement ou détecte automatiquement."""
@@ -32,7 +138,7 @@ def get_default_ollama_url() -> str:
 class OllamaConfig:
     base_url: str = field(default_factory=get_default_ollama_url)
     model: str = "llama3.1"
-    timeout: int = 120
+    timeout: int = field(default_factory=get_default_ollama_timeout)
 
 
 class OllamaProvider:
@@ -61,7 +167,18 @@ class OllamaProvider:
             with urllib.request.urlopen(req, timeout=10) as response:
                 data = json.loads(response.read().decode())
                 return [model["name"] for model in data.get("models", [])]
-        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+        except TimeoutError:
+            # `TimeoutError` derive d'`OSError`, pas d'`URLError` : sans cette
+            # clause il remontait brut jusqu'a l'appelant. Ici la liste vide
+            # reste le contrat d'echec (comme `is_available()` rend False),
+            # mais elle est desormais journalisee au lieu d'etre muette.
+            logger.warning(
+                "Ollama n'a pas liste ses modeles dans le delai de 10 s (%s)",
+                self.config.base_url,
+            )
+            return []
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as e:
+            logger.warning("Liste des modeles Ollama indisponible: %s", e)
             return []
 
     def generate(self, prompt: str, system_prompt: str = "", num_ctx: int = 16384) -> Optional[str]:
@@ -71,6 +188,19 @@ class OllamaProvider:
             prompt: Le prompt à envoyer
             system_prompt: Le system prompt optionnel
             num_ctx: Taille du contexte (défaut: 16384 pour supporter les gros projets)
+
+        Returns:
+            Le texte genere, ou None si Ollama est injoignable ou repond mal
+            (contrat inchange pour ces deux cas).
+
+        Raises:
+            OllamaTimeoutError: si le modele n'a pas repondu dans
+                `config.timeout` secondes. Ce cas n'est volontairement PAS
+                rendu comme `None` : un depassement de delai n'est pas un
+                echec reseau, et l'appelant doit pouvoir le dire a
+                l'utilisateur. Avant cette correction ce cas remontait un
+                `TimeoutError` brut non rattrape ; `OllamaTimeoutError` en
+                derive, donc aucun appelant existant ne casse.
         """
         try:
             payload = {
@@ -98,9 +228,34 @@ class OllamaProvider:
             with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
                 result = json.loads(response.read().decode())
                 return result.get("response")
-                
-        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as e:
-            print(f"Erreur Ollama: {e}")
+
+        except TimeoutError as e:
+            # Depassement du delai de lecture. `TimeoutError` derive d'`OSError`
+            # et d'aucune des erreurs urllib : il n'etait rattrape par personne.
+            logger.warning(
+                "Depassement du delai Ollama: modele=%s timeout=%ss",
+                self.config.model, self.config.timeout,
+            )
+            raise OllamaTimeoutError(self.config.model, self.config.timeout) from e
+
+        except urllib.error.HTTPError as e:
+            logger.error("Ollama a repondu %s: %s", e.code, e)
+            return None
+
+        except urllib.error.URLError as e:
+            # Un depassement de delai a la connexion arrive emballe dans URLError,
+            # contrairement au depassement a la lecture attrape plus haut.
+            if isinstance(e.reason, TimeoutError):
+                logger.warning(
+                    "Depassement du delai Ollama a la connexion: modele=%s timeout=%ss",
+                    self.config.model, self.config.timeout,
+                )
+                raise OllamaTimeoutError(self.config.model, self.config.timeout) from e
+            logger.error("Ollama injoignable (%s): %s", self.config.base_url, e)
+            return None
+
+        except json.JSONDecodeError as e:
+            logger.error("Reponse Ollama illisible: %s", e)
             return None
 
     def pull_model(self, model: str) -> bool:
@@ -440,6 +595,12 @@ def format_prompt_with_ollama(
     Returns:
         Le prompt reformaté ou None en cas d'erreur
         Si return_conversion_info=True: tuple (prompt, was_converted)
+
+    Raises:
+        OllamaTimeoutError: propage volontairement le depassement de delai de
+            `OllamaProvider.generate()`, au lieu de l'aplatir en None. C'est ce
+            qui permet a `PromptForge.format_prompt()` de distinguer « le
+            modele a mis trop de temps » de « Ollama est injoignable ».
     """
     if provider is None:
         provider = OllamaProvider()

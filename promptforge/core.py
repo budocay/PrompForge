@@ -8,7 +8,12 @@ from typing import Optional
 import re
 
 from .database import Database, Project
-from .providers import OllamaProvider, OllamaConfig, format_prompt_with_ollama
+from .providers import (
+    OllamaProvider,
+    OllamaConfig,
+    OllamaTimeoutError,
+    format_prompt_with_ollama,
+)
 from .security import (
     detect_dev_context,
     detect_dependencies_from_text,
@@ -205,12 +210,23 @@ class PromptForge:
                     logger.debug("Security guidelines injected into context")
 
         # Reformatage via Ollama
-        formatted = format_prompt_with_ollama(
-            raw_prompt=raw_prompt,
-            project_context=project_context,
-            provider=self.ollama,
-            profile_name=profile_name
-        )
+        try:
+            formatted = format_prompt_with_ollama(
+                raw_prompt=raw_prompt,
+                project_context=project_context,
+                provider=self.ollama,
+                profile_name=profile_name
+            )
+        except OllamaTimeoutError as exc:
+            # Condition explicite, distincte d'un Ollama absent (traite plus
+            # haut) et d'une erreur reseau (traitee juste en dessous). On sort
+            # AVANT `_save_history` et `db.add_history` : le message peut donc
+            # affirmer sans mentir que rien n'a ete sauvegarde (lecon D-054).
+            logger.warning(
+                f"Timeout Ollama pendant le reformatage: "
+                f"model={exc.model} timeout={exc.timeout}s"
+            )
+            return False, str(exc), None, security_context
 
         if not formatted:
             return False, "Erreur lors du reformatage avec Ollama", None, security_context

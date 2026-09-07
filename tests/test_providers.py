@@ -5,11 +5,17 @@ Tests pour le module providers (Ollama).
 import pytest
 import json
 from unittest.mock import patch, MagicMock
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 from promptforge.providers import (
-    OllamaProvider, 
-    OllamaConfig, 
+    OllamaProvider,
+    OllamaConfig,
+    OllamaError,
+    OllamaTimeoutError,
+    DEFAULT_OLLAMA_TIMEOUT,
+    OLLAMA_TIMEOUT_ENV_VAR,
+    build_timeout_message,
+    get_default_ollama_timeout,
     format_prompt_with_ollama,
     REFORMAT_SYSTEM_PROMPT
 )
@@ -18,14 +24,19 @@ from promptforge.providers import (
 class TestOllamaConfig:
     """Tests pour OllamaConfig."""
 
-    def test_default_values(self):
-        """Test des valeurs par défaut."""
+    def test_default_values(self, monkeypatch):
+        """Test des valeurs par défaut.
+
+        `OLLAMA_TIMEOUT` est retiree de l'environnement : sans cela le verdict
+        dependrait du shell qui lance la suite, pas du code.
+        """
+        monkeypatch.delenv(OLLAMA_TIMEOUT_ENV_VAR, raising=False)
         config = OllamaConfig()
-        
+
         # L'URL peut varier selon l'environnement (WSL vs normal)
         assert "11434" in config.base_url
         assert config.model == "llama3.1"
-        assert config.timeout == 120
+        assert config.timeout == DEFAULT_OLLAMA_TIMEOUT
 
     def test_custom_values(self):
         """Test des valeurs personnalisées."""
@@ -219,3 +230,292 @@ class TestDeadCodeRemoved:
 
         assert hasattr(providers, "is_markdown_format")
         assert hasattr(providers, "convert_markdown_to_xml")
+
+
+# =============================================================================
+# DEPASSEMENT DE DELAI OLLAMA (F-032)
+#
+# Avant F-032, `TimeoutError` derivait d'`OSError` et d'aucune des trois
+# exceptions rattrapees par `generate()` : il remontait brut jusqu'a
+# l'interface. Reproduction avant correction, contre un serveur local qui ne
+# repond jamais :
+#     generate:    EXCEPTION NON RATTRAPEE builtins.TimeoutError -> timed out
+#     list_models: EXCEPTION NON RATTRAPEE builtins.TimeoutError -> timed out
+#     is_available: RETOURNE False
+#
+# Les tests ci-dessous portent sur le CONTRAT (quelle condition est rendue, et
+# avec quel message actionnable), pas sur la simple presence d'un try/except :
+# un `except TimeoutError: return None` les laisserait rouges.
+# =============================================================================
+
+
+@pytest.fixture
+def dead_server():
+    """Socket qui accepte la connexion TCP et ne repond jamais.
+
+    Permet d'exercer le VRAI chemin de depassement de delai d'urllib (socket,
+    `http.client`, `urlopen(timeout=...)`) sans qu'Ollama soit installe : ce
+    test reste vert sur une machine sans Ollama, contrairement aux dix-sept
+    tests de `test_ollama_integration.py`.
+
+    Un `socket.listen()` jamais suivi d'`accept()` suffit : le noyau termine la
+    poignee de main TCP, le client emet sa requete puis attend une reponse qui
+    ne viendra pas. Aucun fil d'execution, donc une fermeture instantanee — un
+    `HTTPServer` dont le gestionnaire dort aurait bloque le demontage aussi
+    longtemps que le sommeil.
+    """
+    import socket
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    try:
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        listener.close()
+
+
+class TestOllamaTimeoutType:
+    """Le type d'exception et sa compatibilite ascendante."""
+
+    def test_timeout_error_is_an_ollama_error(self):
+        assert issubclass(OllamaTimeoutError, OllamaError)
+
+    def test_timeout_error_stays_a_timeout_error(self):
+        """Compatibilite : avant F-032 un `TimeoutError` brut remontait.
+
+        Un appelant qui s'en protegeait deja par `except TimeoutError` ou
+        `except OSError` ne doit pas casser.
+        """
+        exc = OllamaTimeoutError("qwen3:14b", 600)
+        assert isinstance(exc, TimeoutError)
+        assert isinstance(exc, OSError)
+
+    def test_timeout_error_carries_model_and_timeout(self):
+        exc = OllamaTimeoutError("qwen3:14b", 600)
+        assert exc.model == "qwen3:14b"
+        assert exc.timeout == 600
+
+
+class TestTimeoutMessage:
+    """Le message rendu a l'utilisateur, sur le fond."""
+
+    def test_message_names_the_model_and_the_elapsed_budget(self):
+        message = build_timeout_message("qwen3:14b", 600)
+        assert "qwen3:14b" in message
+        assert "600" in message
+
+    def test_message_says_the_service_is_up_not_down(self):
+        """Exigence explicite : l'utilisateur ne doit pas croire qu'Ollama est tombe."""
+        message = build_timeout_message("qwen3:14b", 600).lower()
+        assert "joignable" in message
+
+    def test_message_states_nothing_was_saved(self):
+        """Lecon D-054 : ne jamais laisser croire a une sauvegarde inexistante."""
+        message = build_timeout_message("qwen3:14b", 600).lower()
+        assert "rien n'a ete sauvegarde" in message
+
+    def test_message_gives_the_two_actionable_levers(self):
+        """Allonger le delai, ou prendre un modele plus leger."""
+        message = build_timeout_message("qwen3:14b", 600)
+        assert OLLAMA_TIMEOUT_ENV_VAR in message
+        assert "OLLAMA_MODEL" in message
+        # Le levier « allonger » propose une valeur concrete, pas une consigne vague
+        assert "1200" in message
+
+    def test_message_is_not_confusable_with_a_network_failure(self):
+        """Mutant vise : rendre le meme message pour un timeout et un echec reseau.
+
+        Le message de depassement de delai doit parler de duree, et ne doit pas
+        se resumer au vocabulaire d'indisponibilite employe ailleurs.
+        """
+        message = build_timeout_message("qwen3:14b", 600).lower()
+        assert "delai" in message
+        assert "injoignable" not in message
+        assert "n'est pas disponible" not in message
+
+
+class TestGenerateTimeout:
+    """`generate()` face au depassement de delai."""
+
+    @patch('urllib.request.urlopen')
+    def test_read_timeout_raises_typed_error(self, mock_urlopen):
+        """Depassement a la LECTURE : urllib remonte un `TimeoutError` nu."""
+        mock_urlopen.side_effect = TimeoutError("timed out")
+
+        provider = OllamaProvider(OllamaConfig(model="qwen3:14b", timeout=42))
+
+        with pytest.raises(OllamaTimeoutError) as excinfo:
+            provider.generate("Test prompt")
+
+        assert excinfo.value.model == "qwen3:14b"
+        assert excinfo.value.timeout == 42
+
+    @patch('urllib.request.urlopen')
+    def test_connect_timeout_wrapped_in_urlerror_raises_typed_error(self, mock_urlopen):
+        """Depassement a la CONNEXION : urllib l'emballe dans URLError.
+
+        Sans l'inspection de `URLError.reason`, ce cas retomberait sur le
+        message generique « Ollama injoignable » et l'utilisateur croirait le
+        service tombe alors qu'il est seulement lent.
+        """
+        mock_urlopen.side_effect = URLError(TimeoutError("timed out"))
+
+        provider = OllamaProvider(OllamaConfig(model="qwen3:8b", timeout=7))
+
+        with pytest.raises(OllamaTimeoutError) as excinfo:
+            provider.generate("Test prompt")
+
+        assert excinfo.value.timeout == 7
+
+    @patch('urllib.request.urlopen')
+    def test_network_failure_still_returns_none(self, mock_urlopen):
+        """Contrat inchange : un echec reseau reste un None, pas une exception."""
+        mock_urlopen.side_effect = URLError("Connection refused")
+
+        provider = OllamaProvider()
+        assert provider.generate("Test prompt") is None
+
+    @patch('urllib.request.urlopen')
+    def test_http_error_still_returns_none(self, mock_urlopen):
+        """Contrat inchange : une reponse HTTP en erreur reste un None."""
+        mock_urlopen.side_effect = HTTPError(
+            url="http://localhost:11434/api/generate",
+            code=500, msg="Internal Server Error", hdrs=None, fp=None,
+        )
+
+        provider = OllamaProvider()
+        assert provider.generate("Test prompt") is None
+
+    @patch('urllib.request.urlopen')
+    def test_unreadable_response_still_returns_none(self, mock_urlopen):
+        """Contrat inchange : un JSON illisible reste un None."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"pas du json"
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        provider = OllamaProvider()
+        assert provider.generate("Test prompt") is None
+
+    def test_real_socket_timeout_is_caught(self, dead_server):
+        """Chemin reel de bout en bout, sans Ollama et sans mock.
+
+        C'est le test qui reproduit le defaut signale par le dev : avant F-032
+        il rendait `TimeoutError: timed out` non rattrape.
+        """
+        provider = OllamaProvider(
+            OllamaConfig(base_url=dead_server, model="qwen3:14b", timeout=1)
+        )
+
+        with pytest.raises(OllamaTimeoutError) as excinfo:
+            provider.generate("Test prompt")
+
+        assert "qwen3:14b" in str(excinfo.value)
+        assert excinfo.value.timeout == 1
+
+    def test_no_stdout_pollution_on_failure(self, capsys):
+        """Une bibliotheque n'ecrit pas sur la sortie standard de qui l'importe.
+
+        `providers.py` faisait `print(f"Erreur Ollama: {e}")`, ce qui polluait
+        la sortie du CLI et de tout script important le module.
+        """
+        with patch('urllib.request.urlopen', side_effect=URLError("Connection refused")):
+            OllamaProvider().generate("Test prompt")
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+
+
+class TestListModelsTimeout:
+    """`list_models()` avait la meme faille que `generate()`."""
+
+    @patch('urllib.request.urlopen')
+    def test_timeout_returns_empty_list(self, mock_urlopen):
+        """Contrat de `list_models()` : la liste vide, jamais une exception nue."""
+        mock_urlopen.side_effect = TimeoutError("timed out")
+
+        assert OllamaProvider().list_models() == []
+
+    @patch('urllib.request.urlopen')
+    def test_connect_timeout_wrapped_in_urlerror_returns_empty_list(self, mock_urlopen):
+        mock_urlopen.side_effect = URLError(TimeoutError("timed out"))
+
+        assert OllamaProvider().list_models() == []
+
+    @patch('urllib.request.urlopen')
+    def test_is_available_still_false_on_timeout(self, mock_urlopen):
+        """Non-regression : `is_available()` rattrapait deja le depassement.
+
+        Simule plutot que joue sur socket reel : `is_available()` impose un
+        budget fixe de 5 s et `list_models()` de 10 s, non reglables, qui
+        auraient alourdi la suite de quinze secondes pour aucune information
+        supplementaire. Le chemin socket reel reste couvert par
+        `test_real_socket_timeout_is_caught`.
+        """
+        mock_urlopen.side_effect = TimeoutError("timed out")
+
+        assert OllamaProvider().is_available() is False
+
+
+class TestTimeoutConfiguration:
+    """Le delai se regle par variable d'environnement, comme OLLAMA_HOST/MODEL."""
+
+    def test_default_when_variable_absent(self, monkeypatch):
+        monkeypatch.delenv(OLLAMA_TIMEOUT_ENV_VAR, raising=False)
+        assert get_default_ollama_timeout() == DEFAULT_OLLAMA_TIMEOUT
+
+    def test_default_covers_the_longest_generation_measured(self):
+        """Le chiffre est fonde sur une mesure, pas choisi au hasard.
+
+        Mesure de premiere main du 2026-09-07, `OllamaProvider.generate()` sur
+        un prompt de reformatage realiste : `qwen3:14b` rend 83,34 s, 195,23 s
+        et 98,20 s sur trois passages. Le passage a 195,23 s vaut 1,63 fois
+        l'ancien defaut de 120 s, sans charge artificielle : cette valeur etait
+        franchie par une generation nominale, et le reformatage etait perdu
+        alors que le modele repondait. Le depot avait par ailleurs releve
+        457,48 s en charge (D-073), que le nouveau defaut couvre aussi.
+        """
+        assert DEFAULT_OLLAMA_TIMEOUT >= 458
+        assert DEFAULT_OLLAMA_TIMEOUT > 120
+
+    def test_environment_variable_is_honoured(self, monkeypatch):
+        monkeypatch.setenv(OLLAMA_TIMEOUT_ENV_VAR, "45")
+        assert get_default_ollama_timeout() == 45
+
+    def test_config_built_from_the_environment(self, monkeypatch):
+        """Mutant vise : lire la variable puis ne pas la cabler sur OllamaConfig."""
+        monkeypatch.setenv(OLLAMA_TIMEOUT_ENV_VAR, "45")
+        assert OllamaConfig().timeout == 45
+
+    def test_environment_variable_reaches_the_socket(self, monkeypatch):
+        """Mutant vise : la variable est lue, mais `urlopen` recoit autre chose."""
+        monkeypatch.setenv(OLLAMA_TIMEOUT_ENV_VAR, "33")
+
+        with patch('urllib.request.urlopen') as mock_urlopen:
+            mock_response = MagicMock()
+            mock_response.read.return_value = json.dumps({"response": "ok"}).encode()
+            mock_response.__enter__ = MagicMock(return_value=mock_response)
+            mock_response.__exit__ = MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_response
+
+            OllamaProvider().generate("Test prompt")
+
+        assert mock_urlopen.call_args.kwargs["timeout"] == 33
+
+    def test_explicit_value_beats_the_environment(self, monkeypatch):
+        monkeypatch.setenv(OLLAMA_TIMEOUT_ENV_VAR, "45")
+        assert OllamaConfig(timeout=10).timeout == 10
+
+    @pytest.mark.parametrize("bad_value", ["", "   ", "abc", "60s", "12.5", "0", "-30"])
+    def test_invalid_values_fall_back_without_crashing(self, monkeypatch, bad_value):
+        """Cas limites : une variable mal remplie ne doit pas casser le demarrage.
+
+        Un delai nul ou negatif est refuse : `urlopen(timeout=0)` ferait
+        echouer chaque appel instantanement, ce qui serait pire que le defaut
+        corrige ici.
+        """
+        monkeypatch.setenv(OLLAMA_TIMEOUT_ENV_VAR, bad_value)
+        assert get_default_ollama_timeout() == DEFAULT_OLLAMA_TIMEOUT
