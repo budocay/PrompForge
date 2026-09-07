@@ -29,12 +29,27 @@ from promptforge.models_catalog import (
     CATALOG,
     FOOTPRINT_ESTIMATED,
     FOOTPRINT_OFFICIAL,
+    LICENSE_NOT_OSI_APPROVED,
+    LICENSE_OSI_APPROVED,
+    LICENSE_OSI_STATUSES,
+    LICENSE_OSI_UNDETERMINED,
+    MEMORY_TIERS,
+    OSI_REFERENCE_URL,
+    TIER_CPU_LOW_RAM,
+    TIER_DENSE_12_16,
+    TIER_LARGE_20_24,
+    TIER_MAINSTREAM_8_16,
+    TIER_UNIFIED_24_32,
     UNIFIED_MEMORY_RESERVE_BYTES,
     LocalModel,
     by_memory_footprint,
+    get_memory_tier,
     get_model,
+    group_by_memory_tier,
     known_tags,
+    open_source_only,
     recommend,
+    undetermined_license_tags,
 )
 
 GIB = 1024**3
@@ -76,9 +91,11 @@ def _sample_model(**overrides):
         memory_footprint_bytes=2 * GIB,
         memory_footprint_low_bytes=2 * GIB,
         memory_footprint_basis=FOOTPRINT_ESTIMATED,
+        memory_tier=TIER_CPU_LOW_RAM,
         context_window_tokens=8_000,
         license_name="Apache-2.0",
         license_confirmed=True,
+        license_osi_status=LICENSE_OSI_APPROVED,
         source_url="https://ollama.com/library/fake",
         verified_on="2026-09-04",
     )
@@ -324,6 +341,10 @@ class TestLocalModelValidation:
             {"download_size_bytes": 0},
             {"download_size_bytes": -1},
             {"memory_footprint_basis": "devine"},
+            {"memory_tier": "gpu-42gb"},
+            {"memory_tier": ""},
+            {"license_osi_status": "libre"},
+            {"license_osi_status": ""},
             {"memory_footprint_low_bytes": 3 * GIB},
             {
                 "memory_footprint_bytes": 512 * 1024 * 1024,
@@ -507,3 +528,258 @@ class TestRecommendEdgeCases:
         result = recommend(9 * GIB)
         assert result.recommended.tag == "gemma3n:e4b"
         assert result.margin_bytes == 0
+
+
+# ===========================================================================
+# Qualification OSI des licences — le dev ne veut que de l'open source
+# ===========================================================================
+
+#: Les quatre entrees dont la licence n'est pas approuvee OSI. Trois licences
+#: Meta a seuil de 700M d'utilisateurs actifs mensuels, une Gemma Terms of Use
+#: a restrictions d'usage. Source de la qualification : `MEMORY/VEILLE.md`,
+#: 2026-09-04, « Les licences Meta (Llama 3.x) et Google (Gemma Terms of Use)
+#: imposent des restrictions contractuelles qui ne sont pas de l'open source au
+#: sens OSI ».
+NOT_OSI_TAGS = {"llama3.2:3b", "llama3.1:8b", "llama3.1:70b", "gemma3n:e4b"}
+
+#: Les entrees que les sources ne permettent pas de trancher. Les deux
+#: `qwen2.5-coder` portent une licence deduite de la famille et jamais lue sur
+#: la fiche du tag ; `deepseek-r1:32b` est sous MIT pour ses poids mais sa base
+#: distillee est « Qwen ou Llama — a verifier » selon la veille, et une base
+#: Llama ajouterait ses propres obligations.
+UNDETERMINED_OSI_TAGS = {"qwen2.5-coder:7b", "qwen2.5-coder:14b", "deepseek-r1:32b"}
+
+
+class TestLicenseOsiQualification:
+    def test_every_entry_carries_one_of_the_three_states(self):
+        for tag, model in CATALOG.items():
+            assert model.license_osi_status in LICENSE_OSI_STATUSES, tag
+
+    def test_the_three_states_are_distinct_strings(self):
+        assert len(set(LICENSE_OSI_STATUSES)) == 3
+
+    def test_restricted_weight_licences_are_not_open_source(self):
+        flagged = {
+            t for t, m in CATALOG.items() if m.license_osi_status == LICENSE_NOT_OSI_APPROVED
+        }
+        assert flagged == NOT_OSI_TAGS
+
+    def test_undetermined_entries_are_declared_not_guessed(self):
+        assert set(undetermined_license_tags()) == UNDETERMINED_OSI_TAGS
+
+    def test_every_undetermined_entry_explains_itself(self):
+        """« Non determine » sans motif ecrit serait un aveu sans information."""
+        for tag in undetermined_license_tags():
+            assert "OSI" in CATALOG[tag].notes, tag
+
+    def test_the_rest_of_the_catalog_is_osi_approved(self):
+        approved = {t for t, m in CATALOG.items() if m.license_osi_status == LICENSE_OSI_APPROVED}
+        assert approved == set(CATALOG) - NOT_OSI_TAGS - UNDETERMINED_OSI_TAGS
+        assert len(approved) == 11
+
+    def test_license_name_still_carries_the_exact_wording(self):
+        """La qualification s'ajoute, elle ne remplace aucune information."""
+        assert CATALOG["gemma3n:e4b"].license_name == "Gemma Terms of Use"
+        assert "700M MAU" in CATALOG["llama3.1:8b"].license_name
+        assert CATALOG["qwen3:8b"].license_name == "Apache-2.0"
+
+    def test_qualification_is_not_deduced_from_the_license_name(self):
+        """Deux entrees nommees Apache-2.0, deux qualifications differentes."""
+        assert CATALOG["qwen3:8b"].license_name == CATALOG["qwen2.5-coder:7b"].license_name
+        assert CATALOG["qwen3:8b"].license_osi_status == LICENSE_OSI_APPROVED
+        assert CATALOG["qwen2.5-coder:7b"].license_osi_status == LICENSE_OSI_UNDETERMINED
+
+    def test_osi_status_is_independent_from_license_confirmed(self):
+        """Deux axes distincts : d'ou vient la licence, et ce qu'elle vaut."""
+        confirmed_but_restricted = CATALOG["gemma3n:e4b"]
+        assert confirmed_but_restricted.license_confirmed is True
+        assert confirmed_but_restricted.license_osi_status == LICENSE_NOT_OSI_APPROVED
+        # Et le schema accepte la combinaison inverse, qu'aucune entree ne porte
+        # aujourd'hui : licence lue a la source, mais qualification non tranchee.
+        odd = _sample_model(license_confirmed=True, license_osi_status=LICENSE_OSI_UNDETERMINED)
+        assert odd.license_confirmed is True
+        assert odd.is_osi_approved is False
+
+    def test_is_osi_approved_excludes_the_undetermined(self):
+        assert CATALOG["qwen3:8b"].is_osi_approved is True
+        assert CATALOG["llama3.1:8b"].is_osi_approved is False
+        assert CATALOG["qwen2.5-coder:7b"].is_osi_approved is False
+
+    def test_reference_of_the_qualification_is_exposed(self):
+        assert OSI_REFERENCE_URL.startswith("https://")
+        assert "opensource.org" in OSI_REFERENCE_URL
+
+
+class TestOpenSourceFiltering:
+    def test_no_model_is_removed_from_the_catalog(self):
+        """Le catalogue reste complet : filtrer est une decision d'affichage."""
+        assert set(CATALOG) == EXPECTED_TAGS
+        assert NOT_OSI_TAGS <= set(CATALOG)
+        assert UNDETERMINED_OSI_TAGS <= set(CATALOG)
+
+    def test_filter_keeps_only_osi_approved_by_default(self):
+        kept = open_source_only()
+        assert set(kept) == set(CATALOG) - NOT_OSI_TAGS - UNDETERMINED_OSI_TAGS
+        assert all(m.is_osi_approved for m in kept.values())
+
+    def test_undetermined_can_be_included_on_demand(self):
+        kept = open_source_only(include_undetermined=True)
+        assert set(kept) == set(CATALOG) - NOT_OSI_TAGS
+        assert UNDETERMINED_OSI_TAGS <= set(kept)
+
+    def test_filter_does_not_mutate_the_catalog(self):
+        before = dict(CATALOG)
+        open_source_only()
+        open_source_only(include_undetermined=True)
+        assert CATALOG == before
+
+    def test_filter_result_is_a_catalog_usable_by_the_other_helpers(self):
+        libre = open_source_only()
+        assert by_memory_footprint(libre)[0].tag == "qwen3:32b"
+        result = recommend(32 * GIB, unified=True, catalog=libre)
+        assert result.recommended.tag == "gpt-oss:20b"
+        assert "llama3.1:8b" not in [m.tag for m in result.fits]
+
+    def test_filter_accepts_an_injected_catalog(self):
+        catalog = {
+            "libre:1b": _sample_model(tag="libre:1b"),
+            "ferme:1b": _sample_model(tag="ferme:1b", license_osi_status=LICENSE_NOT_OSI_APPROVED),
+        }
+        assert set(open_source_only(catalog)) == {"libre:1b"}
+        assert undetermined_license_tags(catalog) == ()
+
+    def test_filtering_everything_out_leaves_an_empty_catalog(self):
+        catalog = {"ferme:1b": _sample_model(license_osi_status=LICENSE_NOT_OSI_APPROVED)}
+        assert open_source_only(catalog) == {}
+        assert recommend(32 * GIB, catalog=open_source_only(catalog)).recommended is None
+
+
+# ===========================================================================
+# Paliers memoire — la classification perdue, reprise de la veille
+# ===========================================================================
+
+TIER_MEMBERSHIP = {
+    TIER_CPU_LOW_RAM: {"phi4-mini", "phi3:mini", "llama3.2:3b", "gemma3n:e4b", "qwen3:4b"},
+    TIER_MAINSTREAM_8_16: {"mistral:7b", "llama3.1:8b", "qwen3:8b", "gpt-oss:20b"},
+    TIER_DENSE_12_16: {
+        "qwen2.5-coder:7b",
+        "deepseek-r1:14b",
+        "qwen2.5:14b",
+        "qwen2.5-coder:14b",
+        "qwen3:14b",
+    },
+    TIER_LARGE_20_24: {"qwen3:30b-a3b", "deepseek-r1:32b", "qwen3:32b"},
+    TIER_UNIFIED_24_32: {"llama3.1:70b"},
+}
+
+
+class TestMemoryTiers:
+    def test_the_five_tiers_of_the_veille_are_declared(self):
+        assert [t.tier_id for t in MEMORY_TIERS] == [
+            TIER_CPU_LOW_RAM,
+            TIER_MAINSTREAM_8_16,
+            TIER_DENSE_12_16,
+            TIER_LARGE_20_24,
+            TIER_UNIFIED_24_32,
+        ]
+
+    def test_tier_labels_are_those_of_the_veille(self):
+        labels = [t.label for t in MEMORY_TIERS]
+        assert labels[0] == "Palier CPU seul / faible RAM (4-8 Go)"
+        assert labels[1] == "Palier 8-16 Go (GPU 8 Go ou RAM/memoire unifiee courante)"
+        assert labels[2] == "Palier 12-16 Go dense / qualite superieure"
+        assert labels[3] == "Palier 20-24 Go et plus"
+        assert labels[4].startswith("Palier 24-32 Go et plus")
+        assert "Apple Silicon" in labels[4]
+
+    def test_every_entry_declares_a_known_tier(self):
+        known = {t.tier_id for t in MEMORY_TIERS}
+        for tag, model in CATALOG.items():
+            assert model.memory_tier in known, tag
+
+    def test_tier_membership_follows_the_veille_tables(self):
+        for tier_id, expected in TIER_MEMBERSHIP.items():
+            actual = {t for t, m in CATALOG.items() if m.memory_tier == tier_id}
+            assert actual == expected, tier_id
+
+    def test_get_memory_tier_raises_on_an_unknown_id(self):
+        with pytest.raises(KeyError) as excinfo:
+            get_memory_tier("gpu-42gb")
+        assert "gpu-42gb" in str(excinfo.value)
+        assert TIER_CPU_LOW_RAM in str(excinfo.value)
+
+    def test_label_is_read_from_the_tier_not_copied_on_the_entry(self):
+        model = CATALOG["qwen3:8b"]
+        assert model.memory_tier_label == get_memory_tier(TIER_MAINSTREAM_8_16).label
+
+    def test_grouping_always_yields_the_five_tiers_in_order(self):
+        grouped = group_by_memory_tier()
+        assert list(grouped) == [t.tier_id for t in MEMORY_TIERS]
+
+    def test_grouping_partitions_the_whole_catalog(self):
+        grouped = group_by_memory_tier()
+        seen = [m.tag for group in grouped.values() for m in group]
+        assert sorted(seen) == sorted(CATALOG)
+        assert len(seen) == len(set(seen)), "un modele apparait dans deux paliers"
+
+    def test_each_group_is_ordered_by_memory_footprint(self):
+        for tier_id, group in group_by_memory_tier().items():
+            footprints = [m.memory_footprint_bytes for m in group]
+            assert footprints == sorted(footprints, reverse=True), tier_id
+
+    def test_ascending_grouping_is_available(self):
+        group = group_by_memory_tier(descending=False)[TIER_CPU_LOW_RAM]
+        footprints = [m.memory_footprint_bytes for m in group]
+        assert footprints == sorted(footprints)
+
+    def test_empty_tiers_are_kept_rather_than_dropped(self):
+        grouped = group_by_memory_tier({"fake:1b": _sample_model()})
+        assert list(grouped) == [t.tier_id for t in MEMORY_TIERS]
+        assert [m.tag for m in grouped[TIER_CPU_LOW_RAM]] == ["fake:1b"]
+        assert grouped[TIER_UNIFIED_24_32] == ()
+
+    def test_grouping_composes_with_the_open_source_filter(self):
+        grouped = group_by_memory_tier(open_source_only())
+        assert grouped[TIER_UNIFIED_24_32] == (), "llama3.1:70b n'est pas open source"
+        assert {m.tag for m in grouped[TIER_LARGE_20_24]} == {"qwen3:30b-a3b", "qwen3:32b"}
+
+    def test_a_tier_is_a_label_never_the_number_that_decides(self):
+        """gemma3n:e4b est au palier CPU et pese ~9 Go : l'ecart est signale."""
+        model = CATALOG["gemma3n:e4b"]
+        assert model.memory_tier == TIER_CPU_LOW_RAM
+        assert model.memory_footprint_bytes > 8 * GIB
+        assert "Ecart palier / empreinte" in model.notes
+        # Et c'est bien l'empreinte, pas le palier, qui exclut le modele.
+        assert model.tag not in [m.tag for m in recommend(8 * GIB).fits]
+
+    def test_the_other_tier_discrepancy_is_signalled_too(self):
+        model = CATALOG["qwen2.5-coder:7b"]
+        assert model.memory_tier == TIER_DENSE_12_16
+        assert "Ecart palier / empreinte" in model.notes
+
+
+class TestInstalledModelsCrossingBelongsToTheInterface:
+    """R-007 : le croisement avec `installed_models` n'entre pas dans le domaine.
+
+    La regle du domaine porte sur la memoire (DEC-006) ; « deja telecharge »
+    n'en est pas une et aucune source ne la classe. L'appariement d'un nom
+    rendu par ``ollama list`` avec un tag de catalogue existe deja cote
+    adaptateur (`launcher.py::is_model_installed`) : en poser un second ici
+    recreerait la duplication de D-022. Ces tests scellent la decision, pour
+    qu'elle soit rouverte explicitement et non par inadvertance.
+    """
+
+    def test_recommend_takes_no_installed_list(self):
+        import inspect
+
+        assert "installed" not in inspect.signature(recommend).parameters
+
+    def test_the_module_holds_no_installed_marking(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        code = _code_without_string_literals()
+        assert "installed" not in code, "l'appariement doit rester chez l'appelant"
+        assert "installed" in source, "la decision doit rester expliquee dans le module"
+
+    def test_the_interface_has_what_it_needs_to_cross_on_its_side(self):
+        assert "qwen3:8b" in known_tags()
+        assert get_model("qwen3:8b").tag == "qwen3:8b"
