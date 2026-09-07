@@ -70,3 +70,8 @@ agent_factory.md
 # Systeme de design : document d'entree, jamais importe par un module Python
 # (arbitrage agent-architecte, C12). Les pages/ vides ne sont pas suivies.
 design-system/*/pages/
+
+# Configs de projets reels du dev. Le depot est public : seuls les exemples
+# sont suivis. Regle jumelle de `data/projects/*` (D-008).
+projects/*
+!projects/exemple-*.md

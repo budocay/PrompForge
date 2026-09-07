@@ -49,9 +49,9 @@ all = [
 promptforge = "promptforge.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/promptforge"
-Repository = "https://github.com/yourusername/promptforge"
-Issues = "https://github.com/yourusername/promptforge/issues"
+Homepage = "https://github.com/budocay/PrompForge"
+Repository = "https://github.com/budocay/PrompForge"
+Issues = "https://github.com/budocay/PrompForge/issues"
 
 [tool.setuptools.packages.find]
 include = ["promptforge*"]
